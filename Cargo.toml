@@ -1,0 +1,30 @@
+[package]
+name = "Sahne Karnal PC" # Proje adı
+version = "0.0.1"
+edition = "2021"
+targets = ["riscv64imac-unknown-none-elf", "x86_64-unknown-none", "aarch64-unknown-none", "sparc64-unknown-none", "mips64-unknown-none", "loongarch64-unknown-none", "elbrus64-unknown-none", "powerpc64-unknown-none", "openrisc64-unknown-none"]
+
+[dependencies]
+fdt = "0.3" # veya uygun sürüm
+
+[profile.dev]
+panic = "abort" # Geliştirme sırasında panik durumunda dur
+
+[profile.release]
+panic = "abort" # Yayın sürümünde de panik durumunda dur (boyutu küçültmek için)
+opt-level = "z" # Kod boyutunu optimize et
+
+[build-dependencies]
+# SVD dosyalarından register tanımları oluşturmak için (gerekirse)
+svd2rust = "0.25"
+
+[features]
+x86 = []
+arm = []
+riscv = []
+openrısc = []
+mıps = []
+sparc = []
+loongarch = []
+elbrus = []
+powerpc = []
