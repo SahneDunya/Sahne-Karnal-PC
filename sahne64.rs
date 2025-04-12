@@ -1,628 +1,727 @@
 #![no_std] // Standart kütüphaneye ihtiyaç duymuyoruz
 #![allow(dead_code)] // Henüz kullanılmayan kodlar için uyarı vermesin
-
-// Çeşitli platformlar ve mimariler için konfigürasyon (örnek)
 #[cfg(any(target_arch = "riscv64", target_arch = "aarch64", target_arch = "x86_64", target_arch = "sparc64", target_arch = "openrisc", target_arch = "powerpc64", target_arch = "loongarch64", target_arch = "elbrus", target_arch = "mips64"))]
 pub mod arch {
-    // Mimariye özel detaylar buraya gelebilir (örneğin, sistem çağrı numaraları)
-    pub const SYSCALL_MEMORY_ALLOCATE: u64 = 1;
-    pub const SYSCALL_MEMORY_FREE: u64 = 2;
-    pub const SYSCALL_CREATE_PROCESS: u64 = 3;
-    pub const SYSCALL_EXIT_PROCESS: u64 = 4;
-    pub const SYSCALL_FILE_OPEN: u64 = 5; // Dosya açma sistem çağrısı numarası
-    pub const SYSCALL_FILE_READ: u64 = 6; // Dosyadan okuma sistem çağrısı numarası
-    pub const SYSCALL_FILE_WRITE: u64 = 7; // Dosyaya yazma sistem çağrısı numarası
-    pub const SYSCALL_FILE_CLOSE: u64 = 8; // Dosyayı kapatma sistem çağrısı numarası
-    pub const SYSCALL_GET_PID: u64 = 9; // Süreç ID'sini alma
-    pub const SYSCALL_SLEEP: u64 = 10; // Süreci uyutma
-    pub const SYSCALL_MUTEX_CREATE: u64 = 11; // Muteks oluşturma
-    pub const SYSCALL_MUTEX_LOCK: u64 = 12; // Muteksi kilitleme
-    pub const SYSCALL_MUTEX_UNLOCK: u64 = 13; // Muteksi kilidini açma
-    pub const SYSCALL_THREAD_CREATE: u64 = 14; // Yeni bir thread oluşturma
-    pub const SYSCALL_THREAD_EXIT: u64 = 15; // Mevcut thread'i sonlandırma
-    pub const SYSCALL_GET_TIME: u64 = 16; // Sistem saatini alma
-    pub const SYSCALL_CREATE_SHARED_MEMORY: u64 = 17; // Paylaşımlı bellek oluşturma
-    pub const SYSCALL_MAP_SHARED_MEMORY: u64 = 18; // Paylaşımlı belleği adres alanına eşleme
-    pub const SYSCALL_UNMAP_SHARED_MEMORY: u64 = 19; // Paylaşımlı belleğin eşlemesini kaldırma
-    pub const SYSCALL_SEND_MESSAGE: u64 = 20; // Süreçler arası mesaj gönderme
-    pub const SYSCALL_RECEIVE_MESSAGE: u64 = 21; // Süreçler arası mesaj alma
-    pub const SYSCALL_GET_KERNEL_INFO: u64 = 100; // Çekirdek bilgisi alma sistem çağrısı numarası
-    pub const SYSCALL_YIELD: u64 = 101; // CPU'yu başka bir sürece bırakma
-    pub const SYSCALL_IOCTL: u64 = 102; // Aygıt sürücülerine özel komutlar gönderme
+    // Mimariye özel sistem çağrı numaraları (Sahne64 terminolojisi ile)
+    pub const SYSCALL_MEMORY_ALLOCATE: u64 = 1;  // Bellek tahsis et
+    pub const SYSCALL_MEMORY_RELEASE: u64 = 2;   // Bellek serbest bırak (Handle ile?) - Şimdilik adres/boyut ile
+    pub const SYSCALL_TASK_SPAWN: u64 = 3;       // Yeni bir görev (task) başlat
+    pub const SYSCALL_TASK_EXIT: u64 = 4;        // Mevcut görevi sonlandır
+    pub const SYSCALL_RESOURCE_ACQUIRE: u64 = 5; // Bir kaynağa erişim tanıtıcısı (Handle) al
+    pub const SYSCALL_RESOURCE_READ: u64 = 6;    // Kaynaktan oku (Handle ile)
+    pub const SYSCALL_RESOURCE_WRITE: u64 = 7;   // Kaynağa yaz (Handle ile)
+    pub const SYSCALL_RESOURCE_RELEASE: u64 = 8; // Kaynak tanıtıcısını serbest bırak
+    pub const SYSCALL_GET_TASK_ID: u64 = 9;      // Mevcut görev ID'sini al
+    pub const SYSCALL_TASK_SLEEP: u64 = 10;      // Görevi uyut
+    pub const SYSCALL_LOCK_CREATE: u64 = 11;     // Kilit (Lock) oluştur
+    pub const SYSCALL_LOCK_ACQUIRE: u64 = 12;    // Kilidi al (Bloklayabilir)
+    pub const SYSCALL_LOCK_RELEASE: u64 = 13;    // Kilidi bırak
+    pub const SYSCALL_THREAD_CREATE: u64 = 14;   // Yeni bir iş parçacığı (thread) oluştur
+    pub const SYSCALL_THREAD_EXIT: u64 = 15;     // Mevcut iş parçacığını sonlandır
+    pub const SYSCALL_GET_SYSTEM_TIME: u64 = 16; // Sistem saatini al
+    pub const SYSCALL_SHARED_MEM_CREATE: u64 = 17; // Paylaşımlı bellek alanı oluştur (Handle döner)
+    pub const SYSCALL_SHARED_MEM_MAP: u64 = 18;    // Paylaşımlı belleği adres alanına eşle (Handle ile)
+    pub const SYSCALL_SHARED_MEM_UNMAP: u64 = 19;  // Paylaşımlı bellek eşlemesini kaldır
+    pub const SYSCALL_MESSAGE_SEND: u64 = 20;    // Başka bir göreve mesaj gönder (Task ID veya Handle ile)
+    pub const SYSCALL_MESSAGE_RECEIVE: u64 = 21; // Mesaj al (Bloklayabilir)
+    pub const SYSCALL_GET_KERNEL_INFO: u64 = 100; // Çekirdek bilgisi al
+    pub const SYSCALL_TASK_YIELD: u64 = 101;     // CPU'yu başka bir göreve devret
+    pub const SYSCALL_RESOURCE_CONTROL: u64 = 102;// Kaynağa özel kontrol komutu gönder (Handle ile)
 }
 
-// Hata türü
-#[derive(Debug)]
+/// Sahne64 Kaynak Tanıtıcısı (Handle).
+/// Kaynaklara (dosyalar, soketler, bellek bölgeleri vb.) erişmek için kullanılır.
+/// Bu, Unix'teki file descriptor'ların yerine geçer ve daha soyut bir kavramdır.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[repr(transparent)] // Bellekte sadece u64 olarak yer kaplar
+pub struct Handle(u64);
+
+impl Handle {
+    /// Geçersiz veya boş bir Handle oluşturur.
+    pub const fn invalid() -> Self {
+        Handle(0) // Veya çekirdeğin belirlediği başka bir geçersiz değer
+    }
+
+    /// Handle'ın geçerli olup olmadığını kontrol eder.
+    pub fn is_valid(&self) -> bool {
+        self.0 != Self::invalid().0
+    }
+
+    /// Handle'ın içindeki ham değeri alır (dikkatli kullanılmalı!).
+    pub(crate) fn raw(&self) -> u64 {
+        self.0
+    }
+}
+
+/// Sahne64 Görev (Task) Tanımlayıcısı.
+/// Süreç (process) yerine kullanılır.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub struct TaskId(u64);
+
+impl TaskId {
+    /// Geçersiz bir TaskId oluşturur.
+    pub const fn invalid() -> Self {
+        TaskId(0) // Veya çekirdeğin belirlediği başka bir geçersiz değer
+    }
+
+    /// TaskId'nin geçerli olup olmadığını kontrol eder.
+    pub fn is_valid(&self) -> bool {
+        self.0 != Self::invalid().0
+    }
+
+    /// TaskId'nin içindeki ham değeri alır (dikkatli kullanılmalı!).
+    pub(crate) fn raw(&self) -> u64 {
+        self.0
+    }
+}
+
+
+// Sahne64 Hata Türleri (Unix errno'larından ziyade Sahne64 konseptlerine odaklı)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SahneError {
-    OutOfMemory,
-    InvalidAddress,
-    InvalidParameter,
-    FileNotFound,
-    PermissionDenied,
-    FileAlreadyExists,
-    InvalidFileDescriptor,
-    ResourceBusy,
-    Interrupted,
-    NoMessage,
-    InvalidOperation,
-    NotSupported,
-    // ... diğer hata türleri
-    UnknownSystemCall,
-    ProcessCreationFailed, // Süreç oluşturma hatası için daha spesifik bir tür
+    OutOfMemory,          // Yetersiz bellek
+    InvalidAddress,       // Geçersiz bellek adresi
+    InvalidParameter,     // Fonksiyona geçersiz parametre verildi
+    ResourceNotFound,     // Belirtilen kaynak bulunamadı (örn. isimle ararken)
+    PermissionDenied,     // İşlem için yetki yok
+    ResourceBusy,         // Kaynak şu anda meşgul (örn. kilitli dosya, dolu kuyruk)
+    Interrupted,          // İşlem bir sinyal veya başka bir olayla kesildi
+    NoMessage,            // Beklenen mesaj yok (non-blocking receive)
+    InvalidOperation,     // Kaynak üzerinde geçersiz işlem denendi (örn. okunamaz kaynağı okumak)
+    NotSupported,         // İşlem veya özellik desteklenmiyor
+    UnknownSystemCall,    // Çekirdek bilinmeyen sistem çağrısı numarası aldı
+    TaskCreationFailed,   // Yeni görev (task) oluşturulamadı
+    InvalidHandle,        // Geçersiz veya süresi dolmuş Handle kullanıldı
+    HandleLimitExceeded,  // Süreç başına düşen Handle limiti aşıldı
+    NamingError,          // Kaynak isimlendirme ile ilgili hata
+    CommunicationError,   // Mesajlaşma veya IPC hatası
 }
 
 // Sistem çağrısı arayüzü (çekirdeğe geçiş mekanizması)
-extern "sysv64" { // veya işletim sisteminizin kullandığı çağrı standardı
+// ABI (Application Binary Interface) genellikle platforma özgüdür, bu nedenle "sysv64"
+// yaygın bir 64-bit ABI olduğu için kalabilir, ancak Sahne64 kendi ABI'sini de tanımlayabilir.
+extern "sysv64" {
     fn syscall(number: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i64;
 }
 
+// Hata Kodu Çevirimi Yardımcı Fonksiyonu
+// Çekirdekten dönen negatif sayıları SahneError'a çevirir.
+// NOT: Gerçek Sahne64 çekirdeği kendi hata kodlarını tanımlamalıdır. Buradakiler varsayımsaldır.
+fn map_kernel_error(code: i64) -> SahneError {
+    match code {
+        -1 => SahneError::PermissionDenied,    // EPERM gibi
+        -2 => SahneError::ResourceNotFound,   // ENOENT gibi
+        -3 => SahneError::TaskCreationFailed, // ESRCH gibi (belki?)
+        -4 => SahneError::Interrupted,       // EINTR gibi
+        -9 => SahneError::InvalidHandle,       // EBADF gibi
+        -11 => SahneError::ResourceBusy,       // EAGAIN gibi
+        -12 => SahneError::OutOfMemory,        // ENOMEM gibi
+        -13 => SahneError::PermissionDenied,    // EACCES gibi
+        -14 => SahneError::InvalidAddress,      // EFAULT gibi
+        -17 => SahneError::NamingError,        // EEXIST gibi (belki?)
+        -22 => SahneError::InvalidParameter,    // EINVAL gibi
+        -38 => SahneError::NotSupported,       // ENOSYS gibi
+        -61 => SahneError::NoMessage,          // ENOMSG gibi
+        // ... diğer Sahne64'e özel hata kodları ...
+        _ => SahneError::UnknownSystemCall, // Bilinmeyen veya eşlenmemiş hata
+    }
+}
+
+
 // Bellek yönetimi modülü
 pub mod memory {
-    use super::{SahneError, arch, syscall};
+    use super::{SahneError, arch, syscall, map_kernel_error, Handle};
 
     /// Belirtilen boyutta bellek ayırır.
-    ///
-    /// # Hatalar
-    ///
-    /// * `SahneError::OutOfMemory`: Yeterli bellek yoksa döner.
+    /// Başarılı olursa, ayrılan belleğe işaretçi döner.
     pub fn allocate(size: usize) -> Result<*mut u8, SahneError> {
         let result = unsafe {
             syscall(arch::SYSCALL_MEMORY_ALLOCATE, size as u64, 0, 0, 0, 0)
         };
         if result < 0 {
-            Err(SahneError::OutOfMemory)
+            Err(map_kernel_error(result))
         } else {
             Ok(result as *mut u8)
         }
     }
 
-    /// Daha önce ayrılmış bir belleği serbest bırakır.
-    ///
-    /// # Hatalar
-    ///
-    /// * `SahneError::InvalidAddress`: Geçersiz bir adres verilirse döner.
-    pub fn free(ptr: *mut u8, size: usize) -> Result<(), SahneError> {
+    /// Daha önce `allocate` ile ayrılmış bir belleği serbest bırakır.
+    /// NOT: Sahne64, belki de bellek blokları için de Handle kullanabilir,
+    /// bu durumda imza `release(handle: Handle)` şeklinde olabilirdi.
+    /// Şimdilik klasik adres/boyut yaklaşımı korunuyor.
+    pub fn release(ptr: *mut u8, size: usize) -> Result<(), SahneError> {
         let result = unsafe {
-            syscall(arch::SYSCALL_MEMORY_FREE, ptr as u64, size as u64, 0, 0, 0)
+            syscall(arch::SYSCALL_MEMORY_RELEASE, ptr as u64, size as u64, 0, 0, 0)
         };
         if result < 0 {
-            Err(SahneError::InvalidAddress)
+            Err(map_kernel_error(result))
         } else {
             Ok(())
         }
     }
 
-    /// Belirtilen boyutta paylaşımlı bellek alanı oluşturur.
-    ///
-    /// # Hatalar
-    ///
-    /// * `SahneError::OutOfMemory`: Yeterli bellek yoksa döner.
-    pub fn create_shared(size: usize) -> Result<u64, SahneError> {
+    /// Belirtilen boyutta paylaşımlı bellek alanı oluşturur ve bir Handle döner.
+    pub fn create_shared(size: usize) -> Result<Handle, SahneError> {
         let result = unsafe {
-            syscall(arch::SYSCALL_CREATE_SHARED_MEMORY, size as u64, 0, 0, 0, 0)
+            syscall(arch::SYSCALL_SHARED_MEM_CREATE, size as u64, 0, 0, 0, 0)
         };
         if result < 0 {
-            Err(SahneError::OutOfMemory)
+            Err(map_kernel_error(result))
         } else {
-            Ok(result as u64) // Paylaşımlı bellek ID'si döner
+            Ok(Handle(result as u64))
         }
     }
 
-    /// Paylaşımlı bellek alanını mevcut sürecin adres alanına eşler.
-    ///
-    /// # Hatalar
-    ///
-    /// * `SahneError::InvalidParameter`: Geçersiz bir ID verilirse döner.
-    pub fn map_shared(id: u64, offset: usize, size: usize) -> Result<*mut u8, SahneError> {
-        let result = unsafe {
-            syscall(arch::SYSCALL_MAP_SHARED_MEMORY, id, offset as u64, size as u64, 0, 0)
+    /// Paylaşımlı bellek Handle'ını mevcut görevin adres alanına eşler.
+    pub fn map_shared(handle: Handle, offset: usize, size: usize) -> Result<*mut u8, SahneError> {
+         if !handle.is_valid() {
+            return Err(SahneError::InvalidHandle);
+        }
+       let result = unsafe {
+            syscall(arch::SYSCALL_SHARED_MEM_MAP, handle.raw(), offset as u64, size as u64, 0, 0)
         };
         if result < 0 {
-            Err(SahneError::InvalidParameter)
+            Err(map_kernel_error(result))
         } else {
             Ok(result as *mut u8)
         }
     }
 
-    /// Paylaşımlı bellek alanının eşlemesini kaldırır.
-    ///
-    /// # Hatalar
-    ///
-    /// * `SahneError::InvalidAddress`: Geçersiz bir adres verilirse döner.
+    /// Eşlenmiş paylaşımlı bellek alanını adres alanından kaldırır.
     pub fn unmap_shared(addr: *mut u8, size: usize) -> Result<(), SahneError> {
         let result = unsafe {
-            syscall(arch::SYSCALL_UNMAP_SHARED_MEMORY, addr as u64, size as u64, 0, 0, 0)
+            syscall(arch::SYSCALL_SHARED_MEM_UNMAP, addr as u64, size as u64, 0, 0, 0)
         };
         if result < 0 {
-            Err(SahneError::InvalidAddress)
+            Err(map_kernel_error(result))
         } else {
             Ok(())
         }
     }
 }
 
-// Süreç yönetimi modülü
-pub mod process {
-    use super::{SahneError, arch, syscall};
+// Görev (Task) yönetimi modülü (Süreç yerine)
+pub mod task {
+    use super::{SahneError, arch, syscall, map_kernel_error, Handle, TaskId};
 
-    /// Yeni bir süreç oluşturur.
+    /// Yeni bir görev (task) başlatır.
+    /// Çalıştırılacak kod bir Handle ile temsil edilir (örn. bir kod kaynağı Handle'ı).
+    /// Argümanlar opak bir byte dizisi olarak geçirilir.
+    /// Başarılı olursa, yeni görevin TaskId'sini döner.
     ///
-    /// # Hatalar
-    ///
-    /// * `SahneError::InvalidParameter`: Geçersiz bir parametre verilirse döner.
-    /// * `SahneError::ProcessCreationFailed`: Süreç oluşturulamazsa döner.
-    pub fn create(path: &str) -> Result<u64, SahneError> {
-        let path_ptr = path.as_ptr() as u64;
-        let path_len = path.len() as u64;
+    /// # Argümanlar
+    /// * `code_handle`: Çalıştırılacak kodu içeren kaynağın Handle'ı.
+    /// * `args`: Göreve başlangıçta iletilecek argüman verisi.
+    /// * `capabilities`: (Opsiyonel) Göreve verilecek başlangıç yetenekleri/handle'ları listesi.
+    pub fn spawn(code_handle: Handle, args: &[u8]) -> Result<TaskId, SahneError> {
+         if !code_handle.is_valid() {
+            return Err(SahneError::InvalidHandle);
+        }
+        let args_ptr = args.as_ptr() as u64;
+        let args_len = args.len() as u64;
         let result = unsafe {
-            syscall(arch::SYSCALL_CREATE_PROCESS, path_ptr, path_len, 0, 0, 0)
+            syscall(arch::SYSCALL_TASK_SPAWN, code_handle.raw(), args_ptr, args_len, 0, 0)
         };
         if result < 0 {
-            // İşletim sisteminden dönen hata koduna göre daha spesifik hatalar döndürülebilir.
-            // Şimdilik genel bir hata dönülüyor.
-            if result == -22 { // Örnek hata kodu: EINVAL (Geçersiz argüman)
-                Err(SahneError::InvalidParameter)
-            } else {
-                Err(SahneError::ProcessCreationFailed)
-            }
+            Err(map_kernel_error(result))
         } else {
-            Ok(result as u64)
+            Ok(TaskId(result as u64))
         }
     }
 
-    /// Mevcut süreci sonlandırır.
+    /// Mevcut görevi belirtilen çıkış koduyla sonlandırır. Bu fonksiyon geri dönmez.
     pub fn exit(code: i32) -> ! {
         unsafe {
-            syscall(arch::SYSCALL_EXIT_PROCESS, code as u64, 0, 0, 0, 0);
+            syscall(arch::SYSCALL_TASK_EXIT, code as u64, 0, 0, 0, 0);
         }
-        loop {} // Sürecin gerçekten sonlandığından emin olmak için sonsuz döngü
+        // Syscall başarısız olsa bile (ki olmamalı), görevi sonlandırmak için döngü.
+        loop { core::hint::spin_loop(); }
     }
 
-    /// Mevcut sürecin ID'sini (PID) alır.
-    pub fn get_pid() -> Result<u64, SahneError> {
+    /// Mevcut görevin TaskId'sini alır.
+    pub fn current_id() -> Result<TaskId, SahneError> {
         let result = unsafe {
-            syscall(arch::SYSCALL_GET_PID, 0, 0, 0, 0, 0)
+            syscall(arch::SYSCALL_GET_TASK_ID, 0, 0, 0, 0, 0)
         };
         if result < 0 {
-            Err(SahneError::UnknownSystemCall)
+            Err(map_kernel_error(result))
         } else {
-            Ok(result as u64)
+            Ok(TaskId(result as u64))
         }
     }
 
-    /// Mevcut süreci belirtilen milisaniye kadar uyutur.
+    /// Mevcut görevi belirtilen milisaniye kadar uyutur.
     pub fn sleep(milliseconds: u64) -> Result<(), SahneError> {
         let result = unsafe {
-            syscall(arch::SYSCALL_SLEEP, milliseconds, 0, 0, 0, 0)
+            syscall(arch::SYSCALL_TASK_SLEEP, milliseconds, 0, 0, 0, 0)
         };
         if result < 0 {
-            Err(SahneError::Interrupted) // Uyku kesintiye uğradıysa
+            Err(map_kernel_error(result))
         } else {
             Ok(())
         }
     }
 
-    /// Yeni bir thread oluşturur.
-    ///
-    /// # Hatalar
-    ///
-    /// * `SahneError::InvalidParameter`: Geçersiz bir parametre verilirse döner.
-    pub fn create_thread(entry_point: u64, stack_size: usize, arg: u64) -> Result<u64, SahneError> {
+    /// Yeni bir iş parçacığı (thread) oluşturur.
+    /// İş parçacıkları aynı görev adres alanını paylaşır.
+    /// `entry_point`: Yeni iş parçacığının başlangıç fonksiyon adresi.
+    /// `stack_size`: Yeni iş parçacığı için ayrılacak yığın boyutu.
+    /// `arg`: Başlangıç fonksiyonuna geçirilecek argüman.
+    /// Başarılı olursa, yeni iş parçacığının ID'sini (belki bir ThreadId türü?) döner.
+    pub fn create_thread(entry_point: u64, stack_size: usize, arg: u64) -> Result<u64, SahneError> { // Belki Result<ThreadId, SahneError> olmalı
         let result = unsafe {
             syscall(arch::SYSCALL_THREAD_CREATE, entry_point, stack_size as u64, arg, 0, 0)
         };
         if result < 0 {
-            Err(SahneError::InvalidParameter)
+            Err(map_kernel_error(result))
         } else {
-            Ok(result as u64) // Yeni thread'in ID'si
+            Ok(result as u64) // Thread ID
         }
     }
 
-    /// Mevcut thread'i sonlandırır.
+    /// Mevcut iş parçacığını sonlandırır. Bu fonksiyon geri dönmez.
     pub fn exit_thread(code: i32) -> ! {
         unsafe {
             syscall(arch::SYSCALL_THREAD_EXIT, code as u64, 0, 0, 0, 0);
         }
-        loop {}
+        loop { core::hint::spin_loop(); }
     }
 
-    // ... diğer süreç yönetimi fonksiyonları (IPC vb.)
-}
-
-// Dosya sistemi modülü
-pub mod fs {
-    use super::{SahneError, arch, syscall};
-
-    // Dosya açma modları için sabit tanımlar (örnek)
-    pub const O_RDONLY: u32 = 0;
-    pub const O_WRONLY: u32 = 1;
-    pub const O_RDWR: u32 = 2;
-    pub const O_CREAT: u32 = 0x0100; // Dosya yoksa oluştur
-    pub const O_EXCL: u32 = 0x0200;  // Dosya varsa hata döndür
-    pub const O_TRUNC: u32 = 0x0400; // Dosyayı sıfır uzunlukta aç
-
-    /// Belirtilen yolda bir dosya açar.
-    ///
-    /// # Hatalar
-    ///
-    /// * `SahneError::FileNotFound`: Dosya bulunamazsa döner.
-    /// * `SahneError::PermissionDenied`: Erişim izni yoksa döner.
-    pub fn open(path: &str, flags: u32) -> Result<u64, SahneError> {
-        let path_ptr = path.as_ptr() as u64;
-        let path_len = path.len() as u64;
+    /// CPU'yu gönüllü olarak başka bir çalıştırılabilir göreve bırakır.
+    pub fn yield_now() -> Result<(), SahneError> {
         let result = unsafe {
-            syscall(arch::SYSCALL_FILE_OPEN, path_ptr, path_len, flags as u64, 0, 0)
+            syscall(arch::SYSCALL_TASK_YIELD, 0, 0, 0, 0, 0)
         };
         if result < 0 {
-            // İşletim sisteminden dönen hata kodlarına göre hataları çeviriyoruz.
-            // Bu örnek kodlar tamamen varsayımsaldır. Gerçek hata kodları işletim sistemine özeldir.
-            if result == -2 { // Örnek hata kodu: ENOENT (Dosya veya dizin yok)
-                Err(SahneError::FileNotFound)
-            } else if result == -13 { // Örnek hata kodu: EACCES (İzin reddedildi)
-                Err(SahneError::PermissionDenied)
-            } else {
-                Err(SahneError::UnknownSystemCall)
-            }
+            Err(map_kernel_error(result))
         } else {
-            Ok(result as u64)
+            Ok(())
+        }
+    }
+}
+
+// Kaynak yönetimi modülü (Dosya sistemi yerine)
+pub mod resource {
+    use super::{SahneError, arch, syscall, map_kernel_error, Handle};
+
+    // Kaynak açma/edinme modları için Sahne64'e özgü bayraklar
+    // Bunlar Unix O_* bayraklarından farklı anlamlara gelebilir.
+    pub const MODE_READ: u32 = 1 << 0;    // Kaynaktan okuma yeteneği iste
+    pub const MODE_WRITE: u32 = 1 << 1;   // Kaynağa yazma yeteneği iste
+    pub const MODE_CREATE: u32 = 1 << 2;  // Kaynak yoksa oluşturulsun
+    pub const MODE_EXCLUSIVE: u32 = 1 << 3; // Kaynak zaten varsa hata ver (CREATE ile kullanılır)
+    pub const MODE_TRUNCATE: u32 = 1 << 4; // Kaynak açılırken içeriğini sil (varsa ve yazma izni varsa)
+    // ... Sahne64'e özel diğer modlar eklenebilir (örn. Append, NonBlocking vb.)
+
+    /// Sahne64'e özgü bir kaynak adı veya tanımlayıcısı.
+    /// Bu, bir string path olabileceği gibi, UUID veya başka bir yapı da olabilir.
+    /// Şimdilik basitlik adına string slice kullanıyoruz.
+    pub type ResourceId<'a> = &'a str;
+
+    /// Belirtilen ID'ye sahip bir kaynağa erişim Handle'ı edinir.
+    /// `id`: Kaynağı tanımlayan Sahne64'e özgü tanımlayıcı.
+    /// `mode`: Kaynağa nasıl erişileceğini belirten bayraklar (MODE_*).
+    pub fn acquire(id: ResourceId, mode: u32) -> Result<Handle, SahneError> {
+        let id_ptr = id.as_ptr() as u64;
+        let id_len = id.len() as u64;
+        let result = unsafe {
+            syscall(arch::SYSCALL_RESOURCE_ACQUIRE, id_ptr, id_len, mode as u64, 0, 0)
+        };
+        if result < 0 {
+            Err(map_kernel_error(result))
+        } else {
+            Ok(Handle(result as u64))
         }
     }
 
-    /// Belirtilen dosya tanımlayıcısından (file descriptor) veri okur.
-    ///
-    /// # Hatalar
-    ///
-    /// * `SahneError::InvalidFileDescriptor`: Geçersiz bir dosya tanımlayıcısı verilirse döner.
-    pub fn read(fd: u64, buffer: &mut [u8]) -> Result<usize, SahneError> {
+    /// Belirtilen Handle ile temsil edilen kaynaktan veri okur.
+    /// Okunan byte sayısını döner.
+    pub fn read(handle: Handle, buffer: &mut [u8]) -> Result<usize, SahneError> {
+        if !handle.is_valid() {
+            return Err(SahneError::InvalidHandle);
+        }
         let buffer_ptr = buffer.as_mut_ptr() as u64;
         let buffer_len = buffer.len() as u64;
         let result = unsafe {
-            syscall(arch::SYSCALL_FILE_READ, fd, buffer_ptr, buffer_len, 0, 0)
+            syscall(arch::SYSCALL_RESOURCE_READ, handle.raw(), buffer_ptr, buffer_len, 0, 0)
         };
         if result < 0 {
-            if result == -9 { // Örnek hata kodu: EBADF (Kötü dosya numarası)
-                Err(SahneError::InvalidFileDescriptor)
-            } else {
-                Err(SahneError::UnknownSystemCall)
-            }
+            Err(map_kernel_error(result))
         } else {
             Ok(result as usize)
         }
     }
 
-    /// Belirtilen dosya tanımlayıcısına (file descriptor) veri yazar.
-    ///
-    /// # Hatalar
-    ///
-    /// * `SahneError::InvalidFileDescriptor`: Geçersiz bir dosya tanımlayıcısı verilirse döner.
-    pub fn write(fd: u64, buffer: &[u8]) -> Result<usize, SahneError> {
+    /// Belirtilen Handle ile temsil edilen kaynağa veri yazar.
+    /// Yazılan byte sayısını döner.
+    pub fn write(handle: Handle, buffer: &[u8]) -> Result<usize, SahneError> {
+         if !handle.is_valid() {
+            return Err(SahneError::InvalidHandle);
+        }
         let buffer_ptr = buffer.as_ptr() as u64;
         let buffer_len = buffer.len() as u64;
         let result = unsafe {
-            syscall(arch::SYSCALL_FILE_WRITE, fd, buffer_ptr, buffer_len, 0, 0)
+            syscall(arch::SYSCALL_RESOURCE_WRITE, handle.raw(), buffer_ptr, buffer_len, 0, 0)
         };
         if result < 0 {
-            if result == -9 { // Örnek hata kodu: EBADF (Kötü dosya numarası)
-                Err(SahneError::InvalidFileDescriptor)
-            } else {
-                Err(SahneError::UnknownSystemCall)
-            }
+            Err(map_kernel_error(result))
         } else {
             Ok(result as usize)
         }
     }
 
-    /// Belirtilen dosya tanımlayıcısını (file descriptor) kapatır.
-    ///
-    /// # Hatalar
-    ///
-    /// * `SahneError::InvalidFileDescriptor`: Geçersiz bir dosya tanımlayıcısı verilirse döner.
-    pub fn close(fd: u64) -> Result<(), SahneError> {
+    /// Belirtilen Handle'ı serbest bırakır, kaynağa erişimi sonlandırır.
+    /// Kaynağın kendisi (eğer kalıcıysa) silinmeyebilir, sadece bu Handle geçersizleşir.
+    pub fn release(handle: Handle) -> Result<(), SahneError> {
+         if !handle.is_valid() {
+            return Err(SahneError::InvalidHandle); // Zaten geçersiz handle'ı bırakmaya çalışma
+        }
         let result = unsafe {
-            syscall(arch::SYSCALL_FILE_CLOSE, fd, 0, 0, 0, 0)
+            syscall(arch::SYSCALL_RESOURCE_RELEASE, handle.raw(), 0, 0, 0, 0)
         };
         if result < 0 {
-            if result == -9 { // Örnek hata kodu: EBADF (Kötü dosya numarası)
-                Err(SahneError::InvalidFileDescriptor)
-            } else {
-                Err(SahneError::UnknownSystemCall)
-            }
+            Err(map_kernel_error(result))
         } else {
             Ok(())
         }
     }
 
-    // ... diğer dosya sistemi fonksiyonları (read, write, close vb.)
+    /// Kaynağa özel kontrol komutları göndermek için kullanılır (Unix `ioctl` benzeri).
+    /// `request`: Gönderilecek komutun Sahne64'e özgü kodu.
+    /// `arg`: Komuta eşlik eden veri (yorumu komuta bağlı).
+    pub fn control(handle: Handle, request: u64, arg: u64) -> Result<i64, SahneError> {
+         if !handle.is_valid() {
+            return Err(SahneError::InvalidHandle);
+        }
+        let result = unsafe {
+            syscall(arch::SYSCALL_RESOURCE_CONTROL, handle.raw(), request, arg, 0, 0)
+        };
+        if result < 0 {
+            Err(map_kernel_error(result))
+        } else {
+            Ok(result) // Kontrol komutunun dönüş değeri (yorumu komuta bağlı)
+        }
+    }
 }
 
-// Çekirdek içi bileşenlerle iletişim (örnek)
+// Çekirdek ile genel etkileşim modülü
 pub mod kernel {
-    use super::{SahneError, arch, syscall};
+    use super::{SahneError, arch, syscall, map_kernel_error};
 
-    // Çekirdek bilgi türleri için sabit tanımlar (örnek)
-    pub const KERNEL_INFO_VERSION: u32 = 1;
-    pub const KERNEL_INFO_UPTIME: u32 = 2;
-    pub const KERNEL_INFO_ARCHITECTURE: u32 = 3;
+    // Çekirdek bilgi türleri için Sahne64'e özgü sabitler
+    pub const KERNEL_INFO_VERSION_MAJOR: u32 = 1;
+    pub const KERNEL_INFO_VERSION_MINOR: u32 = 2;
+    pub const KERNEL_INFO_BUILD_ID: u32 = 3;
+    pub const KERNEL_INFO_UPTIME_SECONDS: u32 = 4; // Sistem çalışma süresi (saniye)
+    pub const KERNEL_INFO_ARCHITECTURE: u32 = 5;   // Çalışan mimari (örn. ARCH_X86_64 sabiti dönebilir)
+    // ... diğer Sahne64'e özgü kernel bilgileri
 
     /// Çekirdekten belirli bir bilgiyi alır.
-    pub fn get_kernel_info(info_type: u32) -> Result<u64, SahneError> {
+    pub fn get_info(info_type: u32) -> Result<u64, SahneError> {
         let result = unsafe {
             syscall(arch::SYSCALL_GET_KERNEL_INFO, info_type as u64, 0, 0, 0, 0)
         };
         if result < 0 {
-            Err(SahneError::UnknownSystemCall)
+            Err(map_kernel_error(result))
         } else {
             Ok(result as u64)
         }
     }
 
-    /// CPU'yu başka bir sürece bırakır.
-    pub fn yield_cpu() -> Result<(), SahneError> {
+    /// Sistem saatini (örneğin, epoch'tan beri geçen nanosaniye olarak) alır.
+    pub fn get_time() -> Result<u64, SahneError> {
         let result = unsafe {
-            syscall(arch::SYSCALL_YIELD, 0, 0, 0, 0, 0)
+            syscall(arch::SYSCALL_GET_SYSTEM_TIME, 0, 0, 0, 0, 0)
         };
-        if result < 0 {
-            Err(SahneError::UnknownSystemCall)
+         if result < 0 {
+            Err(map_kernel_error(result))
         } else {
-            Ok(())
+            Ok(result as u64)
         }
     }
-
-    /// Aygıt sürücülerine özel komutlar göndermek için kullanılır.
-    /// `ioctl` sistem çağrısını temsil eder.
-    ///
-    /// # Hatalar
-    ///
-    /// * `SahneError::InvalidFileDescriptor`: Geçersiz bir dosya tanımlayıcısı verilirse döner.
-    /// * `SahneError::InvalidParameter`: Geçersiz bir komut veya argüman verilirse döner.
-    /// * `SahneError::PermissionDenied`: Gerekli izinler yoksa döner.
-    pub fn ioctl(fd: u64, request: u64, arg: u64) -> Result<i64, SahneError> {
-        let result = unsafe {
-            syscall(arch::SYSCALL_IOCTL, fd, request, arg, 0, 0)
-        };
-        if result < 0 {
-            match result {
-                -9 => Err(SahneError::InvalidFileDescriptor),
-                -22 => Err(SahneError::InvalidParameter),
-                -13 => Err(SahneError::PermissionDenied),
-                _ => Err(SahneError::UnknownSystemCall),
-            }
-        } else {
-            Ok(result)
-        }
-    }
-
-    // ... diğer çekirdek iletişim fonksiyonları
 }
 
-// Senkronizasyon ilkel araçları
+// Senkronizasyon araçları modülü (Mutex -> Lock)
 pub mod sync {
-    use super::{SahneError, arch, syscall};
+    use super::{SahneError, arch, syscall, map_kernel_error, Handle};
 
-    /// Yeni bir muteks oluşturur. Başlangıçta kilidi açıktır.
-    pub fn mutex_create() -> Result<u64, SahneError> {
+    /// Yeni bir kilit (Lock) kaynağı oluşturur ve bunun için bir Handle döner.
+    /// Başlangıçta kilit serbesttir.
+    pub fn lock_create() -> Result<Handle, SahneError> {
         let result = unsafe {
-            syscall(arch::SYSCALL_MUTEX_CREATE, 0, 0, 0, 0, 0)
+            syscall(arch::SYSCALL_LOCK_CREATE, 0, 0, 0, 0, 0)
         };
         if result < 0 {
-            Err(SahneError::OutOfMemory) // Muteks oluşturmak için yeterli kaynak yoksa
+            Err(map_kernel_error(result))
         } else {
-            Ok(result as u64) // Muteks ID'si döner
+            Ok(Handle(result as u64))
         }
     }
 
-    /// Belirtilen muteksi kilitler. Eğer muteks zaten kilitliyse, çağıran thread bloke olur.
-    ///
-    /// # Hatalar
-    ///
-    /// * `SahneError::InvalidParameter`: Geçersiz bir muteks ID'si verilirse döner.
-    /// * `SahneError::Interrupted`: İşlem sinyal tarafından kesilirse döner.
-    pub fn mutex_lock(mutex_id: u64) -> Result<(), SahneError> {
+    /// Belirtilen Handle'a sahip kilidi almaya çalışır.
+    /// Kilit başka bir thread/task tarafından tutuluyorsa, çağıran bloke olur.
+    pub fn lock_acquire(lock_handle: Handle) -> Result<(), SahneError> {
+         if !lock_handle.is_valid() {
+            return Err(SahneError::InvalidHandle);
+        }
         let result = unsafe {
-            syscall(arch::SYSCALL_MUTEX_LOCK, mutex_id, 0, 0, 0, 0)
+            syscall(arch::SYSCALL_LOCK_ACQUIRE, lock_handle.raw(), 0, 0, 0, 0)
         };
         if result < 0 {
-            match result {
-                -22 => Err(SahneError::InvalidParameter),
-                -4 => Err(SahneError::Interrupted),
-                _ => Err(SahneError::UnknownSystemCall),
-            }
+            Err(map_kernel_error(result))
         } else {
             Ok(())
         }
     }
 
-    /// Belirtilen muteksin kilidini açar.
-    ///
-    /// # Hatalar
-    ///
-    /// * `SahneError::InvalidParameter`: Geçersiz bir muteks ID'si verilirse döner.
-    /// * `SahneError::InvalidOperation`: Muteks çağıran thread tarafından tutulmuyorsa döner.
-    pub fn mutex_unlock(mutex_id: u64) -> Result<(), SahneError> {
+    /// Belirtilen Handle'a sahip kilidi serbest bırakır.
+    /// Kilidin çağıran thread/task tarafından tutuluyor olması gerekir.
+    pub fn lock_release(lock_handle: Handle) -> Result<(), SahneError> {
+         if !lock_handle.is_valid() {
+            return Err(SahneError::InvalidHandle);
+        }
         let result = unsafe {
-            syscall(arch::SYSCALL_MUTEX_UNLOCK, mutex_id, 0, 0, 0, 0)
+            syscall(arch::SYSCALL_LOCK_RELEASE, lock_handle.raw(), 0, 0, 0, 0)
         };
         if result < 0 {
-            match result {
-                -22 => Err(SahneError::InvalidParameter),
-                -1 => Err(SahneError::InvalidOperation), // Örnek hata kodu: EPERM
-                _ => Err(SahneError::UnknownSystemCall),
-            }
+            Err(map_kernel_error(result))
         } else {
             Ok(())
         }
     }
+
+    // NOT: Sahne64'te kilitler de normal kaynaklar gibi `resource::release` ile
+    // tamamen yok edilebilir. `lock_release` sadece kilidi serbest bırakır, Handle'ı değil.
 }
 
-// Süreçler arası iletişim (IPC) modülü
-pub mod ipc {
-    use super::{SahneError, arch, syscall};
+// Görevler arası iletişim (IPC) modülü (Messaging)
+pub mod messaging {
+    use super::{SahneError, arch, syscall, map_kernel_error, TaskId, Handle};
 
-    /// Belirli bir boyutta bir mesaj kuyruğu oluşturur.
-    pub fn create_message_queue(capacity: usize) -> Result<u64, SahneError> {
+    // Sahne64'te mesajlaşma kanalları veya portlar da Handle ile temsil edilebilir.
+    // Şimdilik TaskId üzerinden doğrudan mesajlaşmayı varsayalım.
+
+    /// Hedef göreve (Task) bir mesaj gönderir.
+    /// `target_task`: Mesajın gönderileceği görevin TaskId'si.
+    /// `message`: Gönderilecek veri.
+    /// Bu işlem asenkron olabilir veya hedef kuyruk doluysa bloklayabilir/hata verebilir.
+    pub fn send(target_task: TaskId, message: &[u8]) -> Result<(), SahneError> {
+         if !target_task.is_valid() {
+             return Err(SahneError::InvalidParameter); // Veya InvalidTarget gibi özel bir hata
+         }
+        let msg_ptr = message.as_ptr() as u64;
+        let msg_len = message.len() as u64;
         let result = unsafe {
-            syscall(arch::SYSCALL_CREATE_SHARED_MEMORY, capacity as u64, 0, 0, 0, 0) // Mesaj kuyruğu için paylaşımlı bellek kullanabiliriz
+            syscall(arch::SYSCALL_MESSAGE_SEND, target_task.raw(), msg_ptr, msg_len, 0, 0)
         };
         if result < 0 {
-            Err(SahneError::OutOfMemory)
-        } else {
-            Ok(result as u64) // Paylaşımlı bellek ID'si (mesaj kuyruğu olarak kullanılacak)
-        }
-    }
-
-    /// Belirtilen süreç ID'sine bir mesaj gönderir.
-    ///
-    /// # Hatalar
-    ///
-    /// * `SahneError::InvalidParameter`: Geçersiz bir süreç ID'si veya mesaj verilirse döner.
-    /// * `SahneError::ResourceBusy`: Alıcı süreç mesaj kuyruğu doluysa döner.
-    pub fn send_message(pid: u64, message_ptr: *const u8, message_len: usize) -> Result<(), SahneError> {
-        let result = unsafe {
-            syscall(arch::SYSCALL_SEND_MESSAGE, pid, message_ptr as u64, message_len as u64, 0, 0)
-        };
-        if result < 0 {
-            match result {
-                -22 => Err(SahneError::InvalidParameter),
-                -11 => Err(SahneError::ResourceBusy), // Örnek hata kodu: EAGAIN
-                _ => Err(SahneError::UnknownSystemCall),
-            }
+            Err(map_kernel_error(result))
         } else {
             Ok(())
         }
     }
 
-    /// Mevcut süreç için bir mesaj alır. Eğer mesaj yoksa, işlem bloke olabilir.
+    /// Mevcut görev için gelen bir mesajı alır.
+    /// `buffer`: Mesajın kopyalanacağı tampon.
+    /// Eğer mesaj yoksa, varsayılan olarak bloklar. (Non-blocking için özel flag gerekebilir)
+    /// Başarılı olursa, alınan mesajın byte cinsinden boyutunu döner.
     ///
-    /// # Hatalar
-    ///
-    /// * `SahneError::NoMessage`: Mesaj kuyruğu boşsa ve bloke etme istenmediyse döner.
-    /// * `SahneError::InvalidAddress`: Geçersiz bir arabellek adresi verilirse döner.
-    /// * `SahneError::Interrupted`: İşlem sinyal tarafından kesilirse döner.
-    pub fn receive_message(buffer_ptr: *mut u8, buffer_len: usize) -> Result<usize, SahneError> {
+    /// # Dönüş Değeri
+    /// Ok(0) genellikle gönderenin bağlantıyı kapattığı anlamına gelebilir (eğer bağlantı odaklıysa).
+    /// Ok(n) n byte mesaj alındığını gösterir.
+    pub fn receive(buffer: &mut [u8]) -> Result<usize, SahneError> {
+        let buffer_ptr = buffer.as_mut_ptr() as u64;
+        let buffer_len = buffer.len() as u64;
         let result = unsafe {
-            syscall(arch::SYSCALL_RECEIVE_MESSAGE, buffer_ptr as u64, buffer_len as u64, 0, 0, 0)
+            // Belki gönderenin TaskId'sini veya bir mesaj Handle'ını da almak için
+            // ek argümanlar veya farklı bir syscall olabilir.
+            syscall(arch::SYSCALL_MESSAGE_RECEIVE, buffer_ptr, buffer_len, 0, 0, 0)
         };
         if result < 0 {
-            match result {
-                -61 => Err(SahneError::NoMessage), // Örnek hata kodu: ENOMSG
-                -14 => Err(SahneError::InvalidAddress), // Örnek hata kodu: EFAULT
-                -4 => Err(SahneError::Interrupted),
-                _ => Err(SahneError::UnknownSystemCall),
-            }
+            Err(map_kernel_error(result))
         } else {
-            Ok(result as usize) // Alınan mesajın boyutu
+            Ok(result as usize)
         }
     }
+
+    // TODO: Sahne64'te mesaj kuyrukları, portlar veya kanallar için `resource::acquire`
+    // benzeri bir mekanizma ve bunlara özel Handle'lar tanımlanabilir. Bu, daha yapılandırılmış
+    // bir IPC sağlar. Örneğin:
+    fn create_channel() -> Result<Handle, SahneError>`
+    fn connect(channel_id: ResourceId) -> Result<Handle, SahneError>`
+    fn send_via(handle: Handle, message: &[u8]) -> Result<(), SahneError>`
+    fn receive_from(handle: Handle, buffer: &mut [u8]) -> Result<usize, SahneError>`
 }
 
-// Örnek bir kullanıcı alanı programı
-#[cfg(feature = "std")] // Standart kütüphane özelliği aktifse çalışır
+
+// --- Örnek Kullanım (main fonksiyonu std gerektirir veya no_std ortamında özel entry point gerekir) ---
+// Bu kısım, kütüphanenin nasıl kullanılacağını gösterir ve Sahne64 prensiplerini yansıtır.
+#[cfg(feature = "std")] // Sadece standart kütüphane varsa derlenir (test/örnek amaçlı)
 fn main() {
-    println!("Sahne64 kullanıcı alanı programı çalışıyor!");
+    // no_std ortamında println! için kendi implementasyonumuz lazım.
+    // Şimdilik std ortamında olduğumuzu varsayalım.
+    use crate::{task, memory, resource, kernel, sync, messaging, Handle, TaskId, SahneError};
 
-    println!("Süreç ID: {:?}", process::get_pid());
+    println!("Sahne64 Kullanıcı Alanı Programı Başlatıldı!");
 
-    match memory::allocate(1024) {
+    match task::current_id() {
+        Ok(tid) => println!("Mevcut Görev ID: {:?}", tid),
+        Err(e) => eprintln!("Görev ID alınamadı: {:?}", e),
+    }
+
+    // Bellek Ayırma ve Bırakma
+    match memory::allocate(2048) {
         Ok(ptr) => {
-            println!("1024 byte bellek ayrıldı: {:?}", ptr);
-            match memory::free(ptr, 1024) {
+            println!("2048 byte bellek ayrıldı: {:p}", ptr);
+            // Belleği kullan... (örneğin ilk byte'a yaz)
+            unsafe { *ptr = 64; }
+            match memory::release(ptr, 2048) {
                 Ok(_) => println!("Bellek serbest bırakıldı."),
-                Err(e) => eprintln!("Bellek serbest bırakılırken hata oluştu: {:?}", e),
+                Err(e) => eprintln!("Bellek bırakma hatası: {:?}", e),
             }
         }
         Err(e) => eprintln!("Bellek ayırma hatası: {:?}", e),
     }
 
-    match process::create("/path/to/another_program") {
-        Ok(pid) => println!("Yeni süreç oluşturuldu, PID: {}", pid),
-        Err(e) => eprintln!("Süreç oluşturma hatası: {:?}", e),
-    }
-
-    match fs::open("/path/to/a_file.txt", fs::O_RDONLY) {
-        Ok(fd) => {
-            println!("Dosya açıldı, dosya tanımlayıcısı: {}", fd);
-            let mut buffer = [0u8; 128];
-            match fs::read(fd, &mut buffer) {
-                Ok(bytes_read) => println!("Dosyadan {} byte okundu.", bytes_read),
-                Err(e) => eprintln!("Dosyadan okuma hatası: {:?}", e),
+    // Kaynak Edinme, Okuma/Yazma, Bırakma (Dosya yerine)
+    let resource_name = "sahne://config/settings.dat"; // Sahne64'e özgü bir URI/path formatı?
+    match resource::acquire(resource_name, resource::MODE_READ | resource::MODE_CREATE) {
+        Ok(handle) => {
+            println!("Kaynak edinildi ('{}'), Handle: {:?}", resource_name, handle);
+            let mut buffer = [0u8; 256];
+            match resource::read(handle, &mut buffer) {
+                Ok(bytes_read) => println!("Kaynaktan {} byte okundu.", bytes_read),
+                Err(e) => eprintln!("Kaynak okuma hatası: {:?}", e),
             }
-            match fs::close(fd) {
-                Ok(_) => println!("Dosya kapatıldı."),
-                Err(e) => eprintln!("Dosya kapatma hatası: {:?}", e),
+            // Yazma denemesi (eğer MODE_WRITE de istenseydi)
+            // match resource::write(handle, b"Merhaba Sahne64!") { ... }
+
+            match resource::release(handle) {
+                Ok(_) => println!("Kaynak Handle'ı serbest bırakıldı."),
+                Err(e) => eprintln!("Kaynak bırakma hatası: {:?}", e),
             }
         }
-        Err(e) => eprintln!("Dosya açma hatası: {:?}", e),
+        Err(SahneError::ResourceNotFound) => eprintln!("Kaynak bulunamadı: {}", resource_name),
+        Err(e) => eprintln!("Kaynak edinme hatası ('{}'): {:?}", resource_name, e),
     }
 
-    match kernel::get_kernel_info(kernel::KERNEL_INFO_VERSION) {
-        Ok(info) => println!("Çekirdek versiyonu: {}", info),
-        Err(e) => eprintln!("Çekirdek bilgisi alınırken hata oluştu: {:?}", e),
+    // Yeni Görev Başlatma (Çalıştırılabilir kodun Handle'ı lazım)
+    // Gerçek sistemde bu handle başka bir `resource::acquire` ile alınır.
+    // Örneğin: let code_handle = resource::acquire("sahne://bin/hesaplayici", resource::MODE_READ)?;
+    let dummy_code_handle = Handle(10); // Varsayımsal handle
+    let task_args = b"arg1 arg2";
+    match task::spawn(dummy_code_handle, task_args) {
+        Ok(new_tid) => println!("Yeni görev başlatıldı, TaskId: {:?}", new_tid),
+        Err(e) => eprintln!("Görev başlatma hatası: {:?}", e),
     }
 
-    match sync::mutex_create() {
-        Ok(mutex_id) => {
-            println!("Muteks oluşturuldu, ID: {}", mutex_id);
-            match sync::mutex_lock(mutex_id) {
+    // Çekirdek Bilgisi Alma
+    match kernel::get_info(kernel::KERNEL_INFO_VERSION_MAJOR) {
+        Ok(ver) => println!("Çekirdek Ana Versiyon: {}", ver),
+        Err(e) => eprintln!("Çekirdek bilgisi alma hatası: {:?}", e),
+    }
+    match kernel::get_time() {
+        Ok(time) => println!("Sistem Zamanı (nanosaniye?): {}", time),
+        Err(e) => eprintln!("Zaman bilgisi alma hatası: {:?}", e),
+    }
+
+    // Kilit (Mutex) Kullanımı
+    match sync::lock_create() {
+        Ok(lock_handle) => {
+            println!("Kilit oluşturuldu, Handle: {:?}", lock_handle);
+            match sync::lock_acquire(lock_handle) {
                 Ok(_) => {
-                    println!("Muteks kilitlendi.");
-                    match sync::mutex_unlock(mutex_id) {
-                        Ok(_) => println!("Muteks kilidi açıldı."),
-                        Err(e) => eprintln!("Muteks kilidi açılırken hata: {:?}", e),
+                    println!("Kilit alındı.");
+                    // ... Kritik bölge ...
+                    println!("Kritik bölge bitti.");
+                    match sync::lock_release(lock_handle) {
+                        Ok(_) => println!("Kilit bırakıldı."),
+                        Err(e) => eprintln!("Kilit bırakma hatası: {:?}", e),
                     }
                 }
-                Err(e) => eprintln!("Muteks kilitlenirken hata: {:?}", e),
+                Err(e) => eprintln!("Kilit alma hatası: {:?}", e),
             }
+             // Kilidi tamamen yok etmek için resource::release kullanılır (opsiyonel)
+             match resource::release(lock_handle) {
+                 Ok(_) => println!("Kilit kaynağı serbest bırakıldı."),
+                 Err(e) => eprintln!("Kilit kaynağı bırakma hatası: {:?}", e),
+             }
         }
-        Err(e) => eprintln!("Muteks oluşturma hatası: {:?}", e),
+        Err(e) => eprintln!("Kilit oluşturma hatası: {:?}", e),
     }
 
-    match ipc::create_message_queue(16) {
-        Ok(queue_id) => {
-            println!("Mesaj kuyruğu oluşturuldu, ID: {}", queue_id);
-            let message = b"Merhaba Kernel!";
-            match ipc::send_message(1, message.as_ptr(), message.len()) {
-                Ok(_) => println!("Çekirdeğe mesaj gönderildi."),
-                Err(e) => eprintln!("Mesaj gönderme hatası: {:?}", e),
-            }
-            let mut buffer = [0u8; 32];
-            match ipc::receive_message(buffer.as_mut_ptr(), buffer.len()) {
-                Ok(received_len) => {
-                    println!("Alınan mesaj: {:?}", &buffer[..received_len]);
+    // Mesajlaşma Örneği
+    let target_task_id = TaskId(2); // Hedef görevin ID'si (varsayımsal)
+    let message_data = b"Merhaba Task 2!";
+    match messaging::send(target_task_id, message_data) {
+        Ok(_) => println!("{:?} ID'li göreve mesaj gönderildi.", target_task_id),
+        Err(e) => eprintln!("Mesaj gönderme hatası: {:?}", e),
+    }
+
+    let mut recv_buffer = [0u8; 64];
+    println!("Gelen mesaj bekleniyor...");
+    match messaging::receive(&mut recv_buffer) {
+        Ok(received_len) => {
+            if received_len > 0 {
+                println!("Mesaj alındı ({} byte): {:?}", received_len, &recv_buffer[..received_len]);
+                // Belki string'e çevirme?
+                if let Ok(s) = core::str::from_utf8(&recv_buffer[..received_len]) {
+                    println!("  Mesaj (metin): {}", s);
                 }
-                Err(e) => eprintln!("Mesaj alma hatası: {:?}", e),
+            } else {
+                 println!("Boş mesaj alındı veya bağlantı kapandı?");
             }
         }
-        Err(e) => eprintln!("Mesaj kuyruğu oluşturma hatası: {:?}", e),
+        Err(SahneError::NoMessage) => eprintln!("Mesaj yok (non-blocking olsaydı)."), // Bu senaryo blocking receive'de zor
+        Err(e) => eprintln!("Mesaj alma hatası: {:?}", e),
     }
 
-    process::exit(0);
+    println!("Görev uykuya dalıyor (1 saniye)...");
+    let _ = task::sleep(1000);
+    println!("Görev uyandı.");
+
+
+    println!("Sahne64 programı normal şekilde sonlanıyor.");
+    task::exit(0); // Görevi 0 koduyla sonlandır
 }
 
-// Standart kütüphanenin bazı temel fonksiyonlarının (örneğin println!) kendi implementasyonunuz
-// veya harici bir crate (örneğin core::fmt) kullanılarak sağlanması gerekebilir.
+
+// --- no_std için Gerekli Olabilecekler ---
+
+// Panik durumunda ne yapılacağı (no_std)
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
-    loop {}
+    // Gerçek bir sistemde burada belki hata mesajı bir porta yazılır,
+    // sistem yeniden başlatılır veya sadece sonsuz döngüye girilir.
+    // Örn:
+    // print!("PANIC: {}", info);
+    // system_reset();
+    loop {
+        core::hint::spin_loop(); // İşlemciyi meşgul etmeden bekle
+    }
 }
 
-// Bu kısım, no_std ortamında println! gibi makroların çalışması için gereklidir.
-// Gerçek bir CustomOS ortamında, bu işlevselliği çekirdek üzerinden bir sistem çağrısı ile
-// veya özel bir donanım sürücüsü ile sağlamanız gerekebilir.
-// Aşağıdaki kod, core::fmt kütüphanesini kullanarak basit bir formatlama örneği sunar.
-// Ancak, gerçek bir çıktı mekanizması (örneğin, UART) olmadan bu çıktıları göremezsiniz.
+// `println!` gibi makroların `no_std` ortamında çalışması için basit bir implementasyon.
+// Gerçek bir Sahne64'te bu, çekirdeğe `resource::write` sistem çağrısı yaparak
+// bir konsol Handle'ına yazmayı içerecektir.
 #[cfg(not(feature = "std"))]
-mod print {
+mod stdio_impl {
     use core::fmt;
-    use core::fmt::Write;
 
-    struct Stdout;
+    // Bu struct, çıktının nereye yazılacağını temsil eder.
+    // Gerçek sistemde bu bir UART, VGA buffer veya debug portu olabilir.
+    // Şimdilik hiçbir şey yapmıyor.
+    struct SahneWriter;
 
-    impl fmt::Write for Stdout {
+    impl fmt::Write for SahneWriter {
         fn write_str(&mut self, s: &str) -> fmt::Result {
-            // Burada gerçek çıktı mekanizmasına (örneğin, bir UART sürücüsüne) erişim olmalı.
-            // Bu örnekte, çıktı kaybolacaktır çünkü gerçek bir çıktı yok.
-            // Gerçek bir işletim sisteminde, bu kısım donanıma özel olacaktır.
+            // BURASI ÖNEMLİ: Gerçek Sahne64 çekirdeğinde, bu fonksiyon
+            // `syscall(SYSCALL_RESOURCE_WRITE, CONSOLE_HANDLE, s.ptr, s.len, ...)`
+            // gibi bir sistem çağrısı yapmalıdır. CONSOLE_HANDLE, görevin
+            // başlangıçta aldığı standart çıktı Handle'ı olabilir.
+            // Şimdilik sadece başarılı olduğunu varsayıyoruz.
             Ok(())
         }
     }
@@ -630,8 +729,9 @@ mod print {
     #[macro_export]
     macro_rules! print {
         ($($arg:tt)*) => ({
-            let mut stdout = $crate::print::Stdout;
-            core::fmt::write(&mut stdout, core::format_args!($($arg)*)).unwrap();
+            use core::fmt::Write;
+            let mut writer = $crate::stdio_impl::SahneWriter;
+            let _ = write!(writer, $($arg)*); // Hata durumunu yoksay (basit örnek)
         });
     }
 
@@ -640,4 +740,19 @@ mod print {
         () => ($crate::print!("\n"));
         ($($arg:tt)*) => ($crate::print!("{}\n", format_args!($($arg)*)));
     }
+
+    #[macro_export]
+    macro_rules! eprintln {
+        () => ($crate::print!("\n")); // Şimdilik stderr yok, stdout'a yaz
+        ($($arg:tt)*) => ($crate::print!("{}\n", format_args!($($arg)*)));
+    }
+
+    // Bu modülü ana scope'a eklemek için:
+    use crate::stdio_impl;` // main veya lib.rs içinde
 }
+
+// Eğer bu bir kütüphane ise ve `main` sadece örnekse, aşağıdaki gibi bir `lib.rs` yapısı olur:
+pub use crate::arch;
+pub use crate::memory;
+// // ... diğer modüller ...
+pub use crate::{Handle, TaskId, SahneError};
