@@ -1,5 +1,6 @@
 #![no_std] // Standart kütüphaneye ihtiyaç duymuyoruz
 #![allow(dead_code)] // Henüz kullanılmayan kodlar için uyarı vermesin
+
 #[cfg(any(target_arch = "riscv64", target_arch = "aarch64", target_arch = "x86_64", target_arch = "sparc64", target_arch = "openrisc", target_arch = "powerpc64", target_arch = "loongarch64", target_arch = "elbrus", target_arch = "mips64"))]
 pub mod arch {
     // Mimariye özel sistem çağrı numaraları (Sahne64 terminolojisi ile)
@@ -20,8 +21,8 @@ pub mod arch {
     pub const SYSCALL_THREAD_EXIT: u64 = 15;     // Mevcut iş parçacığını sonlandır
     pub const SYSCALL_GET_SYSTEM_TIME: u64 = 16; // Sistem saatini al
     pub const SYSCALL_SHARED_MEM_CREATE: u64 = 17; // Paylaşımlı bellek alanı oluştur (Handle döner)
-    pub const SYSCALL_SHARED_MEM_MAP: u64 = 18;    // Paylaşımlı belleği adres alanına eşle (Handle ile)
-    pub const SYSCALL_SHARED_MEM_UNMAP: u64 = 19;  // Paylaşımlı bellek eşlemesini kaldır
+    pub const SYSCALL_SHARED_MEM_MAP: u64 = 18;   // Paylaşımlı belleği adres alanına eşle (Handle ile)
+    pub const SYSCALL_SHARED_MEM_UNMAP: u64 = 19; // Paylaşımlı bellek eşlemesini kaldır
     pub const SYSCALL_MESSAGE_SEND: u64 = 20;    // Başka bir göreve mesaj gönder (Task ID veya Handle ile)
     pub const SYSCALL_MESSAGE_RECEIVE: u64 = 21; // Mesaj al (Bloklayabilir)
     pub const SYSCALL_GET_KERNEL_INFO: u64 = 100; // Çekirdek bilgisi al
@@ -110,19 +111,19 @@ extern "sysv64" {
 // NOT: Gerçek Sahne64 çekirdeği kendi hata kodlarını tanımlamalıdır. Buradakiler varsayımsaldır.
 fn map_kernel_error(code: i64) -> SahneError {
     match code {
-        -1 => SahneError::PermissionDenied,    // EPERM gibi
-        -2 => SahneError::ResourceNotFound,   // ENOENT gibi
+        -1 => SahneError::PermissionDenied,     // EPERM gibi
+        -2 => SahneError::ResourceNotFound,    // ENOENT gibi
         -3 => SahneError::TaskCreationFailed, // ESRCH gibi (belki?)
-        -4 => SahneError::Interrupted,       // EINTR gibi
-        -9 => SahneError::InvalidHandle,       // EBADF gibi
-        -11 => SahneError::ResourceBusy,       // EAGAIN gibi
-        -12 => SahneError::OutOfMemory,        // ENOMEM gibi
-        -13 => SahneError::PermissionDenied,    // EACCES gibi
-        -14 => SahneError::InvalidAddress,      // EFAULT gibi
-        -17 => SahneError::NamingError,        // EEXIST gibi (belki?)
-        -22 => SahneError::InvalidParameter,    // EINVAL gibi
-        -38 => SahneError::NotSupported,       // ENOSYS gibi
-        -61 => SahneError::NoMessage,          // ENOMSG gibi
+        -4 => SahneError::Interrupted,        // EINTR gibi
+        -9 => SahneError::InvalidHandle,        // EBADF gibi
+        -11 => SahneError::ResourceBusy,         // EAGAIN gibi
+        -12 => SahneError::OutOfMemory,          // ENOMEM gibi
+        -13 => SahneError::PermissionDenied,     // EACCES gibi
+        -14 => SahneError::InvalidAddress,     // EFAULT gibi
+        -17 => SahneError::NamingError,         // EEXIST gibi (belki?)
+        -22 => SahneError::InvalidParameter,     // EINVAL gibi
+        -38 => SahneError::NotSupported,        // ENOSYS gibi
+        -61 => SahneError::NoMessage,           // ENOMSG gibi
         // ... diğer Sahne64'e özel hata kodları ...
         _ => SahneError::UnknownSystemCall, // Bilinmeyen veya eşlenmemiş hata
     }
@@ -175,10 +176,10 @@ pub mod memory {
 
     /// Paylaşımlı bellek Handle'ını mevcut görevin adres alanına eşler.
     pub fn map_shared(handle: Handle, offset: usize, size: usize) -> Result<*mut u8, SahneError> {
-         if !handle.is_valid() {
-            return Err(SahneError::InvalidHandle);
-        }
-       let result = unsafe {
+          if !handle.is_valid() {
+              return Err(SahneError::InvalidHandle);
+          }
+        let result = unsafe {
             syscall(arch::SYSCALL_SHARED_MEM_MAP, handle.raw(), offset as u64, size as u64, 0, 0)
         };
         if result < 0 {
@@ -215,9 +216,9 @@ pub mod task {
     /// * `args`: Göreve başlangıçta iletilecek argüman verisi.
     /// * `capabilities`: (Opsiyonel) Göreve verilecek başlangıç yetenekleri/handle'ları listesi.
     pub fn spawn(code_handle: Handle, args: &[u8]) -> Result<TaskId, SahneError> {
-         if !code_handle.is_valid() {
-            return Err(SahneError::InvalidHandle);
-        }
+          if !code_handle.is_valid() {
+              return Err(SahneError::InvalidHandle);
+          }
         let args_ptr = args.as_ptr() as u64;
         let args_len = args.len() as u64;
         let result = unsafe {
@@ -356,9 +357,9 @@ pub mod resource {
     /// Belirtilen Handle ile temsil edilen kaynağa veri yazar.
     /// Yazılan byte sayısını döner.
     pub fn write(handle: Handle, buffer: &[u8]) -> Result<usize, SahneError> {
-         if !handle.is_valid() {
-            return Err(SahneError::InvalidHandle);
-        }
+          if !handle.is_valid() {
+              return Err(SahneError::InvalidHandle);
+          }
         let buffer_ptr = buffer.as_ptr() as u64;
         let buffer_len = buffer.len() as u64;
         let result = unsafe {
@@ -374,9 +375,9 @@ pub mod resource {
     /// Belirtilen Handle'ı serbest bırakır, kaynağa erişimi sonlandırır.
     /// Kaynağın kendisi (eğer kalıcıysa) silinmeyebilir, sadece bu Handle geçersizleşir.
     pub fn release(handle: Handle) -> Result<(), SahneError> {
-         if !handle.is_valid() {
-            return Err(SahneError::InvalidHandle); // Zaten geçersiz handle'ı bırakmaya çalışma
-        }
+          if !handle.is_valid() {
+              return Err(SahneError::InvalidHandle); // Zaten geçersiz handle'ı bırakmaya çalışma
+          }
         let result = unsafe {
             syscall(arch::SYSCALL_RESOURCE_RELEASE, handle.raw(), 0, 0, 0, 0)
         };
@@ -391,9 +392,9 @@ pub mod resource {
     /// `request`: Gönderilecek komutun Sahne64'e özgü kodu.
     /// `arg`: Komuta eşlik eden veri (yorumu komuta bağlı).
     pub fn control(handle: Handle, request: u64, arg: u64) -> Result<i64, SahneError> {
-         if !handle.is_valid() {
-            return Err(SahneError::InvalidHandle);
-        }
+          if !handle.is_valid() {
+              return Err(SahneError::InvalidHandle);
+          }
         let result = unsafe {
             syscall(arch::SYSCALL_RESOURCE_CONTROL, handle.raw(), request, arg, 0, 0)
         };
@@ -434,11 +435,11 @@ pub mod kernel {
         let result = unsafe {
             syscall(arch::SYSCALL_GET_SYSTEM_TIME, 0, 0, 0, 0, 0)
         };
-         if result < 0 {
-            Err(map_kernel_error(result))
-        } else {
-            Ok(result as u64)
-        }
+          if result < 0 {
+              Err(map_kernel_error(result))
+          } else {
+              Ok(result as u64)
+          }
     }
 }
 
@@ -462,9 +463,9 @@ pub mod sync {
     /// Belirtilen Handle'a sahip kilidi almaya çalışır.
     /// Kilit başka bir thread/task tarafından tutuluyorsa, çağıran bloke olur.
     pub fn lock_acquire(lock_handle: Handle) -> Result<(), SahneError> {
-         if !lock_handle.is_valid() {
-            return Err(SahneError::InvalidHandle);
-        }
+          if !lock_handle.is_valid() {
+              return Err(SahneError::InvalidHandle);
+          }
         let result = unsafe {
             syscall(arch::SYSCALL_LOCK_ACQUIRE, lock_handle.raw(), 0, 0, 0, 0)
         };
@@ -478,9 +479,9 @@ pub mod sync {
     /// Belirtilen Handle'a sahip kilidi serbest bırakır.
     /// Kilidin çağıran thread/task tarafından tutuluyor olması gerekir.
     pub fn lock_release(lock_handle: Handle) -> Result<(), SahneError> {
-         if !lock_handle.is_valid() {
-            return Err(SahneError::InvalidHandle);
-        }
+          if !lock_handle.is_valid() {
+              return Err(SahneError::InvalidHandle);
+          }
         let result = unsafe {
             syscall(arch::SYSCALL_LOCK_RELEASE, lock_handle.raw(), 0, 0, 0, 0)
         };
@@ -507,9 +508,9 @@ pub mod messaging {
     /// `message`: Gönderilecek veri.
     /// Bu işlem asenkron olabilir veya hedef kuyruk doluysa bloklayabilir/hata verebilir.
     pub fn send(target_task: TaskId, message: &[u8]) -> Result<(), SahneError> {
-         if !target_task.is_valid() {
-             return Err(SahneError::InvalidParameter); // Veya InvalidTarget gibi özel bir hata
-         }
+          if !target_task.is_valid() {
+              return Err(SahneError::InvalidParameter); // Veya InvalidTarget gibi özel bir hata
+          }
         let msg_ptr = message.as_ptr() as u64;
         let msg_len = message.len() as u64;
         let result = unsafe {
@@ -545,14 +546,439 @@ pub mod messaging {
         }
     }
 
-    // TODO: Sahne64'te mesaj kuyrukları, portlar veya kanallar için `resource::acquire`
+     TODO: Sahne64'te mesaj kuyrukları, portlar veya kanallar için `resource::acquire`
     // benzeri bir mekanizma ve bunlara özel Handle'lar tanımlanabilir. Bu, daha yapılandırılmış
     // bir IPC sağlar. Örneğin:
-    fn create_channel() -> Result<Handle, SahneError>`
-    fn connect(channel_id: ResourceId) -> Result<Handle, SahneError>`
-    fn send_via(handle: Handle, message: &[u8]) -> Result<(), SahneError>`
-    fn receive_from(handle: Handle, buffer: &mut [u8]) -> Result<usize, SahneError>`
+     fn create_channel() -> Result<Handle, SahneError>`
+     fn connect(channel_id: ResourceId) -> Result<Handle, SahneError>`
+     fn send_via(handle: Handle, message: &[u8]) -> Result<(), SahneError>`
+     fn receive_from(handle: Handle, buffer: &mut [u8]) -> Result<usize, SahneError>`
 }
+
+
+// --- Buradan itibaren C API katmanı kodunu ekliyoruz ---
+
+// Rust'taki size_t'ye karşılık gelen C tipi için import. no_std olduğu için core kullanıyoruz.
+use core::ffi::c_void; // C'deki void*'a karşılık gelir
+use core::ptr; // İşaretçi operasyonları için
+
+// --- Add C-compatible Error Codes ---
+// These correspond to the SAHNE_ERROR_* defines in sahne.h
+#[repr(i32)] // Ensure these are 32-bit integers
+#[allow(non_camel_case_types)] // Allow C-style names
+pub enum sahne_error_t {
+    SAHNE_SUCCESS = 0,
+    SAHNE_ERROR_OUT_OF_MEMORY = 1,
+    SAHNE_ERROR_INVALID_ADDRESS = 2,
+    SAHNE_ERROR_INVALID_PARAMETER = 3,
+    SAHNE_ERROR_RESOURCE_NOT_FOUND = 4,
+    SAHNE_ERROR_PERMISSION_DENIED = 5,
+    SAHNE_ERROR_RESOURCE_BUSY = 6,
+    SAHNE_ERROR_INTERRUPTED = 7,
+    SAHNE_ERROR_NO_MESSAGE = 8,
+    SAHNE_ERROR_INVALID_OPERATION = 9,
+    SAHNE_ERROR_NOT_SUPPORTED = 10,
+    SAHNE_ERROR_UNKNOWN_SYSCALL = 11,
+    SAHNE_ERROR_TASK_CREATION_FAILED = 12,
+    SAHNE_ERROR_INVALID_HANDLE = 13,
+    SAHNE_ERROR_HANDLE_LIMIT_EXCEEDED = 14,
+    SAHNE_ERROR_NAMING_ERROR = 15,
+    SAHNE_ERROR_COMMUNICATION_ERROR = 16,
+    // Add more mappings here if SahneError gets new variants
+    SAHNE_ERROR_OTHER = 255, // A catch-all for unmapped kernel errors
+}
+
+// Helper to map Rust SahneError to C error code
+fn map_sahne_error_to_c(err: SahneError) -> sahne_error_t {
+    match err {
+        SahneError::OutOfMemory => sahne_error_t::SAHNE_ERROR_OUT_OF_MEMORY,
+        SahneError::InvalidAddress => sahne_error_t::SAHNE_ERROR_INVALID_ADDRESS,
+        SahneError::InvalidParameter => sahne_error_t::SAHNE_ERROR_INVALID_PARAMETER,
+        SahneError::ResourceNotFound => sahne_error_t::SAHNE_ERROR_RESOURCE_NOT_FOUND,
+        SahneError::PermissionDenied => sahne_error_t::SAHNE_ERROR_PERMISSION_DENIED,
+        SahneError::ResourceBusy => sahne_error_t::SAHNE_ERROR_RESOURCE_BUSY,
+        SahneError::Interrupted => sahne_error_t::SAHNE_ERROR_INTERRUPTED,
+        SahneError::NoMessage => sahne_error_t::SAHNE_ERROR_NO_MESSAGE,
+        SahneError::InvalidOperation => sahne_error_t::SAHNE_ERROR_INVALID_OPERATION,
+        SahneError::NotSupported => sahne_error_t::SAHNE_ERROR_NOT_SUPPORTED,
+        SahneError::UnknownSystemCall => sahne_error_t::SAHNE_ERROR_UNKNOWN_SYSCALL,
+        SahneError::TaskCreationFailed => sahne_error_t::SAHNE_ERROR_TASK_CREATION_FAILED,
+        SahneError::InvalidHandle => sahne_error_t::SAHNE_ERROR_INVALID_HANDLE,
+        SahneError::HandleLimitExceeded => sahne_error_t::SAHNE_ERROR_HANDLE_LIMIT_EXCEEDED,
+        SahneError::NamingError => sahne_error_t::SAHNE_ERROR_NAMING_ERROR,
+        SahneError::CommunicationError => sahne_error_t::SAHNE_ERROR_COMMUNICATION_ERROR,
+        // Add more mappings here
+    }
+}
+
+// Helper to map the raw kernel i64 result to a C error code
+fn map_raw_result_to_c_error(result: i64) -> sahne_error_t {
+    if result >= 0 {
+        sahne_error_t::SAHNE_SUCCESS
+    } else {
+        // Map the *negative* kernel code to a SahneError first, then to C error
+        let sahne_err = map_kernel_error(result);
+        map_sahne_error_to_c(sahne_err)
+    }
+}
+
+
+// --- Expose C API Functions ---
+
+#[no_mangle] // Prevent Rust from mangling the function name
+pub extern "C" fn sahne_mem_allocate(size: usize, out_ptr: *mut *mut u8) -> sahne_error_t { usize ~ size_t
+    if out_ptr.is_null() {
+        return sahne_error_t::SAHNE_ERROR_INVALID_PARAMETER;
+    }
+    match memory::allocate(size) {
+        Ok(ptr) => {
+            unsafe { *out_ptr = ptr; }
+            sahne_error_t::SAHNE_SUCCESS
+        }
+        Err(e) => map_sahne_error_to_c(e),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn sahne_mem_release(ptr: *mut u8, size: usize) -> sahne_error_t { usize ~ size_t
+     match memory::release(ptr, size) {
+        Ok(()) => sahne_error_t::SAHNE_SUCCESS,
+        Err(e) => map_sahne_error_to_c(e),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn sahne_mem_create_shared(size: usize, out_handle: *mut u64) -> sahne_error_t { usize ~ size_t, u64 ~ sahne_handle_t
+    if out_handle.is_null() {
+        return sahne_error_t::SAHNE_ERROR_INVALID_PARAMETER;
+    }
+    match memory::create_shared(size) {
+        Ok(handle) => {
+            unsafe { *out_handle = handle.0; }
+            sahne_error_t::SAHNE_SUCCESS
+        }
+        Err(e) => map_sahne_error_to_c(e),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn sahne_mem_map_shared(handle: u64, offset: usize, size: usize, out_ptr: *mut *mut u8) -> sahne_error_t { u64 ~ sahne_handle_t, usize ~ size_t
+     if out_ptr.is_null() {
+        return sahne_error_t::SAHNE_ERROR_INVALID_PARAMETER;
+    }
+    match memory::map_shared(Handle(handle), offset, size) {
+        Ok(ptr) => {
+            unsafe { *out_ptr = ptr; }
+            sahne_error_t::SAHNE_SUCCESS
+        }
+        Err(e) => map_sahne_error_to_c(e),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn sahne_mem_unmap_shared(addr: *mut u8, size: usize) -> sahne_error_t { usize ~ size_t
+     match memory::unmap_shared(addr, size) {
+        Ok(()) => sahne_error_t::SAHNE_SUCCESS,
+        Err(e) => map_sahne_error_to_c(e),
+    }
+}
+
+
+#[no_mangle]
+pub extern "C" fn sahne_task_spawn(code_handle: u64, args_ptr: *const u8, args_len: usize, out_task_id: *mut u64) -> sahne_error_t { u64 ~ sahne_handle_t, usize ~ size_t, u64 ~ sahne_task_id_t
+    if args_ptr.is_null() && args_len > 0 {
+         return sahne_error_t::SAHNE_ERROR_INVALID_PARAMETER;
+    }
+    if out_task_id.is_null() {
+        return sahne_error_t::SAHNE_ERROR_INVALID_PARAMETER;
+    }
+    let args_slice = if args_ptr.is_null() {
+        &[]
+    } else {
+        unsafe { core::slice::from_raw_parts(args_ptr, args_len) }
+    };
+
+    match task::spawn(Handle(code_handle), args_slice) {
+        Ok(tid) => {
+            unsafe { *out_task_id = tid.0; }
+            sahne_error_t::SAHNE_SUCCESS
+        }
+        Err(e) => map_sahne_error_to_c(e),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn sahne_task_exit(code: i32) -> ! {
+    task::exit(code)
+}
+
+#[no_mangle]
+pub extern "C" fn sahne_task_current_id(out_task_id: *mut u64) -> sahne_error_t { u64 ~ sahne_task_id_t
+    if out_task_id.is_null() {
+        return sahne_error_t::SAHNE_ERROR_INVALID_PARAMETER;
+    }
+    match task::current_id() {
+        Ok(tid) => {
+            unsafe { *out_task_id = tid.0; }
+            sahne_error_t::SAHNE_SUCCESS
+        }
+        Err(e) => map_sahne_error_to_c(e),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn sahne_task_sleep(milliseconds: u64) -> sahne_error_t {
+    match task::sleep(milliseconds) {
+        Ok(()) => sahne_error_t::SAHNE_SUCCESS,
+        Err(e) => map_sahne_error_to_c(e),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn sahne_thread_create(entry_point: u64, stack_size: usize, arg: u64, out_thread_id: *mut u64) -> sahne_error_t { usize ~ size_t, u64 ~ thread ID
+     if out_thread_id.is_null() {
+        return sahne_error_t::SAHNE_ERROR_INVALID_PARAMETER;
+    }
+     match task::create_thread(entry_point, stack_size, arg) {
+        Ok(thread_id) => {
+            unsafe { *out_thread_id = thread_id; }
+            sahne_error_t::SAHNE_SUCCESS
+        }
+        Err(e) => map_sahne_error_to_c(e),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn sahne_thread_exit(code: i32) -> ! {
+    task::exit_thread(code)
+}
+
+#[no_mangle]
+pub extern "C" fn sahne_task_yield() -> sahne_error_t {
+    match task::yield_now() {
+        Ok(()) => sahne_error_t::SAHNE_SUCCESS,
+        Err(e) => map_sahne_error_to_c(e),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn sahne_resource_acquire(id_ptr: *const u8, id_len: usize, mode: u32, out_handle: *mut u64) -> sahne_error_t { usize ~ size_t, u64 ~ sahne_handle_t
+    if id_ptr.is_null() && id_len > 0 {
+         return sahne_error_t::SAHNE_ERROR_INVALID_PARAMETER;
+    }
+    if out_handle.is_null() {
+        return sahne_error_t::SAHNE_ERROR_INVALID_PARAMETER;
+    }
+    let id_slice = if id_ptr.is_null() {
+        &[]
+    } else {
+        unsafe { core::slice::from_raw_parts(id_ptr, id_len) }
+    };
+
+    // Convert &[u8] to &str for the Rust API call if needed, handle errors.
+    // If Sahne64 resource IDs are arbitrary bytes, modify the Rust API to take &[u8].
+    // Assuming &[u8] mapping to &str and checking UTF-8 here.
+    let id_str_res = core::str::from_utf8(id_slice);
+    let id_str = match id_str_res {
+        Ok(s) => s,
+        Err(_) => return sahne_error_t::SAHNE_ERROR_INVALID_PARAMETER, // Or a specific NamingError for invalid UTF-8
+    };
+
+    match resource::acquire(id_str, mode) {
+        Ok(handle) => {
+            unsafe { *out_handle = handle.0; }
+            sahne_error_t::SAHNE_SUCCESS
+        }
+        Err(e) => map_sahne_error_to_c(e),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn sahne_resource_read(handle: u64, buffer_ptr: *mut u8, buffer_len: usize, out_bytes_read: *mut usize) -> sahne_error_t { u64 ~ sahne_handle_t, usize ~ size_t
+    if buffer_ptr.is_null() && buffer_len > 0 {
+         return sahne_error_t::SAHNE_ERROR_INVALID_PARAMETER;
+    }
+    if out_bytes_read.is_null() {
+        return sahne_error_t::SAHNE_ERROR_INVALID_PARAMETER;
+    }
+    let buffer_slice = if buffer_ptr.is_null() {
+        &mut []
+    } else {
+        unsafe { core::slice::from_raw_parts_mut(buffer_ptr, buffer_len) }
+    };
+
+    match resource::read(Handle(handle), buffer_slice) {
+        Ok(bytes_read) => {
+            unsafe { *out_bytes_read = bytes_read; }
+            sahne_error_t::SAHNE_SUCCESS
+        }
+        Err(e) => map_sahne_error_to_c(e),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn sahne_resource_write(handle: u64, buffer_ptr: *const u8, buffer_len: usize, out_bytes_written: *mut usize) -> sahne_error_t { // u64 ~ sahne_handle_t, usize ~ size_t
+     if buffer_ptr.is_null() && buffer_len > 0 {
+         return sahne_error_t::SAHNE_ERROR_INVALID_PARAMETER;
+    }
+    // out_bytes_written can be null if the caller doesn't care about the count. Check before dereferencing.
+     if out_bytes_written.is_null() { return SAHNE_ERROR_INVALID_PARAMETER; } // Depending on desired strictness
+
+    let buffer_slice = if buffer_ptr.is_null() {
+        &[]
+    } else {
+        unsafe { core::slice::from_raw_parts(buffer_ptr, buffer_len) }
+    };
+
+    match resource::write(Handle(handle), buffer_slice) {
+        Ok(bytes_written) => {
+             if !out_bytes_written.is_null() {
+                 unsafe { *out_bytes_written = bytes_written; }
+             }
+            sahne_error_t::SAHNE_SUCCESS
+        }
+        Err(e) => map_sahne_error_to_c(e),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn sahne_resource_release(handle: u64) -> sahne_error_t { u64 ~ sahne_handle_t
+    match resource::release(Handle(handle)) {
+        Ok(()) => sahne_error_t::SAHNE_SUCCESS,
+        Err(e) => map_sahne_error_to_c(e),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn sahne_resource_control(handle: u64, request: u64, arg: u64, out_result: *mut i64) -> sahne_error_t { u64 ~ sahne_handle_t
+    if out_result.is_null() {
+        return sahne_error_t::SAHNE_ERROR_INVALID_PARAMETER;
+    }
+     match resource::control(Handle(handle), request, arg) {
+        Ok(result_val) => {
+            unsafe { *out_result = result_val; }
+            sahne_error_t::SAHNE_SUCCESS
+        }
+        Err(e) => map_sahne_error_to_c(e),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn sahne_kernel_get_info(info_type: u32, out_value: *mut u64) -> sahne_error_t {
+    if out_value.is_null() {
+        return sahne_error_t::SAHNE_ERROR_INVALID_PARAMETER;
+    }
+    match kernel::get_info(info_type) {
+        Ok(value) => {
+            unsafe { *out_value = value; }
+            sahne_error_t::SAHNE_SUCCESS
+        }
+        Err(e) => map_sahne_error_to_c(e),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn sahne_kernel_get_time(out_time: *mut u64) -> sahne_error_t {
+    if out_time.is_null() {
+        return sahne_error_t::SAHNE_ERROR_INVALID_PARAMETER;
+    }
+     match kernel::get_time() {
+        Ok(time) => {
+            unsafe { *out_time = time; }
+            sahne_error_t::SAHNE_SUCCESS
+        }
+        Err(e) => map_sahne_error_to_c(e),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn sahne_sync_lock_create(out_handle: *mut u64) -> sahne_error_t { u64 ~ sahne_handle_t
+    if out_handle.is_null() {
+        return sahne_error_t::SAHNE_ERROR_INVALID_PARAMETER;
+    }
+    match sync::lock_create() {
+        Ok(handle) => {
+            unsafe { *out_handle = handle.0; }
+            sahne_error_t::SAHNE_SUCCESS
+        }
+        Err(e) => map_sahne_error_to_c(e),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn sahne_sync_lock_acquire(handle: u64) -> sahne_error_t { u64 ~ sahne_handle_t
+    match sync::lock_acquire(Handle(handle)) {
+        Ok(()) => sahne_error_t::SAHNE_SUCCESS,
+        Err(e) => map_sahne_error_to_c(e),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn sahne_sync_lock_release(handle: u64) -> sahne_error_t { u64 ~ sahne_handle_t
+     match sync::lock_release(Handle(handle)) {
+        Ok(()) => sahne_error_t::SAHNE_SUCCESS,
+        Err(e) => map_sahne_error_to_c(e),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn sahne_msg_send(target_task: u64, message_ptr: *const u8, message_len: usize) -> sahne_error_t { u64 ~ sahne_task_id_t, usize ~ size_t
+     if message_ptr.is_null() && message_len > 0 {
+         return sahne_error_t::SAHNE_ERROR_INVALID_PARAMETER;
+    }
+    let message_slice = if message_ptr.is_null() {
+        &[]
+    } else {
+        unsafe { core::slice::from_raw_parts(message_ptr, message_len) }
+    };
+    match messaging::send(TaskId(target_task), message_slice) {
+        Ok(()) => sahne_error_t::SAHNE_SUCCESS,
+        Err(e) => map_sahne_error_to_c(e),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn sahne_msg_receive(buffer_ptr: *mut u8, buffer_len: usize, out_bytes_received: *mut usize) -> sahne_error_t { // usize ~ size_t
+     if buffer_ptr.is_null() && buffer_len > 0 {
+         return sahne_error_t::SAHNE_ERROR_INVALID_PARAMETER;
+    }
+    if out_bytes_received.is_null() {
+        return sahne_error_t::SAHNE_ERROR_INVALID_PARAMETER;
+    }
+    let buffer_slice = if buffer_ptr.is_null() {
+        &mut []
+    } else {
+        unsafe { core::slice::from_raw_parts_mut(buffer_ptr, buffer_len) }
+    };
+
+    match messaging::receive(buffer_slice) {
+        Ok(bytes_received) => {
+            unsafe { *out_bytes_received = bytes_received; }
+            sahne_error_t::SAHNE_SUCCESS
+        }
+        Err(e) => map_sahne_error_to_c(e),
+    }
+}
+
+// Optional: Expose the raw syscall for advanced users or specific needs, though generally discouraged.
+ #[no_mangle]
+ pub extern "C" fn sahne_raw_syscall(number: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i64 {
+       unsafe { syscall(number, arg1, arg2, arg3, arg4, arg5) }
+ }
+
+
+// --- Re-export types for Rust users ---
+// (Bu kısım sizin orijinal kodunuzun sonuna yakındı, burada bırakmak uygun)
+pub use crate::arch;
+pub use crate::memory;
+pub use crate::task;
+pub use crate::resource;
+pub use crate::kernel;
+pub use crate::sync;
+pub use crate::messaging;
+pub use crate::{Handle, TaskId, SahneError}; // Export Rust-idiomatic types
+// C API hata tipi de Rust tarafından kullanılabilir hale getirilebilir (isteğe bağlı)
+pub use crate::sahne_error_t;
 
 
 // --- Örnek Kullanım (main fonksiyonu std gerektirir veya no_std ortamında özel entry point gerekir) ---
@@ -595,7 +1021,7 @@ fn main() {
                 Err(e) => eprintln!("Kaynak okuma hatası: {:?}", e),
             }
             // Yazma denemesi (eğer MODE_WRITE de istenseydi)
-            // match resource::write(handle, b"Merhaba Sahne64!") { ... }
+             match resource::write(handle, b"Merhaba Sahne64!") { ... }
 
             match resource::release(handle) {
                 Ok(_) => println!("Kaynak Handle'ı serbest bırakıldı."),
@@ -608,7 +1034,7 @@ fn main() {
 
     // Yeni Görev Başlatma (Çalıştırılabilir kodun Handle'ı lazım)
     // Gerçek sistemde bu handle başka bir `resource::acquire` ile alınır.
-    // Örneğin: let code_handle = resource::acquire("sahne://bin/hesaplayici", resource::MODE_READ)?;
+    let code_handle = resource::acquire("sahne://bin/hesaplayici", resource::MODE_READ)?;
     let dummy_code_handle = Handle(10); // Varsayımsal handle
     let task_args = b"arg1 arg2";
     match task::spawn(dummy_code_handle, task_args) {
@@ -642,11 +1068,11 @@ fn main() {
                 }
                 Err(e) => eprintln!("Kilit alma hatası: {:?}", e),
             }
-             // Kilidi tamamen yok etmek için resource::release kullanılır (opsiyonel)
-             match resource::release(lock_handle) {
-                 Ok(_) => println!("Kilit kaynağı serbest bırakıldı."),
-                 Err(e) => eprintln!("Kilit kaynağı bırakma hatası: {:?}", e),
-             }
+            // Kilidi tamamen yok etmek için resource::release kullanılır (opsiyonel)
+            match resource::release(lock_handle) {
+                Ok(_) => println!("Kilit kaynağı serbest bırakıldı."),
+                Err(e) => eprintln!("Kilit kaynağı bırakma hatası: {:?}", e),
+            }
         }
         Err(e) => eprintln!("Kilit oluşturma hatası: {:?}", e),
     }
@@ -670,7 +1096,7 @@ fn main() {
                     println!("  Mesaj (metin): {}", s);
                 }
             } else {
-                 println!("Boş mesaj alındı veya bağlantı kapandı?");
+                  println!("Boş mesaj alındı veya bağlantı kapandı?");
             }
         }
         Err(SahneError::NoMessage) => eprintln!("Mesaj yok (non-blocking olsaydı)."), // Bu senaryo blocking receive'de zor
@@ -696,8 +1122,8 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
     // Gerçek bir sistemde burada belki hata mesajı bir porta yazılır,
     // sistem yeniden başlatılır veya sadece sonsuz döngüye girilir.
     // Örn:
-    // print!("PANIC: {}", info);
-    // system_reset();
+     print!("PANIC: {}", info);
+     system_reset();
     loop {
         core::hint::spin_loop(); // İşlemciyi meşgul etmeden bekle
     }
@@ -718,7 +1144,7 @@ mod stdio_impl {
     impl fmt::Write for SahneWriter {
         fn write_str(&mut self, s: &str) -> fmt::Result {
             // BURASI ÖNEMLİ: Gerçek Sahne64 çekirdeğinde, bu fonksiyon
-            // `syscall(SYSCALL_RESOURCE_WRITE, CONSOLE_HANDLE, s.ptr, s.len, ...)`
+             `syscall(SYSCALL_RESOURCE_WRITE, CONSOLE_HANDLE, s.ptr, s.len, ...)`
             // gibi bir sistem çağrısı yapmalıdır. CONSOLE_HANDLE, görevin
             // başlangıçta aldığı standart çıktı Handle'ı olabilir.
             // Şimdilik sadece başarılı olduğunu varsayıyoruz.
@@ -748,11 +1174,21 @@ mod stdio_impl {
     }
 
     // Bu modülü ana scope'a eklemek için:
-    use crate::stdio_impl;` // main veya lib.rs içinde
+     use crate::stdio_impl; // main veya lib.rs içinde
 }
 
 // Eğer bu bir kütüphane ise ve `main` sadece örnekse, aşağıdaki gibi bir `lib.rs` yapısı olur:
 pub use crate::arch;
 pub use crate::memory;
 // // ... diğer modüller ...
-pub use crate::{Handle, TaskId, SahneError};
+pub use crate::task;
+pub use crate::resource;
+pub use crate::kernel;
+pub use crate::sync;
+pub use crate::messaging;
+
+// Rust API tiplerini ve C API hata tipini dışa aktar
+pub use crate::{Handle, TaskId, SahneError, sahne_error_t}; // sahne_error_t de artık kullanılabilir
+
+// (Bu API için programlama dili uyumluluk katmanı oluşturmak istiyorum çünkü bu API sadece Rust ile tam uyumlu olabiliyor)
+// (Ben bu katma sayesinde C, C++, D ve Rust olmak üzere toplamda 4 tane programlama dilinde kullanılabilmesini sağlayacak!)
