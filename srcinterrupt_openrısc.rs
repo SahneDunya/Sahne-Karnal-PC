@@ -283,18 +283,3 @@ unsafe fn enable_usb_interrupt() {
 
      // !!! BU KISIM DONANIMA ÖZGÜ KOD İLE DOLDURULMALIDIR. !!!
 }
-
-// Interrupt handler fonksiyonları
-// Bu fonksiyonlar genellikle merkezi interrupt_handler fonksiyonundan cause'a göre çağrılır.
-// Ayrı ayrı #[no_mangle] veya #[link_section] işaretleri alabilirler.
-
-// Zamanlayıcı kesme işleyicisi helper'ı, ana işleyiciden çağrılır.
-// handle_timer_interrupt fonksiyonu zaten yukarıda tanımlı.
-
-// USB kesme işleyicisi helper'ı, ana işleyiciden çağrılır.
-// handle_usb_interrupt fonksiyonu zaten yukarıda tanımlı.
-
-
-// no_std ortamında temel çıktı için Sahne64'ün konsol makrolarını kullanıyoruz.
-// Lokal stdio modülü veya println! makrosu bu dosyada tanımlı değil.
-// Sahne64 crate'i tarafından sağlandığı varsayılır.
