@@ -1,5 +1,5 @@
 #![no_std]
-// #[allow(dead_code)] // Keep if needed, otherwise remove
+#[allow(dead_code)] // Keep if needed, otherwise remove
 
 // Use the Sahne64 crate's modules/types
 // Assuming this file is part of a separate crate that depends on 'sahne64'
