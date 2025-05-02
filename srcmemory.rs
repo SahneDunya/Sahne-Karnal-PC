@@ -1,8 +1,19 @@
 #![no_std]
-use crate::{memory, SahneError};
+// Use the Sahne64 crate's modules/types
+// Assuming this file is part of a separate crate that depends on 'sahne64'
+// Sahne64 crate'ini projenize bağımlılık olarak eklemeniz gerekecek.
+use sahne64::{memory, SahneError}; // <-- Değişiklik 1: Sahne64 crate'inden import
 use core::ptr::NonNull;
 use core::slice;
-use core::mem::ManuallyDrop; // Drop'u manuel olarak kontrol etmek için
+// core::mem::ManuallyDrop import'u bu dosyada kullanılmıyor, kaldırılabilir.
+ use core::mem::ManuallyDrop; // Drop'u manuel olarak kontrol etmek için - Kullanılmıyor
+
+// Not: Eğer bu component crate'i no_std ortamında `eprintln!` kullanacaksa,
+// ya kendi basit çıktısını implement etmeli ya da Sahne64 crate'inin
+// sağladığı stdio_impl gibi bir mekanizmaya erişimi olmalıdır.
+// Aşağıdaki kod, her iki durum için de eprintln! kullanımını ayarlar,
+// no_std durumu için Sahne64'ün custom macro'sunun scope'ta olduğunu varsayar.
+
 
 /// # AllocatedMemory Struct
 ///
@@ -18,12 +29,37 @@ use core::mem::ManuallyDrop; // Drop'u manuel olarak kontrol etmek için
 ///
 /// ## Örnekler
 ///
-/// ```
-/// if let Some(mut mem) = AllocatedMemory::new(1024) {
-///     mem.initialize(0); // Belleği 0 ile başlat
-///     println!("Bellek boyutu: {}", mem.size());
-///     println!("İlk byte: {}", mem.as_slice()[0]);
-/// }
+/// ```ignore // Bu örneklerin derlenebilmesi için Sahne64 crate'ine bağımlılık ve uygun bir çalışma ortamı gerekir.
+/// // Bu örnekler muhtemelen testler veya dokümantasyon için `#![cfg(feature = "std")]` veya
+/// // özel bir Sahne64 test ortamı gerektirecektir.
+///
+ use sahne64::{memory, SahneError}; // Kullanım örneğinde de doğru import
+ use your_crate_name::AllocatedMemory; // AllocatedMemory'nin bulunduğu crate'ten import
+///
+/// // Eğer std kullanılmıyorsa, çıktı için özel makrolar gereklidir.
+  #[cfg(not(feature = "std"))] use sahne64::println; // veya custom makro importu
+///
+ fn example_usage() -> Result<(), SahneError> {
+///     // new Option döndürüyor, allocate ise Result. Match yapısı hala doğru.
+     if let Some(mut mem) = AllocatedMemory::new(1024) {
+       mem.initialize(0); // Belleği 0 ile başlat
+///
+///       // println! custom macro veya std feature gerektirir.
+        #[cfg(feature = "std")]
+        std::println!("Bellek boyutu: {}", mem.size());
+        #[cfg(not(feature = "std"))]
+        println!("Bellek boyutu: {}", mem.size());
+///
+        #[cfg(feature = "std")]
+        std::println!("İlk byte: {}", mem.as_slice()[0]);
+        #[cfg(not(feature = "std"))]
+        println!("İlk byte: {}", mem.as_slice()[0]);
+///
+///         // Bellek Drop edildiğinde otomatik olarak serbest bırakılır.
+     } // mem scope dışına çıktığında Drop çağrılır
+     Ok(()) // Başarılı
+ }
+/// 
 /// ```
 pub struct AllocatedMemory {
     ptr: NonNull<u8>,
@@ -42,32 +78,39 @@ impl AllocatedMemory {
     ///
     /// # Geri Dönüş Değeri
     ///
-    /// Başarılı olursa `Some(AllocatedMemory)`, başarısız olursa `None`.
+    /// Başarılı olursa `Some(AllocatedMemory)`, bellek ayırma Sahne64 API hatası döndürürse `None`.
     ///
     /// # Örnekler
     ///
-    /// ```
-    /// let mem = AllocatedMemory::new(1024);
-    /// assert!(mem.is_some());
-    ///
-    /// let mem_zero_size = AllocatedMemory::new(0);
-    /// assert!(mem_zero_size.is_none());
+    /// ```ignore // Örneklerin derlenebilirliğini sağlamak için
+      use your_crate_name::AllocatedMemory;
+      let mem = AllocatedMemory::new(1024);
+      assert!(mem.is_some());
+      let mem_zero_size = AllocatedMemory::new(0);
+      assert!(mem_zero_size.is_none());
     /// ```
     pub fn new(size: usize) -> Option<Self> {
         if size == 0 {
             return None;
         }
 
-        match unsafe { memory::allocate(size) } {
+        // Sahne64 memory::allocate fonksiyonu Result<*mut u8, SahneError> dönüyor
+        match memory::allocate(size) {
             Ok(ptr) => {
-                // NonNull::new_unchecked çünkü memory::allocate başarılı olursa null dönmez
+                // memory::allocate başarılı olursa null olmayan bir pointer garanti eder,
+                // bu nedenle NonNull::new_unchecked burada hala güvenlidir.
                 Some(Self {
                     ptr: unsafe { NonNull::new_unchecked(ptr) },
                     size,
                     initialized: false,
                 })
             }
-            Err(_) => None, // Bellek ayırma başarısız oldu
+            Err(_e) => {
+                // Bellek ayırma Sahne64 API hatası döndürdü.
+                // Burada hatayı loglayabilirsiniz eğer loglama altyapısı varsa.
+                 #[cfg(not(feature = "std"))] eprintln!("Bellek ayırma hatası: {:?}", _e);
+                None // Başarısızlık durumunda None döndür
+            }
         }
     }
 
@@ -86,21 +129,25 @@ impl AllocatedMemory {
     /// # Örnekler
     ///
     /// ```should_panic
-    /// let mut mem = AllocatedMemory::new(10).unwrap();
-    /// // mem.initialize(0); // Yorum satırı kaldırılırsa panic olmaz
-    /// let slice = mem.as_slice(); // Panic verir çünkü bellek henüz başlatılmadı
+      use your_crate_name::AllocatedMemory;
+      let mut mem = AllocatedMemory::new(10).unwrap();
+       mem.initialize(0); // Yorum satırı kaldırılırsa panic olmaz
+      let slice = mem.as_slice(); // Panic verir çünkü bellek henüz başlatılmadı
     /// ```
     ///
-    /// ```
-    /// let mut mem = AllocatedMemory::new(10).unwrap();
-    /// mem.initialize(0);
-    /// let slice = mem.as_slice(); // Panic vermez
-    /// assert_eq!(slice.len(), 10);
+    /// ```ignore // Örneklerin derlenebilirliğini sağlamak için
+      use your_crate_name::AllocatedMemory;
+      let mut mem = AllocatedMemory::new(10).unwrap();
+      mem.initialize(0);
+      let slice = mem.as_slice(); // Panic vermez
+      assert_eq!(slice.len(), 10);
     /// ```
     pub fn as_slice(&self) -> &[u8] {
         if !self.initialized {
             panic!("Bellek henüz başlatılmadı! `as_slice` çağrılmadan önce `initialize` fonksiyonlarından birini kullanarak belleği başlatmanız gerekmektedir."); // Geliştirilmiş hata mesajı
         }
+        // Güvenli olmayan (unsafe) blok, pointer ve boyutun geçerli olduğunu varsayar,
+        // bu varsayım `AllocatedMemory` yapısının doğru kullanımına dayanır.
         unsafe { slice::from_raw_parts(self.ptr.as_ptr(), self.size) }
     }
 
@@ -114,12 +161,15 @@ impl AllocatedMemory {
     ///
     /// # Örnekler
     ///
-    /// ```
-    /// let mut mem = AllocatedMemory::new(10).unwrap();
-    /// let mut_slice = mem.as_mut_slice();
-    /// mut_slice[0] = 42; // Belleğin ilk byte'ını değiştir
+    /// ```ignore // Örneklerin derlenebilirliğini sağlamak için
+      use your_crate_name::AllocatedMemory;
+      let mut mem = AllocatedMemory::new(10).unwrap();
+      let mut_slice = mem.as_mut_slice();
+      mut_slice[0] = 42; // Belleğin ilk byte'ını değiştir
     /// ```
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        // Güvenli olmayan (unsafe) blok, pointer ve boyutun geçerli olduğunu varsayar,
+        // bu varsayım `AllocatedMemory` yapısının doğru kullanımına dayanır.
         unsafe { slice::from_raw_parts_mut(self.ptr.as_ptr(), self.size) }
     }
 
@@ -133,11 +183,12 @@ impl AllocatedMemory {
     ///
     /// # Örnekler
     ///
-    /// ```
-    /// let mut mem = AllocatedMemory::new(10).unwrap();
-    /// mem.initialize(0); // Belleği 0 ile başlat
-    /// assert_eq!(mem.as_slice()[0], 0);
-    /// assert_eq!(mem.as_slice()[9], 0);
+    /// ```ignore // Örneklerin derlenebilirliğini sağlamak için
+      use your_crate_name::AllocatedMemory;
+      let mut mem = AllocatedMemory::new(10).unwrap();
+      mem.initialize(0); // Belleği 0 ile başlat
+      assert_eq!(mem.as_slice()[0], 0);
+      assert_eq!(mem.as_slice()[9], 0);
     /// ```
     pub fn initialize(&mut self, value: u8) {
         let slice = self.as_mut_slice();
@@ -155,10 +206,11 @@ impl AllocatedMemory {
     ///
     /// # Örnekler
     ///
-    /// ```
-    /// let mut mem = AllocatedMemory::new(5).unwrap();
-    /// mem.initialize_with(|i| (i * 2) as u8); // Belleği indeksin iki katı ile başlat
-    /// assert_eq!(mem.as_slice(), &[0, 2, 4, 6, 8]);
+    /// ```ignore // Örneklerin derlenebilirliğini sağlamak için
+      use your_crate_name::AllocatedMemory;
+      let mut mem = AllocatedMemory::new(5).unwrap();
+      mem.initialize_with(|i| (i * 2) as u8); // Belleği indeksin iki katı ile başlat
+      assert_eq!(mem.as_slice(), &[0, 2, 4, 6, 8]);
     /// ```
     pub fn initialize_with<F>(&mut self, f: F)
     where
@@ -179,9 +231,10 @@ impl AllocatedMemory {
     ///
     /// # Örnekler
     ///
-    /// ```
-    /// let mem = AllocatedMemory::new(2048).unwrap();
-    /// assert_eq!(mem.size(), 2048);
+    /// ```ignore // Örneklerin derlenebilirliğini sağlamak için
+      use your_crate_name::AllocatedMemory;
+      let mem = AllocatedMemory::new(2048).unwrap();
+      assert_eq!(mem.size(), 2048);
     /// ```
     pub fn size(&self) -> usize {
         self.size
@@ -197,12 +250,27 @@ impl Drop for AllocatedMemory {
         let ptr = self.ptr.as_ptr();
         let size = self.size;
         if size > 0 {
-            match unsafe { memory::free(ptr, size) } {
+            // <-- Değişiklik 2: memory::free yerine memory::release çağırıldı
+            // memory::release yeni Sahne64 API'sine göre Result<(), SahneError> dönüyor
+            match memory::release(ptr, size) {
                 Ok(_) => (), // Bellek başarıyla serbest bırakıldı
                 Err(e) => {
-                    // Kernel ortamında panic yerine daha uygun bir loglama mekanizması kullanılabilir.
-                    // Şimdilik sadece bir uyarı veriyoruz.
-                    eprintln!("UYARI: Bellek serbest bırakılırken hata oluştu: {:?}", e);
+                    // Değişiklik 3: eprintln! kullanımı için std/no_std kontrolü
+                    // Eğer no_std durumunda Sahne64'ün kendi eprintln!'ı kullanılacaksa
+                    // ilgili macro'nun veya fonksiyonun scope'ta olması gerekir.
+                    #[cfg(not(feature = "std"))]
+                    {
+                         // Eğer Sahne64 stdio_impl modülü public ise
+                         // use sahne64::stdio_impl::eprintln; kullanabilirsiniz.
+                         // Veya crate seviyesinde macro_use ile import etmelisiniz.
+                         // Şimdilik macro'nun scope'ta olduğunu varsayalım.
+                         eprintln!("UYARI: Bellek serbest bırakılırken hata oluştu: {:?}", e);
+                    }
+                     #[cfg(feature = "std")]
+                     {
+                         // std ortamında standart eprintln kullanabilirsiniz.
+                         std::eprintln!("UYARI: Bellek serbest bırakılırken hata oluştu: {:?}", e);
+                     }
                 }
             }
         }
