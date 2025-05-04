@@ -9,3 +9,4 @@ Sahne Karnal PC is a kernel version designed for desktop computers by Sahne Dün
 5. Main programming language used: Rust
 6. Target CPU instruction set: Cross CPU instruction set support
 7. Targeted Optimization level: -Os
+8. Targeted Electronic devices: Personal PC Laptop, PC Desktop, PC Tablet
