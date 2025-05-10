@@ -1,123 +1,117 @@
-#![no_std]
+#![no_std] // Bu dosya da çekirdek alanında çalışıyor
 
-use core::arch::asm;
-use core::ptr::NonNull;
-use fdt::{Fdt, FdtError};
+use crate::karnal64::{ // Karnal64 modüllerine erişim varsayılıyor
+    kresource, // Kaynak yönetimi modülü
+    KError,    // Hata tipi
+    KHandle,   // Handle tipi
+    // İhtiyaç duyulursa KTaskId, KThreadId vb.
+};
 
-#[cfg(target_arch = "openrisc")]
-/// OpenRISC mimarisinde DTB adresini r9 yazmacından alır.
-///
-/// **UYARI**: OpenRISC mimarisinde DTB adresinin hangi yazmaçta veya nasıl
-/// iletildiği standart olmayabilir ve sisteme özgü değişebilir.
-/// Bu örnekte r9 yazmacı varsayılmıştır. Lütfen sisteminizin dokümantasyonunu
-/// kontrol ederek doğru yazmacı veya yöntemi belirleyin.
-pub fn get_dtb_address() -> usize {
-    let dtb_address: usize;
+// DTB (Device Tree Blob) verisini tutacak statik tampon.
+// Gerçek bir sistemde boyut tahmini veya dinamik bellek yönetimi gerekebilir.
+// Şimdilik sabit ve makul büyüklükte bir tampon varsayalım.
+const MAX_DTB_SIZE: usize = 64 * 1024; // 64 KB
+static mut DTB_BUFFER: [u8; MAX_DTB_SIZE] = [0; MAX_DTB_SIZE];
+static mut DTB_SIZE: usize = 0; // Gerçek okunan DTB boyutu
+
+/// DTB kaynağını Karnal64 üzerinden yükler ve statik tampona kaydeder.
+/// Başarı durumunda DTB verisinin statik slice'ını, hata durumunda KError döner.
+pub fn load_dtb() -> Result<&'static [u8], KError> {
+    // DTB kaynağının adı/path'i. Karnal64'ün kaynak kayıt sisteminde
+    // bu ismin bir ResourceProvider'a eşlendiği varsayılır.
+    let dtb_resource_name = "karnal://boot/dtb"; // Örnek path
+
+    // 1. DTB kaynağını Karnal64 üzerinden edin (acquire).
+    // Okuma izni talep ediyoruz.
+    let dtb_handle = kresource::resource_acquire(
+        dtb_resource_name.as_ptr(),
+        dtb_resource_name.len(),
+        kresource::MODE_READ, // Okuma modu
+    )?; // KError::NotFound, KError::PermissionDenied, KError::InvalidArgument dönebilir
+
+    // Başarı durumunda bir KHandle elde ettik.
+    crate::println!("DTB kaynağı başarıyla edinildi. Handle: {:?}", dtb_handle);
+
+    // 2. Kaynaktan DTB verisini oku.
+    // Okuma işlemi için çekirdek alanındaki statik tamponumuzu kullanacağız.
+    let bytes_read = unsafe {
+        kresource::resource_read(
+            dtb_handle.0, // Ham handle değeri
+            DTB_BUFFER.as_mut_ptr(), // Tampon pointer'ı (writable)
+            DTB_BUFFER.len(), // Tampon boyutu
+        )? // KError::BadHandle, KError::BadAddress, KError::Interrupted vb. dönebilir
+    };
+
+    // Okunan byte sayısını güncelleyelim.
     unsafe {
-        // r9 yazmacının değerini dtb_address değişkenine taşı.
-        // OpenRISC için yazmaç adı ve assembly sözdizimi kontrol edilmeli.
-        asm!("mr {}, r9", out(reg) dtb_address); // "mr" (move register) komutu varsayılmıştır.
+        DTB_SIZE = bytes_read;
     }
-    dtb_address
+
+    crate::println!("DTB verisi başarıyla okundu. {} byte.", bytes_read);
+
+    // 3. İşimiz bitince kaynağı serbest bırak (release).
+    // Bu, Handle Yöneticisindeki kaydı temizler.
+    kresource::resource_release(dtb_handle.0)?; // KError::BadHandle vb. dönebilir
+
+    crate::println!("DTB kaynağı serbest bırakıldı.");
+
+    // 4. Okunan veriyi içeren slice'ı döndür.
+    // Statik tampondan okunan byte sayısı kadar bir slice oluşturulur.
+    let dtb_data_slice = unsafe {
+        // Güvenlik: DTB_BUFFER statik mutable, DTB_SIZE okunan byte sayısıdır.
+        // Slice oluşturma güvenlidir, çünkü okunan boyutu kullanıyoruz.
+        core::slice::from_raw_parts(DTB_BUFFER.as_ptr(), DTB_SIZE)
+    };
+
+    Ok(dtb_data_slice)
 }
 
-/// Verilen bellek adresinden bir Fdt (Device Tree Blob) yapısı yükler.
-///
-/// # Arguments
-///
-/// * `dtb_address` - DTB'nin bellek adresi.
-///
-/// # Returns
-///
-/// `Ok(Fdt)` eğer DTB başarıyla yüklendiyse, `Err(FdtError)` aksi takdirde.
-///
-/// # Errors
-///
-/// `FdtError::NullPtr` eğer verilen adres geçerli bir işaretçi değilse.
-pub fn load_dtb(dtb_address: usize) -> Result<Fdt<'static>, FdtError> {
-    // Verilen adresi ham bir işaretçiye dönüştür ve NonNull ile kontrol et.
-    let ptr = NonNull::new(dtb_address as *const u8).ok_or(FdtError::NullPtr)?;
-    // Güvenli olmayan blok: ham işaretçiden Fdt yapısı oluşturuluyor.
-    unsafe { Fdt::from_ptr(ptr.as_ptr()) }
-}
-
-/// Bir Device Tree node'unun belirli bir özelliğini alır.
-///
-/// # Arguments
-///
-/// * `dtb` - Fdt yapısı referansı.
-/// * `node_path` - Node'un yolu (örneğin "/memory").
-/// * `property_name` - Özellik adı (örneğin "reg").
-///
-/// # Returns
-///
-/// `Some(&[u8])` eğer özellik bulunduysa, `None` aksi takdirde.
-pub fn get_property<'a>(dtb: &'a Fdt, node_path: &str, property_name: &str) -> Option<&'a [u8]> {
-    dtb.find_node(node_path) // Node'u bul
-        .and_then(|node| node.property(property_name)) // Node içinde özelliği bul
-        .map(|property| property.value()) // Özellik değerini al
-}
-
-/// Bir Device Tree node'unun belirli bir string özelliğini alır.
-///
-/// # Arguments
-///
-/// * `dtb` - Fdt yapısı referansı.
-/// * `node_path` - Node'un yolu.
-/// * `property_name` - Özellik adı.
-///
-/// # Returns
-///
-/// `Some(&str)` eğer özellik bulundu ve UTF-8 string olarak çözümlenebildiyse, `None` aksi takdirde.
-pub fn get_property_str(dtb: &Fdt, node_path: &str, property_name: &str) -> Option<&str> {
-    get_property(dtb, node_path, property_name) // Özelliği byte dizisi olarak al
-        .and_then(|value| core::str::from_utf8(value).ok()) // Byte dizisini UTF-8 string'e dönüştürmeyi dene
-}
-
-/// Kök node'un "compatible" özelliğini okur ve yazdırır.
-/// Bu genellikle cihaz uyumluluğunu belirten bir stringdir.
-///
-/// # Arguments
-///
-/// * `dtb` - Fdt yapısı referansı.
-pub fn print_compatible(dtb: &Fdt) {
-    if let Some(compatible) = get_property_str(dtb, "/", "compatible") {
-        println!("Cihaz uyumluluğu: {}", compatible);
-    } else {
-        println!("Uyumluluk bilgisi bulunamadı."); // Uyumluluk özelliği bulunamazsa bilgi mesajı
+/// DTB verisine erişim sağlayan fonksiyon (eğer daha önce yüklendiyse).
+/// load_dtb() çağrıldıktan sonra kullanılır.
+pub fn get_loaded_dtb() -> Option<&'static [u8]> {
+    unsafe {
+        if DTB_SIZE > 0 {
+            Some(core::slice::from_raw_parts(DTB_BUFFER.as_ptr(), DTB_SIZE))
+        } else {
+            None // DTB henüz yüklenmemiş veya hata oluşmuş
+        }
     }
 }
 
-/// Örnek init fonksiyonu: DTB'yi yükler ve uyumluluk bilgisini yazdırır.
-/// Bu fonksiyon, çekirdek veya bootloader gibi ortamlarda kullanılmak üzere tasarlanmıştır.
-///
-/// # Returns
-///
-/// `Ok(())` eğer init başarıyla tamamlandıysa, `Err(FdtError)` aksi takdirde.
-///
-/// # Errors
-///
-/// `FdtError` DTB yükleme sırasında bir hata oluşursa.
-pub fn init() -> Result<(), FdtError>{
-    let dtb_address: usize;
+// TODO: DTB verisini parse edecek ve donanım bilgilerini çıkaracak fonksiyonlar eklenebilir.
+// Örneğin: find_node_by_compatible, get_property vb.
+// Bu parsing mantığı OF-fdt (Open Firmware Flattened Device Tree) spesifikasyonuna göre yapılır.
+// Şu an sadece veriyi yükleme ve erişim kısmı Karnal64 ile etkileşimi gösteriyor.
 
-    #[cfg(target_arch = "openrisc")]
-    {
-        // OpenRISC mimarisinde DTB adresini al.
-        dtb_address = get_dtb_address();
-    }
-    #[cfg(not(target_arch = "openrisc"))]
-    {
-        // Diğer mimariler için varsayılan bir adres (UYARI: Bu sadece bir örnektir, gerçekte mimariye göre değişir!)
-        dtb_address = 0x100000;
-        println!("UYARI: OpenRISC dışı mimari için varsayılan DTB adresi kullanılıyor: 0x{:X}. Doğru adresi ayarlayın!", dtb_address);
-    }
+// Çekirdek içinden kullanılacak placeholder print! makrosu (debug amaçlı)
+// Gerçek çekirdekte konsol sürücüsü üzerinden implemente edilmelidir.
+#[macro_export]
+macro_rules! println {
+    ($($arg:tt)*) => ({
+        // Çekirdek içi konsol yazma mantığı buraya gelir
+        // Şimdilik boş bırakalım veya debug output'a yönlendirelim
+         #[cfg(feature = "debug_console")]
+         crate::debug_console::print(format_args!($($arg)*));
+    });
+}
 
-    // DTB'yi yükle ve olası hataları işle.
-    let dtb = load_dtb(dtb_address)?;
+// Placeholder debug_console modülü (eğer println! kullanılacaksa)
+#[cfg(feature = "debug_console")]
+mod debug_console {
+     use core::fmt::Write;
+     // Dummy writer veya gerçek donanım (UART) yazıcısı
+     struct DummyWriter;
 
-    // Uyumluluk bilgisini yazdır.
-    print_compatible(&dtb);
+     impl Write for DummyWriter {
+         fn write_str(&mut self, s: &str) -> core::fmt::Result {
+             // Buraya gerçek UART veya konsol yazma kodu gelir
+              print!("{}", s); // Bu olmaz, std gerektirir. Donanıma yazmalı.
+             Ok(())
+         }
+     }
 
-    Ok(())
+     pub fn print(args: core::fmt::Arguments) {
+         let mut writer = DummyWriter;
+         writer.write_fmt(args).ok();
+     }
 }
