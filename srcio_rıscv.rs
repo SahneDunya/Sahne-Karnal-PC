@@ -1,379 +1,239 @@
-#![no_std] // Standart kütüphaneye ihtiyacımız yok
-#![no_main] // Rust'ın varsayılan giriş noktasını (main) kullanmıyoruz
+#![no_std] // Standart kütüphaneye ihtiyaç duymuyoruz, çekirdek alanında çalışırız
+#![allow(dead_code)] // Geliştirme sırasında kullanılmayan kodlara izin ver
 
-// Hedef mimariyi belirt (RISC-V)
-// Derleme sırasında bu öznitelik kullanılacaktır.
-#![target_arch = "riscv64"] // veya riscv32
+// Karnal64 API'sından gerekli tipleri ve fonksiyonları içeri aktaralım.
+// handle_syscall fonksiyonu, raw sistem çağrısı argümanlarını alıp genel API'ye iletecektir.
+use karnal64::{KError, KHandle, handle_syscall};
 
-// Core kütüphanesinden gerekli öğeler
-use core::panic::PanicInfo; // Panik işleyicisi için
-use core::ptr::{read_volatile, write_volatile}; // Volatile okuma/yazma için
-use core::fmt::Write; // Yazma trait'i için (debug çıktısı için)
-// use core::slice; // Eğer slice işlemleri gerekirse eklenebilir
+// RISC-V mimarisine özel tanımlar (gerçek implementasyonlar ayrı modüllerde olabilir)
+// Örneğin, CSR (Control and Status Register) erişimi için fonksiyonlar veya register tanımları
 
-// 'volatile' krateri, bellek eşlemeli (memory-mapped) I/O için yapılandırılmış erişim sağlar.
-// Doğrudan ham pointer kullanmak yerine, kayıtları struct olarak tanımlamak için tercih edilebilir.
-use volatile::Volatile; // <-- Imported volatile crate
+/// Bir trap (kesme veya istisna) meydana geldiğinde görev bağlamının kaydedildiği yapı.
+/// Bu yapı, RISC-V ABI'sına ve trap işleme kurulumuna göre değişir.
+/// Burası sistem çağrısı argümanları ve dönüş değeri için ilgili registerları içerir.
+/// Tam bir TrapFrame tüm 32/64 genel amaçlı registerı içermelidir.
+#[repr(C)] // Assembly kodu ile etkileşim için C uyumlu bellek düzeni sağlar
+pub struct TrapFrame {
+    // x0 (zero register) kaydedilmez
+    // x1-x9: Ra, Sp, Gp, Tp, T0-T2 (Kaydedilmeli)
+    pub ra: u64, // x1
+    pub sp: u64, // x2
+    pub gp: u64, // x3
+    pub tp: u64, // x4
+    pub t0: u64, // x5
+    pub t1: u64, // x6
+    pub t2: u64, // x7
 
-// Sahne64 konsol makrolarını kullanabilmek için (çıktı/loglama amaçlı)
-// Bu makrolar Sahne64 crate'i tarafından sağlanır ve resource API'sini kullanır.
-// Bu crate'te kullanılabilir olmaları için uygun kurulum (örn. #[macro_use]) gereklidir.
-// Bu örnekte, #[cfg] ile std/no_std çıktısını ayarlayarak makroların
-// uygun ortamda kullanılabilir olduğunu varsayıyoruz.
- use sahne64::{println, eprintln}; // Örnek import eğer macro publicse
+    // x10-x17: A0-A7 (Argüman/Dönüş Değeri ve Sistem Çağrısı Numarası - Kaydedilmeli)
+    pub a0: u64, // x10 - Argüman 0 / Dönüş Değeri
+    pub a1: u64, // x11 - Argüman 1
+    pub a2: u64, // x12 - Argüman 2
+    pub a3: u64, // x13 - Argüman 3
+    pub a4: u64, // x14 - Argüman 4
+    pub a5: u64, // x15 - Argüman 5
+    pub a6: u64, // x16 - Argüman 6
+    pub a7: u64, // x17 - Sistem Çağrısı Numarası
 
-// Çıktı makroları (Sahne64 console makrolarını kullanacak şekilde ayarlandı)
-// Eğer 'std' feature etkinse std::println! kullanılır.
-// Eğer 'std' feature etkin değilse (no_std), Sahne6ne64 crate'inden gelen println! kullanılır.
-#[cfg(feature = "std")]
-macro_rules! kprintln {
-    () => (std::println!());
-    ($($arg:tt)*) => (std::println!($($arg)*));
-}
-#[cfg(not(feature = "std"))]
-macro_rules! kprintln {
-    () => (println!()); // Varsayım: Sahne64 println! makrosu
-    ($($arg:tt)*) => (println!($($arg)*)); // Varsayım: Sahne64 println! makrosu
-}
+    // x18-x27: S2-S11 (Kaydedilmeli)
+    pub s2: u64, // x18
+    pub s3: u64, // x19
+    pub s4: u64, // x20
+    pub s5: u64, // x21
+    pub s6: u64, // x22
+    pub s7: u64, // x23
+    pub s8: u64, // x24
+    pub s9: u64, // x25
+    pub s10: u64, // x26
+    pub s11: u64, // x27
 
-#[cfg(feature = "std")]
-macro_rules! kprint {
-    ($($arg:tt)*) => (std::print!($($arg)*));
-}
-#[cfg(not(feature = "std"))]
-macro_rules! kprint {
-    ($($arg:tt)*) => (print!($($arg)*)); // Varsayım: Sahne64 print! makrosu
-}
+    // x28-x31: T3-T6 (Kaydedilmeli)
+    pub t3: u64, // x28
+    pub t4: u64, // x29
+    pub t5: u64, // x30
+    pub t6: u64, // x31
 
-
-// *************************************************************************
-// ÖNEMLİ NOTLAR:
-// *************************************************************************
-// 1. Bu kod örnek bir taslaktır ve gerçek bir USB sürücüsü DEĞİLDİR.
-//    Gerçek bir USB sürücüsü çok daha karmaşık olacaktır.
-// 2. Bu kod, belirli bir USB denetleyicisi donanımını varsaymaz.
-//    USB denetleyicisinin register adresleri ve bit alanları donanıma özeldir.
-//    Kendi donanımınızın veri sayfasına (datasheet) başvurmanız GEREKİR.
-// 3. Bu kod API kullanmadan, doğrudan donanım register'larına erişerek
-//    USB denetleyicisi ile iletişimi göstermeyi amaçlar.
-// 4. Kendi çekirdeğiniz için yazdığınızdan, çekirdeğinizin temel fonksiyonlarını
-//    (örneğin, adres çevirisi, bellek yönetimi, kesme yönetimi vb.)
-//    kendiniz uygulamanız gerekecektir. Bu örnek bu temel fonksiyonları kapsamaz.
-// 5. Bu örnek sadece USB aygıtını algılama ve basit veri gönderme/alma
-//    konseptini göstermeyi amaçlar. Tam USB protokollerini (USB yığın protokolleri,
-//    sınıf sürücüleri vb.) uygulamaz.
-// 6. Hata yönetimi ve güvenlik konuları bu örnekte basitleştirilmiştir.
-//    Gerçek bir sürücüde, bu konulara çok daha fazla dikkat etmek gerekir.
-// 7. `volatile` semantiği, derleyicinin donanım register erişimlerini
-//    optimize etmesini engellemek için kullanılır. Donanım etkileşiminde KESİNLİKLE
-//    kullanılmalıdır.
-// 8. `unsafe` blokları, Rust'ın güvenli olmayan operasyonları (örneğin, ham pointer
-//    erişimleri) kapsamasını sağlar. Donanım düzeyinde programlama yaparken
-//    `unsafe` blokları kaçınılmazdır.
-// 9. Bu kod, minimal bir ortamda (no_std) çalışacak şekilde tasarlanmıştır.
-//    Bu nedenle, standart kütüphane (std) fonksiyonları kullanılamaz.
-// *************************************************************************
-
-
-// *************************************************************************
-// DONANIM TANIMLARI (RISC-V Donanımınıza GÖRE DÜZENLEYİN!!!)
-// *************************************************************************
-// USB Denetleyici Temel Adresi (DATASHEET'TEN ALIN)
-// RISC-V sistemlerde MMIO adresleri platforma göre değişir.
-const USB_CONTROLLER_BASE_ADDRESS: usize = 0x1000_1000; // ÖRNEK ADRES! DEĞİŞTİRİN!
-
-// USB Kontrol Register'ı Ofseti ve Tam Adresi (DATASHEET'TEN ALIN)
-const USB_CONTROL_REGISTER_OFFSET: usize = 0x00;
-const USB_CONTROL_REGISTER_ADDRESS: usize = USB_CONTROLLER_BASE_ADDRESS.wrapping_add(USB_CONTROL_REGISTER_OFFSET);
-
-// USB Durum Register'ı Ofseti ve Tam Adresi (DATASHEET'TEN ALIN)
-const USB_STATUS_REGISTER_OFFSET: usize = 0x04;
-const USB_STATUS_REGISTER_ADDRESS: usize = USB_CONTROLLER_BASE_ADDRESS.wrapping_add(USB_STATUS_REGISTER_OFFSET);
-
-// USB Veri Gönderme Register'ı Ofseti ve Tam Adresi (DATASHEET'TEN ALIN)
-// Burası bir FIFO veya tek bir register olabilir.
-const USB_DATA_TRANSMIT_REGISTER_OFFSET: usize = 0x08;
-const USB_DATA_TRANSMIT_REGISTER_ADDRESS: usize = USB_CONTROLLER_BASE_ADDRESS.wrapping_add(USB_DATA_TRANSMIT_REGISTER_OFFSET);
-
-// USB Veri Alma Register'ı Ofseti ve Tam Adresi (DATASHEET'TEN ALIN)
-// Burası bir FIFO veya tek bir register olabilir.
-const USB_DATA_RECEIVE_REGISTER_OFFSET: usize = 0x0C;
-const USB_DATA_RECEIVE_REGISTER_ADDRESS: usize = USB_CONTROLLER_BASE_ADDRESS.wrapping_add(USB_DATA_RECEIVE_REGISTER_OFFSET);
-
-// Kontrol Register Bit Tanımları (DATASHEET'TEN ALIN)
-const USB_CONTROL_ENABLE_BIT: u32 = 1 << 0; // ÖRNEK BİT! DEĞİŞTİRİN!
-const USB_CONTROL_RESET_BIT: u32 = 1 << 1;  // ÖRNEK BİT! DEĞİŞTİRİN!
-
-
-// Durum Register Bit Tanımları (DATASHEET'TEN ALIN)
-const USB_STATUS_DEVICE_CONNECTED_BIT: u32 = 1 << 0; // ÖRNEK BİT! DEĞİŞTİRİN!
-const USB_STATUS_DATA_AVAILABLE_BIT: u32 = 1 << 1; // ÖRNEK BİT! DEĞİŞTİRİN! (RX FIFO Not Empty)
-const USB_STATUS_TRANSMIT_READY_BIT: u32 = 1 << 2; // ÖRNEK BİT! DEĞİTİRİN! (TX FIFO Not Full/Empty)
-const USB_STATUS_RESET_DONE_BIT: u32 = 1 << 3;  // ÖRNEK BİT! DEĞİŞTİRİN!
-
-
-// *************************************************************************
-// FONKSİYONLAR
-// *************************************************************************
-
-/// # Güvenli Olmayan Register Okuma
-///
-/// Verilen adresteki volatile register'ı okur (32-bit).
-/// RISC-V 64-bit'te bile 32-bit MMIO yaygındır.
-///
-/// # Parametreler
-///
-/// * `address`: Okunacak register'ın adresi (usize, 32 veya 64 bit olabilir).
-///
-/// # Geri Dönüş Değeri
-///
-/// Register'ın değeri (u32 olarak).
-///
-/// # Güvenlik
-/// Ham bellek adresinden okuma yaptığı için 'unsafe'dır. Adresin geçerli olması çağırana bağlıdır.
-#[inline(always)] // Genellikle MMIO helper'ları inline yapmak performansı artırır.
-unsafe fn read_register_u32(address: usize) -> u32 {
-    // usize adresi u32 pointer'a cast et ve volatile oku.
-    // RISC-V MMIO adreslemesine dikkat edin (örn. cache etkileri).
-    read_volatile(address as *const u32) // *mut yerine *const daha doğru
+    // Kontrol ve Durum Registerları (CSRs) - Trap sırasında kaydedilmeli
+    pub sepc: u64,  // Supervisor Exception Program Counter (Trap'e neden olan komutun adresi)
+    pub sstatus: u64, // Supervisor Status Register
+    pub scause: u64, // Trap'in Nedeni
+    pub stval: u64, // Trap Value (örn: geçersiz adres)
+    // Diğer CSR'lar da duruma göre kaydedilebilir (sscratch, satp vb.)
 }
 
-/// # Güvenli Olmayan Register Yazma
-///
-/// Verilen adresteki volatile register'a değer yazar (32-bit).
-///
-/// # Parametreler
-///
-/// * `address`: Yazılacak register'ın adresi (usize).
-/// * `value`: Yazılacak değer (u32).
-///
-/// # Güvenlik
-/// Ham bellek adresine yazma yaptığı için 'unsafe'dır. Adresin geçerli olması çağırana bağlıdır.
-#[inline(always)] // Genellikle MMIO helper'ları inline yapmak performansı artırır.
-unsafe fn write_register_u32(address: usize, value: u32) {
-    // usize adresi u32 pointer'a cast et ve volatile yaz.
-    write_volatile(address as *mut u32, value);
-}
+// RISC-V Trap Nedenleri (scause register değerleri)
+const CAUSE_INTERRUPT_SUPERVISOR_TIMER: u64 = 0x8000000000000005; // Supervisor Timer Interrupt
+const CAUSE_ECALL_U_MODE: u64 = 8; // User mode'dan Environment Call (Sistem Çağrısı)
+const CAUSE_ECALL_S_MODE: u64 = 9; // Supervisor mode'dan Environment Call (Sistem Çağrısı)
+const CAUSE_PAGE_FAULT_LOAD: u64 = 13; // Bellekten okuma sırasında sayfa hatası
+const CAUSE_PAGE_FAULT_STORE: u64 = 15; // Belleğe yazma sırasında sayfa hatası
+// ... diğer nedenler (illegal instruction, breakpoint vb.)
 
-// TODO: Eğer donanımınız 64-bit registerlar veya byte/word erişimi gerektiriyorsa,
-// read_register_u64, write_register_u64, read_register_u8, write_register_u8 vb. ekleyin.
-// volatile::Volatile kullanarak daha yapılandırılmış register erişimi de tercih edilebilir.
+/// Bir kullanıcı alanı pointer'ının geçerli ve izinlere sahip olup olmadığını doğrular.
+/// Bu, kritik bir güvenlik fonksiyonudur ve GERÇEK MMU (Bellek Yönetim Birimi)
+/// ve sayfa tablosu etkileşimi gerektirir.
+/// DİKKAT: Buradaki implementasyon bir yer tutucudur ve GÜVENSİZDİR.
+/// Validasyon, mevcut görev/iş parçacığının sanal adres alanına göre yapılmalıdır.
+unsafe fn validate_user_pointer(ptr: *const u8, len: usize, writeable: bool) -> Result<(), KError> {
+    // TODO: GERÇEK MMU TABANLI DOĞRULAMAYI BURAYA EKLEYİN!
+    // 1. ptr + len değerinin taşma yapıp yapmadığını kontrol edin.
+    // 2. [ptr, ptr + len) adres aralığının mevcut görev'in sanal adres alanında MAP'li olup olmadığını kontrol edin.
+    // 3. MAP'li bellek bölgesinin READ iznine sahip olup olmadığını kontrol edin.
+    // 4. Eğer `writeable` true ise, WRITE iznine de sahip olup olmadığını kontrol edin.
+    // 5. len > 0 iken ptr'nin null olmadığından emin olun.
 
-
-/// # USB Denetleyiciyi Başlat
-///
-/// USB denetleyicisini resetler ve etkinleştirir.
-///
-/// # Güvenlik
-/// Donanım registerlarına yazma/okuma işlemleri içerdiği için 'unsafe'dır.
-unsafe fn init_usb_controller() {
-    kprintln!("RISC-V USB Denetleyicisi Başlatılıyor (Örnek)...");
-    // 1. USB Denetleyicisini Resetle (Örnek Kod - GERÇEK DEĞİL)
-    // Register bit tanımları ve anlamları donanıma özeldir.
-    unsafe { // unsafe block necessary for write_register_u32
-         let control_reg_addr = USB_CONTROL_REGISTER_ADDRESS;
-         let status_reg_addr = USB_STATUS_REGISTER_ADDRESS;
-
-         kprintln!("Denetleyici Resetleniyor...");
-        // Reset bitini set et (Read-Modify-Write)
-         let current_control = read_register_u32(control_reg_addr); // unsafe
-         write_register_u32(control_reg_addr, current_control | usb_bits::USB_CONTROL_RESET_BIT); // unsafe
-
-        // Reset tamamlanana kadar bekle (veya zaman aşımı)
-        // Örnek: Durum registerındaki bir bitin set olmasını bekle
-         kprintln!("Reset Tamamlanması Bekleniyor...");
-         while (read_register_u32(status_reg_addr) & usb_bits::USB_STATUS_RESET_DONE_BIT) == 0 { // unsafe
-             core::hint::spin_loop(); // Basit bekleme
-         }
-         kprintln!("Reset Tamamlandı.");
-
-        // Reset bitini temizle (Eğer yazarak temizleniyorsa, Read-Modify-Write)
-         let current_control = read_register_u32(control_reg_addr); // unsafe
-         write_register_u32(control_reg_addr, current_control & !usb_bits::USB_CONTROL_RESET_BIT); // unsafe
-         kprintln!("Reset Biti Temizlendi (Örnek).");
+    // Bu yer tutucu implementasyon, herhangi bir gerçek doğrulama yapmaz.
+    // Sadece null pointer ve sıfır uzunluk durumu gibi temel hataları kontrol eder.
+    if ptr.is_null() && len > 0 {
+         println!("ERROR: validate_user_pointer received null pointer with non-zero length"); // Çekirdek içi print! gerektirir
+        return Err(KError::BadAddress);
     }
 
-    // 2. USB Denetleyicisini Etkinleştir (Örnek Kod - GERÇEK DEĞİL)
-    unsafe { // unsafe block necessary for write_register_u32
-         let control_reg_addr = USB_CONTROL_REGISTER_ADDRESS;
-         kprintln!("Denetleyici Etkinleştiriliyor...");
-        // Etkinleştirme bitini set et (Read-Modify-Write)
-         let current_control = read_register_u32(control_reg_addr); // unsafe
-         write_register_u32(control_reg_addr, current_control | usb_bits::USB_CONTROL_ENABLE_BIT); // unsafe
-         kprintln!("Denetleyici Etkinleştirildi (Örnek).");
-    }
-    kprintln!("USB Denetleyicisi Başlatma Tamamlandı (Örnek).");
-}
-
-
-/// # USB Aygıt Bağlı mı?
-///
-/// USB aygıtının bağlı olup olmadığını kontrol eder.
-/// Root Hub port durumu registerlarına bakmak gerekebilir.
-///
-/// # Geri Dönüş Değeri
-///
-/// Aygıt bağlıysa `true`, değilse `false`.
-///
-/// # Güvenlik
-/// Donanım registerı okuduğu için 'unsafe'dır.
-unsafe fn is_usb_device_connected() -> bool {
-    // Gerçek bir sürücüde, bu genellikle Host Controller'ın Port Status registerlarından okunur.
-    // Bu örnekte, varsayımsal bir Durum registerındaki bit kontrol ediliyor.
-    let status = read_register_u32(USB_STATUS_REGISTER_ADDRESS); // unsafe
-    (status & usb_bits::USB_STATUS_DEVICE_CONNECTED_BIT) != 0
-}
-
-/// # Veri Gönder
-///
-/// USB veri gönderme registerına (veya FIFO'suna) veri yazar.
-/// Çok basit bir polleme tabanlı örnektir. Gerçek transferler daha karmaşıktır.
-///
-/// # Parametreler
-///
-/// * `data`: Gönderilecek veri (u32 olarak).
-///
-/// # Güvenlik
-/// Donanım registerlarına yazma/okuma işlemleri içerdiği için 'unsafe'dır.
-unsafe fn send_data_usb(data: u32) {
-    kprintln!("USB'den Veri Gönderiliyor: {:08x} (Örnek)", data);
-    unsafe { // unsafe block necessary for read/write_register_u32
-        // Veri gönderme register/FIFO'su hazır olana kadar bekle (VEYA zaman aşımı ekleyin!)
-        while (read_register_u32(USB_STATUS_REGISTER_ADDRESS) & usb_bits::USB_STATUS_TRANSMIT_READY_BIT) == 0 {
-            // İşlemciyi boşa harcamamak için burada düşük güçte bir döngü (spin loop) veya
-            // başka bir çekirdek görevi yapmak daha iyi olabilir.
-            // Şimdilik basit bir boş döngü kullanıyoruz.
-            core::hint::spin_loop();
-            // TODO: Zaman aşımı ekle
-        }
-        write_register_u32(USB_DATA_TRANSMIT_REGISTER_ADDRESS, data);
-        kprintln!("Veri Gönderme Tamamlandı (Örnek).");
-    }
-}
-
-/// # Veri Almaya Hazır mı?
-///
-/// USB veri alma registerında (veya FIFO'sunda) okunacak veri olup olmadığını kontrol eder.
-///
-/// # Geri Dönüş Değeri
-///
-/// Veri alınmaya hazırsa `true` (RX FIFO boş değilse), değilse `false`.
-///
-/// # Güvenlik
-/// Donanım registerı okuduğu için 'unsafe'dır.
-unsafe fn is_data_available_usb() -> bool {
-    let status = read_register_u32(USB_STATUS_REGISTER_ADDRESS); // unsafe
-    (status & usb_bits::USB_STATUS_DATA_AVAILABLE_BIT) != 0
-}
-
-/// # Veri Al
-///
-/// USB veri alma registerından (veya FIFO'sundan) veri okur.
-/// Çok basit bir polleme tabanlı örnektir. Gerçek transferler daha karmaşıktır.
-///
-/// # Geri Dönüş Değeri
-///
-/// Alınan veri (u32 olarak).
-///
-/// # Güvenlik
-/// Donanım registerlarına yazma/okuma işlemleri içerdiği için 'unsafe'dır.
-unsafe fn receive_data_usb() -> u32 {
-    kprintln!("USB'den Veri Alınıyor (Örnek)...");
-    // Veri alma register/FIFO'su hazır olana kadar bekle (VEYLA zaman aşımı ekleyin!)
-    while !is_data_available_usb() { // unsafe çağrı
-         // İşlemciyi boşa harcamamak için burada düşük güçte bir döngü (spin loop) veya
-         // başka bir çekirdek görevi yapmak daha iyi olabilir.
-         // Şimdilik basit bir boş döngü kullanıyoruz.
-         core::hint::spin_loop();
-         // TODO: Zaman aşımı ekle
-    }
-    let received_data = read_register_u32(USB_DATA_RECEIVE_REGISTER_ADDRESS); // unsafe
-    kprintln!("Veri Alma Tamamlandı (Örnek): {:08x}", received_data);
-    received_data
-}
-
-
-// *************************************************************************
-// ÇEKİRDEK GİRİŞ NOKTASI (no_mangle ve panic_handler gerekli)
-// *************************************************************************
-
-#[panic_handler]
-fn panic(info: &PanicInfo) -> ! {
-    // Panik bilgisini Sahne64 konsol makrolarını kullanarak yazdır
-    #[cfg(feature = "std")] std::eprintln!("KERNEL PANIC: {}", info);
-    #[cfg(not(feature = "std"))] eprintln!("KERNEL PANIC: {}", info); // Varsayım: Sahne64 eprintln! makrosu
-
-     // Eğer panik bilgisinde location ve message varsa onları da yazdır.
-     if let Some(location) = info.location() {
-         #[cfg(feature = "std")] std::eprintln!("at {}", location);
-         #[cfg(not(feature = "std"))] eprintln!("at {}", location);
+    // GERÇEK KERNEL'DE BU KISIM MMU SORGUSU YAPMALIDIR:
+     if !current_task_mmu.is_valid_and_accessible(ptr, len, read_permission=true, write_permission) {
+        return Err(KError::BadAddress);
      }
-     if let Some(message) = info.message() {
-         #[cfg(feature = "std")] std::eprintln!(": {}", message);
-         #[cfg(not(feature = "std"))] eprintln!(": {}", message);
-     }
-     #[cfg(feature = "std")] std::eprintln!("\n");
-     #[cfg(not(feature = "std"))] eprintln!("\n");
 
-    // **BURAYA PANİK ANINDA YAPILACAK DİĞER ÖNEMLİ İŞLEMLERİ EKLEYİN.**
-    // Örneğin: Donanımı güvenli bir duruma getir, CPU'yu durdur, hata kodunu kaydet, watchdog timer'ı devre dışı bırak, yeniden başlatma vb.
-    // Donanıma özgü durdurma işlemleri burada yapılabilir (MMIO yazma vb.).
-    loop {} // Sonsuz döngüde kal
+    // Yer tutucu başarılı varsayım (GÜVENSİZ!)
+    Ok(())
 }
 
-#[no_mangle]
-pub extern "C" fn _start() -> ! {
-    // Sahne64 konsol makrolarının std dışı ortamda çalışması için gerekli
-    // ilk ayarlar burada veya platform başlangıcında yapılmalıdır.
-    // Örnekte kprintln! Sahne64 makrolarını kullanıyor (varsayım).
-    kprintln!("srcio_riscv.rs çekirdek örneği başladı! (RISC-V)");
 
-    // Güvenli olmayan blok içinde tüm donanım erişimleri ve unsafe fonksiyon çağrıları
+/// RISC-V mimarisi için ana trap işleyici giriş noktası.
+/// Düşük seviyeli assembly trap vektörü tarafından çağrılır.
+/// Kaydedilmiş registerları içeren TrapFrame'i alır.
+#[no_mangle] // Assembly kodu tarafından çağrılabilmesi için isim düzenlemesi yapılmaz
+pub extern "C" fn riscv_trap_handler(trap_frame: *mut TrapFrame) {
+    // Güvenlik: Assembly kodunun geçerli bir trap_frame pointer'ı sağladığına güvenmeliyiz.
+    // Ham pointer'a erişim unsafe blok içinde.
     unsafe {
-        // 1. USB denetleyiciyi başlat (reset ve enable)
-        init_usb_controller(); // unsafe çağrı
+        let tf = &mut *trap_frame;
+        let cause = tf.scause;
 
-        // 2. USB aygıtının bağlanmasını bekle (VEYA zaman aşımı ekleyin!)
-        kprintln!("USB aygıtının bağlanması bekleniyor...");
-        while !is_usb_device_connected() { // unsafe çağrı
-            // Bağlantı bekleniyor...
-            core::hint::spin_loop(); // Basit polleme bekleme
-            // TODO: Zaman aşımı ekle ve/veya kesme tabanlı bir yaklaşım kullan
+        // Trap nedenini kontrol et
+        match cause {
+            CAUSE_ECALL_U_MODE | CAUSE_ECALL_S_MODE => {
+                // --- Sistem Çağrısı (ECALL) İşleme ---
+
+                // Sistem çağrısı numarasını ve argümanları TrapFrame'den al
+                // RISC-V ABI'sına göre:
+                // syscall numarası: a7 (x17)
+                // argümanlar: a0-a5 (x10-x15)
+                // dönüş değeri: a0 (x10)
+                let syscall_num = tf.a7;
+                let arg1 = tf.a0;
+                let arg2 = tf.a1;
+                let arg3 = tf.a2;
+                let arg4 = tf.a3;
+                let arg5 = tf.a4;
+                // Karnal64'ün handle_syscall'ı 5 argüman alıyor, RISC-V'nin ilk 5 argümanını kullanıyoruz (a0-a4).
+                // Bu eşleşme, kullanıcı alanındaki sistem çağrısı stubları ile tutarlı olmalıdır.
+
+                // --- Güvenlik: Kullanıcı Pointer Doğrulama ---
+                // Karnal64 API fonksiyonlarına kullanıcı alanından gelen pointer'lar geçirilmeden ÖNCE,
+                // bu pointer'ların geçerli ve erişilebilir olduğundan emin olmalıyız.
+                // Bu, `validate_user_pointer` fonksiyonu ile yapılır.
+                // Hangi argümanların pointer olduğu ve hangi izinlere ihtiyaç duyulduğu, sistem çağrısı numarasına bağlıdır.
+                // Gerçek bir trap işleyici, syscall numarasına göre pointer argümanlarını bilmeli ve buna göre doğrulamalıdır.
+
+                let syscall_result: i64;
+
+                // Burada her sistem çağrısı için pointer argümanlarının doğrulama gereksinimleri
+                // tek tek veya bir lookup tablosu aracılığıyla ele alınmalıdır.
+                // Örnek olarak RESOURCE_READ ve RESOURCE_WRITE için pointer doğrulama ekleyelim:
+                match syscall_num {
+                     SYSCALL_RESOURCE_READ = 6 ( handle, buffer_ptr, buffer_len, ... )
+                    6 => {
+                        let user_buffer_ptr = arg2 as *mut u8; // arg2 user buffer pointer'ı
+                        let user_buffer_len = arg3 as usize; // arg3 buffer uzunluğu
+                        // RESOURCE_READ durumunda çekirdek, kullanıcı tamponuna yazacağı için buffer'ın YAZILABİLİR olduğunu doğrula.
+                        if let Err(err) = validate_user_pointer(user_buffer_ptr as *const u8, user_buffer_len, true) {
+                            syscall_result = err as i64; // Doğrulama başarısızsa hata döndür
+                        } else {
+                            // Doğrulama başarılı, Karnal64 API'sini çağır
+                            syscall_result = handle_syscall(syscall_num, arg1, arg2, arg3, arg4, arg5);
+                        }
+                    }
+                     SYSCALL_RESOURCE_WRITE = 7 ( handle, buffer_ptr, buffer_len, ... )
+                    7 => {
+                        let user_buffer_ptr = arg2 as *const u8; // arg2 user buffer pointer'ı
+                        let user_buffer_len = arg3 as usize; // arg3 buffer uzunluğu
+                        // RESOURCE_WRITE durumunda çekirdek, kullanıcı tamponundan okuyacağı için buffer'ın OKUNABİLİR olduğunu doğrula.
+                        if let Err(err) = validate_user_pointer(user_buffer_ptr, user_buffer_len, false) {
+                            syscall_result = err as i64; // Doğrulama başarısızsa hata döndür
+                        } else {
+                            // Doğrulama başarılı, Karnal64 API'sini çağır
+                            syscall_result = handle_syscall(syscall_num, arg1, arg2, arg3, arg4, arg5);
+                        }
+                    }
+                    // TODO: Diğer pointer alan sistem çağrıları için de benzer doğrulama mantığı ekleyin:
+                     SYSCALL_TASK_SPAWN (arg2: args_ptr) -> OKUNABİLİR
+                     SYSCALL_MESSAGE_SEND (arg2: message_ptr) -> OKUNABİLİR
+                     SYSCALL_MESSAGE_RECEIVE (arg1: buffer_ptr) -> YAZILABİLİR
+                     SYSCALL_RESOURCE_ACQUIRE (arg1: resource_id_ptr) -> OKUNABİLİR
+
+                    _ => {
+                        // Pointer argümanı almayan veya henüz doğrulaması eklenmemiş sistem çağrıları için
+                        // doğrudan Karnal64 API'sini çağır.
+                        // UYARI: Eğer bu syscall'lar validate edilmemiş pointer alıyorsa bu GÜVENSİZDİR.
+                        syscall_result = handle_syscall(syscall_num, arg1, arg2, arg3, arg4, arg5);
+                    }
+                }
+
+                // Karnal64 API'sinden dönen sonucu (i64) dönüş değeri registerına (a0) yaz
+                tf.a0 = syscall_result as u64; // i64'ü u64'e dönüştür (negatifler de doğru temsil edilmeli)
+
+                // sepc (Exception Program Counter) registerını sistem çağrısı komutundan sonrasına taşı
+                // RISC-V'de ECALL komutu genellikle 4 byte uzunluğundadır.
+                tf.sepc += 4;
+            }
+            CAUSE_INTERRUPT_SUPERVISOR_TIMER => {
+                 // Timer Kesmesini İşle
+                 // TODO: Timer kesme işleyicisini çağır
+                 // Muhtemelen zamanlayıcıyı resetle ve zamanlayıcı (scheduler) mantığını tetikle
+                  println!("Timer Interrupt!"); // Çekirdek içi print! gerektirir
+                 // Zamanlayıcı kesmesini işledikten sonra sbi_rt::time::clear_sip() gibi bir çağrı gerekebilir
+                 // Trap dönüşünde sepc'yi ilerletmeye gerek yok, interrupted komut tekrar çalışacak.
+            }
+            CAUSE_PAGE_FAULT_LOAD | CAUSE_PAGE_FAULT_STORE => {
+                // Sayfa Hatasını İşle
+                // TODO: Bellek yöneticisini (kmemory) çağırarak sayfa hatasını çözmeye çalış
+                // tf.stval geçersiz adresi içerir. scause hatanın tipini (okuma/yazma) belirtir.
+                // Eğer çözülemezse, hataya neden olan görevi sonlandır.
+                 println!("Page Fault at {:x}, Cause: {:x}", tf.stval, cause); // Çekirdek içi print!
+                 tf.a0 = KError::BadAddress as i64 as u64; // Hata kodu döndür
+                 tf.sepc += 4; // sepc'yi ilerlet (Görev sonlandırılacaksa buna gerek kalmaz)
+            }
+            // TODO: Diğer interrupt ve exception nedenlerini (Illegal Instruction, Breakpoint vb.) ele al
+
+            _ => {
+                // Bilinmeyen veya işlenmemiş trap nedeni
+                // Hata mesajı yazdır ve hataya neden olan görevi sonlandır veya sistemi durdur
+                 println!("Unhandled Trap! Cause: {:x}, SEPC: {:x}, STVAL: {:x}", cause, tf.sepc, tf.stval); // Çekirdek içi print!
+                 tf.a0 = KError::InternalError as i64 as u64; // Genel hata kodu döndür
+                 tf.sepc += 4; // sepc'yi ilerlet (Görev sonlandırılacaksa buna gerek kalmaz)
+                 // TODO: Görevi sonlandır veya panic yap
+            }
         }
-        kprintln!("USB Aygıtı Bağlandı!");
-
-
-        // 3. Aygıt bağlandı, şimdi örnek veri gönder/al işlemlerine başla
-        // Gerçek bir sürücüde, burası aygıt numaralandırması (enumeration)
-        // ve ardından aygıta özgü sınıf sürücüsü mantığının başlaması olurdu.
-
-        // Örnek veri gönderme
-        let data_to_send: u32 = 0x12345678;
-        send_data_usb(data_to_send); // unsafe çağrı
-
-        // Örnek veri alma (eğer varsa)
-        if is_data_available_usb() { // unsafe çağrı
-            let received_data = receive_data_usb(); // unsafe çağrı
-            // Gelen veriyi işle... (örneğin, çekirdek günlüğüne yazdır - çekirdek günlüğü
-            // fonksiyonlarınız varsa)
-            kprintln!("Alınan Veri İşleniyor: {:08x}", received_data);
-            // TODO: Alınan veriyi işleyin
-        } else {
-             kprintln!("Alınacak Veri Yok (Örnek Kontrol).");
-        }
-
-        // ... Daha fazla USB iletişimi veya aygıt sınıfı mantığı ...
-        // Bu kısım gerçek USB sürücüsünün karmaşık işlerini içerir.
-    } // unsafe block sonu
-
-    kprintln!("srcio_riscv.rs çekirdek örneği tamamlandı. Sonsuz döngüye giriliyor.");
-
-    // Çekirdek döngüsü (sonsuz döngü)
-    // Gerçek bir kernelde burası task scheduler veya event loop olurdu.
-    loop {
-        // TODO: Diğer kernel işlemleri (task switch, diğer cihaz sürücüleri polleme, kesme işleme vb.)
-        // Eğer USB sürücüsü polleme tabanlı ise, periyodik olarak durum/veri kontrolü burada yapılabilir.
-        // Eğer kesme tabanlı ise, kesme işleyicisi uygun sürücü fonksiyonlarını çağıracaktır.
-        core::hint::spin_loop(); // CPU'yu meşgul etmemek için
+        // İşlemeden sonra, kontrol assembly trap dönüş koduna geri döner.
+        // Assembly kodu kaydedilmiş registerları TrapFrame'den yükler ve `sret` komutu ile
+        // tuzaktan önceki bağlama (genellikle kullanıcı moduna) geri döner.
     }
 }
+
+// TODO: RISC-V özelindeki diğer düşük seviye I/O veya donanım etkileşim kodlarını buraya ekleyin.
+// Örneğin:
+// - UART (seri port) sürücüsü implementasyonu (çekirdek içi print! veya konsol kaynağı için)
+// - Zamanlayıcı (timer) kurulumu ve kesme işleyicisi bağlantısı
+// - MMU (paging) kurulumu ve yönetimi fonksiyonları (kmemory modülü tarafından kullanılır)
+// - Kesme denetleyicisi (PLIC veya CLINT) yönetimi
+
+// Örnek olarak bir dummy çekirdek içi print fonksiyonu (geliştirme için faydalı)
+
+#[cfg(feature = "enable_kernel_debug_print")]
+#[macro_export]
+macro_rules! println {
+    ($($arg:tt)*) => ($crate::riscv_uart::print_fmt(format_args!($($arg)*)));
+}
+
+// src/riscv_uart.rs içinde implemente edilecek
+ pub fn print_fmt(args: core::fmt::Arguments);
