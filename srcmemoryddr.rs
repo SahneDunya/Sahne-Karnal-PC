@@ -1,383 +1,479 @@
-#![no_std] // Standart kütüphaneye ihtiyaç duymuyoruz
+#![no_std] // Standart kütüphaneye ihtiyaç duymuyoruz, çekirdek alanında çalışır
 
-// Use the Sahne64 crate's modules/types
-// Assuming this file is part of a separate crate that depends on 'sahne64'
-use sahne64::{memory, SahneError}; // <-- Changed import
-use core::ptr::{read_volatile, write_volatile};
+// Geliştirme sırasında kullanılmayan kod veya argümanlar için izinler (isteğe bağlı, hata ayıklama sırasında faydalı)
+#![allow(dead_code)]
+#![allow(unused_variables)]
 
-// Need access to the custom print/eprint macros from Sahne64's stdio_impl in no_std
-// Assuming these are made available in the build setup for this component crate.
- #[cfg(not(feature = "std"))] #[macro_use] extern crate sahne64; // Or specific imports if macros exported differently.
+// Çekirdek API'sından (karnal64.rs) ihtiyaç duyulan tipleri içe aktar
+// Gerçek projede, bu muhtemelen 'use super::KError;' veya 'use crate::karnal64::KError;' gibi bir şey olurdu.
+// Bu örnek için KError'ı burada yeniden tanımlayalım ki dosya kendi başına derlenebilsin (tamamen bağımsız olması adına).
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[repr(i64)] // KError'ın i64 olarak temsil edilmesi, sistem çağrısı dönüş değerleriyle uyum için önemli
+pub enum KError {
+    OutOfMemory = -12,         // Yetersiz bellek
+    InvalidArgument = -3,      // Geçersiz argüman (örn: yanlış hizalama, adres aralık dışında)
+    InternalError = -255,      // Dahili hata (beklenmedik durum)
+    NotSupported = -38,        // İşlem desteklenmiyor (örn: henüz implemente edilmemiş çoklu frame tahsisi)
+    Busy = -11,                // Kaynak meşgul (kullanılmıyor olabilir ama ekledik)
+}
 
-
-/// DDR Bellek Türlerini tanımlar. Şu anda DDR3, DDR4 ve DDR5 desteklenmektedir.
+// Bellek haritası bilgisi için temel bir yapı (bootloader'dan gelir)
+// Gerçek çekirdekte bu daha detaylı olurdu.
 #[derive(Debug, Copy, Clone)]
-pub enum DDRType {
-    DDR3,
-    DDR4,
-    DDR5,
+#[repr(C)] // C uyumluluğu için
+pub struct MemoryRegion {
+    pub base_addr: u64, // Bölgenin başlangıç fiziksel adresi
+    pub size: u64,      // Bölgenin boyutu
+    pub kind: u32,      // Bölgenin türü (0: Reserved, 1: Usable, vb.)
+    pub attribute: u32, // Ek nitelikler (şu an kullanılmıyor)
 }
 
-/// DDR Bellek Yöneticisi işlemleri sırasında oluşabilecek hataları tanımlar.
-#[derive(Debug)]
-pub enum DDRError {
-    InitializationError(String),
-    ReadError(String),
-    WriteError(String),
-    UnsupportedDDRType(DDRType),
-    AddressOutOfRange(usize),
-    /// Bellek kontrolcüsü henüz başlatılmadı.
-    NotInitialized,
-    MemoryOperationError(SahneError), // Renamed from MemoryAllocationError for broader use
-}
+// Basit bir spinlock (çekirdek içi senkronizasyon için)
+// ksync modülünden gelmesi beklenen primitiflerden biri.
+// Burada kendi temel implementasyonunu sağlıyoruz.
+mod ksync_internal {
+    use core::cell::UnsafeCell;
+    use core::sync::atomic::{AtomicBool, Ordering};
 
-impl From<SahneError> for DDRError {
-    fn from(error: SahneError) -> Self {
-        DDRError::MemoryOperationError(error) // Uses the renamed variant
+    pub struct Spinlock {
+        locked: AtomicBool,
+        // Gerçek çekirdekte hata ayıklama için kilit sahibi görev/iş parçacığı ID'si eklenebilir.
+    }
+
+    unsafe impl Sync for Spinlock {} // Statik başlatmaya ve paylaşılan erişime izin verir
+
+    impl Spinlock {
+        #[inline(always)] // Çağrıldığı yere gömülmesini tercih et
+        pub const fn new() -> Self {
+            Spinlock {
+                locked: AtomicBool::new(false),
+            }
+        }
+
+        #[inline(always)]
+        pub fn acquire(&self) {
+            // Atomik takas (swap): Kilit açıksa (false), kilitler (true) ve eski değeri (false) döner.
+            // Kilitliyse (true), true döndürür ve kilitli kalır.
+            while self.locked.swap(true, Ordering::Acquire) {
+                // Kilitliyse, serbest bırakılana kadar meşgul döngüde bekle.
+                // Gerçek çekirdekte, CPU'nun boşa dönmesini veya başka iş parçacığına geçmesini sağlayacak
+                // mimariye özel talimatlar (örn: x86'da PAUSE) veya zamanlayıcıyla entegre bekleme kullanılmalıdır.
+                core::hint::spin_loop(); // Rust'ın meşgul bekleme ipucu
+            }
+        }
+
+        #[inline(always)]
+        pub fn release(&self) {
+            // Atomik mağaza (store): Kilidi serbest bırakır (false).
+            self.locked.store(false, Ordering::Release);
+        }
+    }
+
+    // RAII stili kilit koruyucusu
+    pub struct SpinlockGuard<'a> {
+        lock: &'a Spinlock,
+    }
+
+    impl Spinlock {
+        #[inline(always)]
+        pub fn lock(&self) -> SpinlockGuard {
+            self.acquire();
+            SpinlockGuard { lock: self }
+        }
+    }
+
+    impl<'a> Drop for SpinlockGuard<'a> {
+        fn drop(&mut self) {
+            self.lock.release();
+        }
     }
 }
+use ksync_internal::Spinlock; // Dahili spinlock implementasyonumuzu kullan
 
-/// DDR Bellek Yöneticisi yapısı. Bu yapı, belirli bir DDR türünü yönetmek için kullanılır.
+// --- Fiziksel Çerçeve Ayırıcı Yapısı ---
+
+// Fiziksel bellek çerçevesinin boyutu (genellikle sayfa boyutu ile aynıdır)
+const FRAME_SIZE: usize = 4096; // 4KB
+
+// Yönetilecek fiziksel bellek aralığı.
+// Bunlar bootloader'dan gelmeli. Örnek olarak sabit değerler kullanıyoruz.
+// Başlangıç adresi: 0x10000000
+// Toplam boyut: 64MB (64 * 1024 * 1024 bytes)
+// Bu durumda toplam çerçeve sayısı: 64MB / 4KB = 16384 çerçeve
+const PHYS_MEMORY_START: usize = 0x10000000;
+const PHYS_MEMORY_SIZE: usize = 64 * 1024 * 1024;
+const TOTAL_FRAMES: usize = PHYS_MEMORY_SIZE / FRAME_SIZE;
+
+// Çerçeve durumunu (boş/dolu) takip etmek için bitmap.
+// Her bit bir çerçeveyi temsil eder. 0: boş, 1: dolu.
+// Boyut = (Toplam Çerçeve Sayısı + 7) / 8 (byte cinsinden, yuvarlama)
+const BITMAP_SIZE: usize = (TOTAL_FRAMES + 7) / 8;
+static mut FRAME_BITMAP: [u8; BITMAP_SIZE] = [0; BITMAP_SIZE];
+
+// Tahsis edilmiş çerçeve sayısını tutmak için atomik sayaç (stat/debug için)
+static ALLOCATED_FRAME_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+// Bitmap'e eş zamanlı erişimi korumak için spinlock
+static BITMAP_LOCK: Spinlock = Spinlock::new();
+
+// Yönetilen bellek bölgesinin sınırları (init sırasında belirlenir)
+static mut MANAGED_RANGE: Option<core::ops::Range<usize>> = None;
+
+
+// --- Public API / kmemory Entegrasyon Fonksiyonları ---
+
+/// Fiziksel Çerçeve Ayırıcısını başlatır.
+/// Bootloader'dan gelen kullanılabilir bellek haritasını alır.
+/// Karnal64'teki kmemory modülünün init fonksiyonu tarafından çağrılır.
 ///
-/// **Dikkat:** Bu örnek kod, DDR bellek kontrolcüsünün basitleştirilmiş bir modelidir.
-/// Gerçek bir DDR kontrolcüsü çok daha karmaşık donanım etkileşimleri ve zamanlama
-/// gereksinimleri içerir. Bu kod sadece kavramsal bir örnek olarak sunulmuştur ve
-/// gerçek donanım üzerinde çalışması amaçlanmamıştır. Bu güncellenmiş versiyon,
-/// Sahne64'ün bellek yönetimi sistem çağrılarını kullanmayı amaçlamaktadır.
-pub struct DDRMemoryController {
-    ddr_type: Option<DDRType>,
-    memory_size: usize, // Bellek boyutu (bayt cinsinden)
-    memory_ptr: *mut u8, // Belleği temsil eden bir pointer
-    is_initialized: bool,
+/// Güvenlik Notu: Gerçek bir çekirdekte, bootloader'dan gelen bellek haritası
+/// bilgisi dikkatlice doğrulanmalı ve çekirdeğin kendi kapladığı alanlar,
+/// aygıtlar için ayrılmış alanlar bitmap'de dolu olarak işaretlenmelidir.
+pub fn init(memory_map: &[MemoryRegion]) -> Result<(), KError> {
+    let mut bitmap_guard = BITMAP_LOCK.lock();
+
+    unsafe {
+        // Bitmap'i sıfırla (tüm çerçeveleri başlangıçta boş işaretle)
+        ptr::write_bytes(FRAME_BITMAP.as_mut_ptr(), 0, BITMAP_SIZE);
+        ALLOCATED_FRAME_COUNT.store(0, Ordering::SeqCst);
+        MANAGED_RANGE = None; // Başlangıçta yönetilen aralık yok
+    }
+
+    // Bellek haritasını işle, ilk kullanılabilir (Usable) bölgeyi bul
+    // ve bu bölgeyi yönetecek şekilde bitmap'i ayarla.
+    // Bu çok basit bir yaklaşım, gerçek bir ayırıcı tüm kullanılabilir
+    // bölgeleri yönetebilir.
+    let mut found_managed_region = false;
+    for region in memory_map.iter() {
+        // Kullanılabilir RAM bölgeleri (genellikle E820 veya benzeri bir standartla belirlenir)
+        const MEMORY_REGION_USABLE: u32 = 1; // Bu değer bootloader/BIOS standardına göre değişebilir
+
+        if region.kind == MEMORY_REGION_USABLE && region.size > 0 {
+            let region_start = region.base_addr as usize;
+            let region_end = (region.base_addr + region.size) as usize;
+
+            // Yönetmek istediğimiz sabit aralığı bulduğumuz bölgeye göre ayarla
+            // Veya doğrudan bootloader'ın sağladığı aralığı yönet.
+            // Örnek olarak sabit aralığı kullanmaya devam edelim ve bootloader'ın
+            // en azından bu aralığı kullanılabilir olarak işaretlediğini varsayalım.
+            let managed_start = PHYS_MEMORY_START;
+            let managed_end = PHYS_MEMORY_START + PHYS_MEMORY_SIZE;
+
+            // Bootloader'ın sağladığı kullanılabilir bölgenin, bizim yönetmek
+            // istediğimiz sabit aralığı tamamen veya kısmen içerdiğini kontrol et.
+            if region_start <= managed_start && region_end >= managed_end {
+                 unsafe {
+                    MANAGED_RANGE = Some(managed_start..managed_end);
+                 }
+                 found_managed_region = true;
+                 // Kernel kodunun, veri bölümlerinin ve başlangıç yığınının
+                 // yönetilen alanda olduğunu varsayalım ve bu çerçeveleri DOLU işaretleyelim.
+                 // Bu kısım bootloader'dan gelen bilgiye (kernel'in yüklendiği adresler)
+                 // ve linker script'ine göre yapılmalıdır. Şimdilik atlıyoruz.
+                 break; // İlk bulunan uygun bölgeyi kullanıyoruz
+            }
+            // TODO: Eğer managed_start < region_start veya managed_end > region_end ise
+            // veya bootloader haritasında hiç uygun bölge yoksa hata döndürmeliyiz.
+        }
+    }
+
+    if !found_managed_region {
+        // Kullanılabilir bellek bölgesi bulunamadı veya yönetmek istediğimiz aralık geçerli değil.
+          println!("Error: Could not find a suitable usable memory region to manage."); // Kernel print needed
+        return Err(KError::InternalError); // Veya spesifik bir init hatası
+    }
+
+
+    // TODO: Çekirdek kod/veri alanlarını bitmap'de dolu olarak işaretle.
+    // Bu, linker script'inden gelen sembollere (_kernel_start, _kernel_end vb.)
+    // veya bootloader tarafından sağlanan kernel adresine dayanır.
+
+     println!("DDR Ayırıcısı Başlatıldı. Yönetilen Alan: {:#x}-{:#x}",
+              PHYS_MEMORY_START, PHYS_MEMORY_START + PHYS_MEMORY_SIZE); // Kernel print needed
+     println!("Toplam {} çerçeve ({} KB), Bitmap boyutu {} byte",
+              TOTAL_FRAMES, TOTAL_FRAMES * FRAME_SIZE / 1024, BITMAP_SIZE);
+
+    Ok(())
 }
 
-impl DDRMemoryController {
-    /// Yeni bir DDR Bellek Yöneticisi örneği oluşturur ve belleği ayırır.
-    ///
-    /// Başlangıçta bellek yöneticisi başlatılmamıştır. `init` metodu ile başlatılmalıdır.
-    /// Bellek ayırma sırasında bir Sahne64 API hatası oluşursa `DDRError::MemoryOperationError` döndürülür.
-    pub fn new(memory_size_mb: usize) -> Result<Self, DDRError> {
-        let memory_size = memory_size_mb * 1024 * 1024; // MB'tan bayta dönüştür
-        // memory::allocate yeni Sahne64 API'sine göre Result<*mut u8, SahneError> dönüyor
-        match memory::allocate(memory_size) { // <-- Correct function call based on new API
-            Ok(ptr) => Ok(DDRMemoryController {
-                ddr_type: None,
-                memory_size,
-                memory_ptr: ptr,
-                is_initialized: false,
-            }),
-            Err(e) => Err(DDRError::from(e)), // SahneError, From trait ile DDRError'a çevriliyor
-        }
+
+/// Bir veya daha fazla fiziksel bellek çerçevesi tahsis eder.
+/// Bu fonksiyon, kmemory modülü tarafından, kullanıcı alanı bellek tahsisi
+/// veya paylaşılan bellek gibi işlemler için çağrılır.
+///
+/// `num_frames`: Tahsis edilecek çerçeve sayısı.
+/// `align_frames`: (İsteğe bağlı) Tahsisin başlaması gereken çerçeve hizalaması.
+///                 (örn: 1MB hizalaması için 256 çerçeve hizalaması istenir)
+///
+/// Başarı durumunda, tahsis edilen ilk çerçevenin fiziksel adresini döner.
+/// Hata durumunda KError döner.
+pub fn allocate_physical_frames(num_frames: usize, align_frames: usize) -> Result<NonNull<u8>, KError> {
+    if num_frames == 0 {
+        return Err(KError::InvalidArgument);
+    }
+    if align_frames == 0 || !align_frames.is_power_of_two() {
+        // Hizalama 0 olamaz ve 2'nin kuvveti olmalıdır.
+        return Err(KError::InvalidArgument);
     }
 
-    /// DDR Bellek Yöneticisini belirli bir DDR türü için başlatır.
-    /// Gerçek donanım başlatma işlemleri burada simüle edilir.
-    pub fn init(&mut self, ddr_type: DDRType) -> Result<(), DDRError> {
-        if self.is_initialized {
-            // Zaten başlatılmışsa hata dönebilir veya yeniden başlatmaya izin verilebilir.
-            // Bu örnekte basitlik adına yeniden başlatmaya izin verelim ama gerçekte daha dikkatli olmak gerekir.
-              return Err(DDRError::InitializationError("Controller already initialized".into()));
-        }
+    let mut bitmap_guard = BITMAP_LOCK.lock(); // Kilidi al
 
-        // Simüle edilmiş başlatma mesajları
-        #[cfg(feature = "std")]
-        std::println!("{:?} Bellek Yöneticisi başlatılıyor...", ddr_type);
-        #[cfg(not(feature = "std"))]
-        println!("{:?} Bellek Yöneticisi başlatılıyor...", ddr_type);
+    // Bitmap'de yeterli sayıda (num_frames) ardışık (contiguous) boş çerçeve arar.
+    // Hizalama (align_frames) gereksinimi varsa, arama buna göre başlar.
+    // Bu, basit bir 'ilk uyan' (first-fit) algoritmasıdır. Daha gelişmiş algoritmalar
+    // (örn: 'en iyi uyan' - best-fit) parçalanmayı azaltabilir.
 
+    let mut current_frame_index = 0;
+    while current_frame_index < TOTAL_FRAMES {
 
-        match ddr_type {
-            DDRType::DDR3 => {
-                // DDR3'e özgü başlatma işlemleri burada yapılabilir.
-                // Örneğin, zamanlama parametrelerini ayarlamak gibi.
-            }
-            DDRType::DDR4 => {
-                // DDR4'e özgü başlatma işlemleri burada yapılabilir.
-            }
-            DDRType::DDR5 => {
-                // DDR5'e özgü başlatma işlemleri burada yapılabilir.
+        // Hizalama gereksinimini kontrol et ve uygula
+        if align_frames > 1 {
+            let current_frame_addr = PHYS_MEMORY_START + current_frame_index * FRAME_SIZE;
+            let align_bytes = align_frames * FRAME_SIZE;
+
+            // Eğer mevcut adres istenen hizalamada değilse, bir sonraki hizalı adrese atla.
+            if current_frame_addr % align_bytes != 0 {
+                let next_aligned_addr = (current_frame_addr / align_bytes + 1) * align_bytes;
+                current_frame_index = (next_aligned_addr - PHYS_MEMORY_START) / FRAME_SIZE;
+                // Atladıktan sonra toplam çerçeve sayısını aşmış olabiliriz
+                if current_frame_index >= TOTAL_FRAMES {
+                    break; // Döngüyü kır
+                }
+                continue; // Hizalamayı sağladık, şimdi bu indexten itibaren kontrol et
             }
         }
-        self.ddr_type = Some(ddr_type);
-        self.is_initialized = true;
-
-        // Simüle edilmiş başarı mesajı
-         #[cfg(feature = "std")]
-        std::println!("{:?} Bellek Yöneticisi başarıyla başlatıldı.", ddr_type);
-         #[cfg(not(feature = "std"))]
-        println!("{:?} Bellek Yö yöneticisi başarıyla başlatıldı.", ddr_type);
-
-        Ok(())
-    }
-
-    /// Bellek yöneticisi kapatıldığında belleği serbest bırakır.
-    /// Dahili kullanımdır, genellikle Drop tarafından çağrılır.
-    fn deinit(&mut self) -> Result<(), DDRError> {
-        if self.is_initialized {
-             #[cfg(feature = "std")]
-            match self.ddr_type {
-                Some(ddr_type) => std::println!("{:?} Bellek Yöneticisi kapatılıyor...", ddr_type),
-                None => std::println!("Bellek Yöneticisi kapatılıyor..."), // init çağrılmamışsa
-            }
-             #[cfg(not(feature = "std"))]
-             match self.ddr_type {
-                Some(ddr_type) => println!("{:?} Bellek Yöneticisi kapatılıyor...", ddr_type),
-                None => println!("Bellek Yöneticisi kapatılıyor..."), // init çağrılmamışsa
-            }
 
 
-            // Belleği Sahne64 API'sini kullanarak serbest bırak
-            // Güvenli olmayan (unsafe) bir işlem çünkü ham pointer ile çalışıyoruz.
-            // <-- Değişiklik 2: memory::free yerine memory::release çağırıldı
-            let result = memory::release(self.memory_ptr, self.memory_size);
-
-            self.is_initialized = false;
-            self.memory_ptr = core::ptr::null_mut(); // Serbest bırakılan pointer'ı null yap
-            self.ddr_type = None;
-
-            // Sahne64 API'sinden dönen Result<_, SahneError>'ı Result<_, DDRError>'a çevir
-            result.map_err(DDRError::from)
+        // Mevcut indexten itibaren num_frames kadar ardışık çerçeve boş mu?
+        let mut is_block_free = true;
+        if current_frame_index + num_frames > TOTAL_FRAMES {
+            // Yeterli sayıda çerçeve kalmadı
+            is_block_free = false;
         } else {
-            // Zaten başlatılmamışsa bir şey yapmaya gerek yok
-            Ok(())
+            unsafe {
+                for i in 0..num_frames {
+                    let frame_index = current_frame_index + i;
+                    let byte_index = frame_index / 8;
+                    let bit_index_in_byte = frame_index % 8;
+                    let bit_mask = 1 << bit_index_in_byte;
+
+                    // Eğer herhangi bir çerçeve doluysa (bit 1 ise)
+                    if (FRAME_BITMAP[byte_index] & bit_mask) != 0 {
+                        is_block_free = false;
+                        // Boş bloğu bulamadık, aramaya bir sonraki çerçevenin başından devam et
+                        // (kontrol ettiğimiz bloğun başından değil!)
+                        current_frame_index = frame_index + 1;
+                        break; // İç döngüyü kır, dış döngü devam etsin
+                    }
+                }
+            }
         }
+
+        // Eğer blok boş bulunduysa
+        if is_block_free {
+            // Çerçeveleri dolu olarak işaretle (bitleri 1 yap)
+            unsafe {
+                for i in 0..num_frames {
+                    let frame_index = current_frame_index + i;
+                    let byte_index = frame_index / 8;
+                    let bit_index_in_byte = frame_index % 8;
+                    let bit_mask = 1 << bit_index_in_byte;
+                    FRAME_BITMAP[byte_index] |= bit_mask;
+                }
+            }
+
+            // Tahsis edilen sayıyı güncelle
+            ALLOCATED_FRAME_COUNT.fetch_add(num_frames, Ordering::SeqCst);
+
+            // Tahsis edilen bloğun başlangıç fiziksel adresini hesapla
+            let phys_addr = PHYS_MEMORY_START + current_frame_index * FRAME_SIZE;
+
+            // Kilidi serbest bırak ve adresi döndür
+            return Ok(unsafe { NonNull::new_unchecked(phys_addr as *mut u8) });
+        }
+
+        // Eğer blok boş değilse ve iç döngü kırılmadıysa (yani tek çerçeveli blok aranıyorsa)
+        // veya multi-frame blok kontrolünden sonra is_block_free false ise,
+        // arama bir sonraki çerçevenin başından devam eder (current_frame_index zaten güncellendi).
+        // Eğer iç döngü kırıldıysa (bir dolu çerçeve bulunduysa), current_frame_index
+        // zaten dolu çerçevenin bir fazlasına ayarlanmıştır.
+        // Eğer is_block_free false olduysa ama iç döngü kırılmadıysa (yalnızca TOTAL_FRAMES kontrolü),
+        // current_frame_index'i bir artırıp devam etmemiz gerekir.
+        if !is_block_free && current_frame_index + num_frames <= TOTAL_FRAMES {
+             current_frame_index += 1;
+        }
+         // Eğer is_block_free false olduysa ve iç döngü Kırıldıysa, current_frame_index
+         // zaten doğru şekilde ayarlanmış oluyor.
+
+    } // Döngü sonu
+
+    // Tüm bitmap arandı ama uygun boş blok bulunamadı
+    Err(KError::OutOfMemory) // Kilidi döndürmeden önce Drop trait'i serbest bırakır
+}
+
+/// Daha önce tahsis edilmiş bir veya daha fazla fiziksel çerçeveyi serbest bırakır.
+///
+/// `frame_ptr`: Serbest bırakılacak ilk çerçevenin fiziksel adresi.
+/// `num_frames`: Serbest bırakılacak ardışık çerçeve sayısı.
+///
+/// Başarı durumunda Ok(()), hata durumunda KError döner.
+/// Güvenlik Notu: `frame_ptr`'nin gerçekten daha önce bu ayırıcıdan
+/// tahsis edilmiş geçerli bir adres olduğu doğrulanmalıdır.
+pub fn free_physical_frames(frame_ptr: NonNull<u8>, num_frames: usize) -> Result<(), KError> {
+    let phys_addr = frame_ptr.as_ptr() as usize;
+
+    // Temel doğrulama: Adresin yönetilen aralıkta ve çerçeve hizalı olup olmadığını kontrol et.
+    if phys_addr < PHYS_MEMORY_START ||
+       phys_addr >= PHYS_MEMORY_START + PHYS_MEMORY_SIZE ||
+       (phys_addr - PHYS_MEMORY_START) % FRAME_SIZE != 0 ||
+       num_frames == 0 || // Sıfır çerçeve serbest bırakmak geçerli değil
+       (phys_addr - PHYS_MEMORY_START) / FRAME_SIZE + num_frames > TOTAL_FRAMES // Serbest bırakılan blok sınırları aşıyor
+    {
+         println!("Free_physical_frames: Invalid argument - addr {:#x}, num_frames {}", phys_addr, num_frames); // Kernel print needed
+        return Err(KError::InvalidArgument);
+    }
+
+    // Çerçevenin başlangıç indeksini hesapla
+    let start_frame_index = (phys_addr - PHYS_MEMORY_START) / FRAME_SIZE;
+
+    let mut bitmap_guard = BITMAP_LOCK.lock(); // Kilidi al
+
+    // Serbest bırakılacak çerçeveleri dolu olarak işaretliyse (bit 1) kontrol et
+    // ve ardından boş olarak işaretle (bitleri 0 yap).
+    unsafe {
+        for i in 0..num_frames {
+            let frame_index = start_frame_index + i;
+            let byte_index = frame_index / 8;
+            let bit_index_in_byte = frame_index % 8;
+            let bit_mask = 1 << bit_index_in_byte;
+
+            // Çerçevenin dolu olduğundan emin ol (bir hata kontrolü)
+            if (FRAME_BITMAP[byte_index] & bit_mask) == 0 {
+                 // println!("Free_physical_frames: Attempted to free a free or invalid frame at index {} (address {:#x})", frame_index, phys_addr + i * FRAME_SIZE); // Kernel print needed
+                // Bir hata oluştu: serbest bırakılmaya çalışılan çerçeve zaten boş.
+                // Bu, aynı çerçeve bloğunun iki kere serbest bırakıldığı anlamına gelebilir.
+                // Bu durumda, o ana kadar serbest bırakılmış çerçeveleri geri "dolu" yapmamak gerekir,
+                // ancak hata durumunu açıkça belirtmeliyiz.
+                // Kilit serbest bırakılmadan çıkıyoruz.
+                return Err(KError::InternalError); // Veya KError::InvalidArgument
+            }
+
+            // Çerçeveyi boş olarak işaretle (biti 0 yap)
+            FRAME_BITMAP[byte_index] &= !bit_mask;
+        }
+    } // Kilit serbest bırakılır
+
+    // Tahsis edilen sayıyı güncelle
+    ALLOCATED_FRAME_COUNT.fetch_sub(num_frames, Ordering::SeqCst);
+
+    Ok(())
+}
+
+/// Yönetilen toplam fiziksel çerçeve sayısını döndürür.
+pub fn total_frames() -> usize {
+    TOTAL_FRAMES
+}
+
+/// Şu anda tahsis edilmiş fiziksel çerçeve sayısını döndürür.
+pub fn allocated_frames() -> usize {
+    ALLOCATED_FRAME_COUNT.load(Ordering::SeqCst)
+}
+
+/// Fiziksel adresin yönetilen alanda olup olmadığını kontrol eder.
+pub fn is_managed_physical_address(phys_addr: usize) -> bool {
+    match unsafe { MANAGED_RANGE } {
+        Some(ref range) => range.contains(&phys_addr),
+        None => false, // Henüz başlatılmadıysa hiçbir adres yönetilmiyor
     }
 }
 
-impl Drop for DDRMemoryController {
-    /// `DDRMemoryController` örneği düşürüldüğünde belleği serbest bırakır.
-    /// Bu, Drop trait'inin gerektirdiği fonksiyondur. deinit'i çağırır ve
-    /// deinit'teki olası hataları yoksayar (Drop içinde hata fırlatmak Rust prensiplerine aykırıdır).
-    fn drop(&mut self) {
-        // deinit'ten dönen Result'ı kontrol etmiyoruz, çünkü Drop içinde
-        // paniklememeye çalışmalıyız. Ancak loglama yapabiliriz.
-         if let Err(e) = self.deinit() {
-             // Değişiklik 3: eprintln! kullanımı için std/no_std kontrolü
-             #[cfg(not(feature = "std"))]
-             {
-                  // Sahne64 custom eprintln! macro'sunun scope'ta olduğunu varsayalım.
-                  eprintln!("UYARI: DDR Bellek Yöneticisi serbest bırakılırken hata oluştu: {:?}", e);
-             }
-             #[cfg(feature = "std")]
-             {
-                 std::eprintln!("UYARI: DDR Bellek Yöneticisi serbest bırakılırken hata oluştu: {:?}", e);
-             }
-         }
+// TODO: Diğer ihtiyaç duyulabilecek fonksiyonlar:
+// - Fiziksel adresten çerçeve indeksini bulma
+// - Çerçeve indeksinden fiziksel adresi bulma
+// - Belirli bir çerçeve bloğunun durumunu sorgulama
+
+
+// --- kmemory Modülü İçin Kullanılacak Yüksek Seviye Fonksiyonlar (İskelet) ---
+// Bu fonksiyonlar, karnal64.rs'deki kmemory modülü tarafından çağrılacaktır.
+// Bunlar, fiziksel ayırıcının üzerine kurulu daha yüksek seviye bellek yönetimi işlevleridir.
+// Gerçek implementasyonları sanal bellek (sayfa tabloları) yönetimini içerecektir.
+
+// Bu fonksiyon kmemory::init_manager() tarafından çağrılır.
+// Buradaki init fonksiyonumuzu çağırır.
+pub fn memory_manager_init(memory_map: &[MemoryRegion]) -> Result<(), KError> {
+    init(memory_map)
+}
+
+// Bu fonksiyon handle_syscall'dan SYSCALL_MEMORY_ALLOCATE için çağrılır (kmemory üzerinden).
+// Kullanıcı alanı için bellek tahsis eder (sanal bellek yönetimi burada başlar).
+// Şu an sadece fiziksel çerçeve tahsis eder, sanal eşleme yapmaz.
+pub fn allocate_user_memory(size: usize) -> Result<NonNull<u8>, KError> {
+    // Kullanıcı alanı tahsisi genellikle sayfa boyutunda hizalanmalıdır.
+    if size == 0 {
+        return Err(KError::InvalidArgument);
+    }
+    let size_in_frames = (size + FRAME_SIZE - 1) / FRAME_SIZE;
+
+    // TODO: Gerçek kullanıcı alanı tahsisi:
+    // 1. allocate_physical_frames ile fiziksel çerçeve(ler) tahsis et.
+    // 2. Mevcut görevin sanal adres alanında uygun bir sanal adres bul (örn: heap alanı).
+    // 3. Sayfa tablosunu güncelleyerek sanal adresleri fiziksel çerçevelere eşle.
+    // 4. Tahsis edilen sanal adresin başlangıcını döndür.
+
+    // Basitlik adına, şimdilik sadece bir fiziksel çerçeve tahsis edelim ve onun adresini döndürelim.
+    // Bu adres doğrudan kullanıcı alanında geçerli olmayabilir! Sanal eşleme GEREKLİ.
+    let num_frames = 1; // Şimdilik sadece 1 çerçeve
+    let align_frames = 1; // Hizalama yok (veya 1 çerçeve hizalama)
+    match allocate_physical_frames(num_frames, align_frames) {
+        Ok(phys_ptr) => {
+            // Gerçek implementasyonda, burada phys_ptr'yi kullanıcı alanındaki bir sanal adrese eşlerdik.
+            // Şimdilik fiziksel adresi (Non-null pointer olarak) döndürüyoruz, bu KESİNLİKLE YANLIŞTIR
+            // gerçek bir çekirdekte sanal bellek olmadan yapılamaz.
+              println!("allocate_user_memory: Allocated physical frame {:#p}, VIRTUAL mapping needed!", phys_ptr.as_ptr()); // Kernel print needed
+            Ok(phys_ptr) // DİKKAT: Burası sanal adres DÖNDÜRMELİ, fiziksel değil!
+        },
+        Err(err) => Err(err),
     }
 }
 
-impl DDRMemoryController {
-    /// Belirtilen adresten bayt okur.
-    /// Okuma işlemi volatile olarak yapılır.
-    pub fn read_byte(&self, address: usize) -> Result<u8, DDRError> {
-        if !self.is_initialized {
-            return Err(DDRError::NotInitialized);
-        }
-        if address >= self.memory_size {
-            return Err(DDRError::AddressOutOfRange(address));
-        }
-        // Güvenli olmayan (unsafe) bir işlem çünkü ham pointer ile çalışıyoruz.
-        // Pointer'ın geçerli ve boyut içinde olduğunu kontrol ettik.
-        unsafe { Ok(read_volatile(self.memory_ptr.add(address))) }
-    }
+// Bu fonksiyon handle_syscall'dan SYSCALL_MEMORY_RELEASE için çağrılır (kmemory üzerinden).
+// Kullanıcı alanı belleğini serbest bırakır (sanal bellek yönetimi burada devam eder).
+// Şu an sadece fiziksel çerçeveyi serbest bırakır, sanal eşlemeyi kaldırmaz.
+pub fn free_user_memory(ptr: NonNull<u8>, size: usize) -> Result<(), KError> {
+     if size == 0 {
+        return Err(KError::InvalidArgument);
+     }
+    let size_in_frames = (size + FRAME_SIZE - 1) / FRAME_SIZE;
 
-    /// Belirtilen adrese bir bayt yazar.
-    /// Yazma işlemi volatile olarak yapılır.
-    pub fn write_byte(&mut self, address: usize, value: u8) -> Result<(), DDRError> {
-        if !self.is_initialized {
-            return Err(DDRError::NotInitialized);
-        }
-        if address >= self.memory_size {
-            return Err(DDRError::AddressOutOfRange(address));
-        }
-        // Güvenli olmayan (unsafe) bir işlem çünkü ham pointer ile çalışıyoruz.
-        // Pointer'ın geçerli ve boyut içinde olduğunu kontrol ettik.
-        unsafe { write_volatile(self.memory_ptr.add(address), value) };
-        Ok(())
-    }
+    // TODO: Gerçek kullanıcı alanı serbest bırakma:
+    // 1. Verilen sanal adresten (ptr) başlayarak eşlenmiş fiziksel çerçeveleri bul.
+    // 2. Sayfa tablosundan sanal-fiziksel eşlemeyi kaldır.
+    // 3. free_physical_frames ile fiziksel çerçeveleri serbest bırak.
 
-    /// Belirtilen adresten 32-bit (4 bayt) okur.
-    /// Okuma işlemi volatile olarak yapılır. Endianness dikkate alınmayabilir,
-    /// gerçek donanım sürücüsünde endianness yönetimi önemlidir.
-    pub fn read_u32(&self, address: usize) -> Result<u32, DDRError> {
-        if !self.is_initialized {
-            return Err(DDRError::NotInitialized);
-        }
-        // 32-bit okuma için 4 bayt alan gerekir.
-        if address.checked_add(4).unwrap_or(usize::MAX) > self.memory_size { // Overflow check eklendi
-             return Err(DDRError::AddressOutOfRange(address));
-        }
-        // Güvenli olmayan (unsafe) bir işlem çünkü ham pointer ile çalışıyoruz.
-        // Pointer'ın geçerli ve boyut içinde olduğunu kontrol ettik.
-        unsafe {
-            let ptr = self.memory_ptr.add(address) as *const u32;
-            Ok(read_volatile(ptr))
-        }
-    }
+    // Basitlik adına, verilen pointer'ın (yanlışlıkla fiziksel olduğunu varsaydığımız)
+    // 1 çerçevelik bir tahsis olduğunu varsayalım ve o çerçeveyi serbest bırakalım.
+    // Bu KESİNLİKLE YANLIŞTIR gerçek bir çekirdekte sanal bellek olmadan yapılamaz.
+    let num_frames = 1; // Şimdilik sadece 1 çerçeve
+     if size_in_frames > 1 {
+          println!("free_user_memory: Only single frame deallocation supported in this basic example."); // Kernel print needed
+         return Err(KError::NotSupported); // Çoklu çerçeve serbest bırakma desteklenmiyor
+     }
+     if (ptr.as_ptr() as usize - PHYS_MEMORY_START) % FRAME_SIZE != 0 {
+           println!("free_user_memory: Pointer {:#p} is not frame-aligned for basic free.", ptr.as_ptr()); // Kernel print needed
+          return Err(KError::InvalidArgument); // Çerçeve hizalı değilse basit serbest bırakma yapamayız
+     }
 
-    /// Belirtilen adrese 32-bit (4 bayt) yazar.
-    /// Yazma işlemi volatile olarak yapılır. Endianness dikkate alınmayabilir.
-    pub fn write_u32(&mut self, address: usize, value: u32) -> Result<(), DDRError> {
-        if !self.is_initialized {
-            return Err(DDRError::NotInitialized);
-        }
-         // 32-bit yazma için 4 bayt alan gerekir.
-        if address.checked_add(4).unwrap_or(usize::MAX) > self.memory_size { // Overflow check eklendi
-            return Err(DDRError::AddressOutOfRange(address));
-        }
-        // Güvenli olmayan (unsafe) bir işlem çünkü ham pointer ile çalışıyoruz.
-        // Pointer'ın geçerli ve boyut içinde olduğunu kontrol ettik.
-        unsafe {
-            let ptr = self.memory_ptr.add(address) as *mut u32;
-            write_volatile(ptr, value);
-        }
-        Ok(())
-    }
 
-    /// Bellek yöneticisinin şu anda hangi DDR türünü kullandığını döndürür.
-    pub fn get_ddr_type(&self) -> Option<DDRType> {
-        self.ddr_type
-    }
-
-    /// Bellek yöneticisinin yönettiği toplam bellek boyutunu bayt cinsinden döndürür.
-    pub fn get_memory_size(&self) -> usize {
-        self.memory_size
-    }
-
-    /// Ayrılan belleğin ham pointer'ını döndürür.
-    /// DİKKAT: Bu pointer'ı kullanırken bellek güvenliğini sağlamak çağıranın sorumluluğundadır.
-    pub fn as_ptr(&self) -> *mut u8 {
-         self.memory_ptr
-    }
+    // DİKKAT: ptr burada sanal bir adres olmalı, fiziksel değil.
+    // Aşağıdaki çağrı, sanki ptr fiziksel bir adresmiş gibi free_physical_frames'i çağırıyor.
+    // Bu yanlıştır ve gerçek implementasyonda sanal adres -> fiziksel adres çevirisi GEREKLİDİR.
+      println!("free_user_memory: Attempting to free physical frame at {:#p}", ptr.as_ptr()); // Kernel print needed
+    free_physical_frames(ptr, num_frames) // DİKKAT: Bu çağrı doğrudan fiziksel adresi bekler, sanal değil!
 }
 
-// --- Örnek Kullanım ---
-#[cfg(feature = "std")]
-fn main() {
-    // Bu örnek std ortamında çalışacak şekilde yapılandırılmıştır.
-    // no_std ortamında Sahne64'ün çıktı makroları veya özel bir çıktı mekanizması gerektirir.
-
-    #[cfg(feature = "std")]
-    std::println!("Sahne64 DDR Bellek Yöneticisi Örneği (std)");
-    #[cfg(not(feature = "std"))]
-    println!("Sahne64 DDR Bellek Yöneticisi Örneği (no_std)");
-
-
-    // 16MB boyutunda bir DDR Bellek Yöneticisi oluştur
-    match DDRMemoryController::new(16) {
-        Ok(mut ddr_controller) => {
-            // DDR4 olarak başlat
-            match ddr_controller.init(DDRType::DDR4) {
-                Ok(_) => {
-                     #[cfg(feature = "std")]
-                    std::println!("DDR Bellek Yöneticisi başarıyla başlatıldı.");
-                     #[cfg(not(feature = "std"))]
-                     println!("DDR Bellek Yöneticisi başarıyla başlatıldı.");
-                }
-                Err(e) => {
-                    #[cfg(feature = "std")]
-                    std::eprintln!("DDR Bellek Yöneticisi başlatma hatası: {:?}", e);
-                     #[cfg(not(feature = "std"))]
-                     eprintln!("DDR Bellek Yöneticisi başlatma hatası: {:?}", e);
-                    return;
-                }
-            }
-
-            // Belleğe veri yazma (32-bit)
-            let address_to_write = 0x1000; // Örnek adres
-            let data_to_write: u32 = 0x12345678;
-            match ddr_controller.write_u32(address_to_write, data_to_write) {
-                Ok(_) => {
-                    #[cfg(feature = "std")]
-                    std::println!("0x{:X} adresine 0x{:X} değeri yazıldı.", address_to_write, data_to_write);
-                     #[cfg(not(feature = "std"))]
-                     println!("0x{:X} adresine 0x{:X} değeri yazıldı.", address_to_write, data_to_write);
-                }
-                Err(e) => {
-                     #[cfg(feature = "std")]
-                    std::eprintln!("Yazma hatası: {:?}", e);
-                     #[cfg(not(feature = "std"))]
-                     eprintln!("Yazma hatası: {:?}", e);
-                }
-            }
-
-            // Bellekten veri okuma (32-bit)
-            let address_to_read = 0x1000; // Aynı adres
-            match ddr_controller.read_u32(address_to_read) {
-                Ok(read_data) => {
-                    #[cfg(feature = "std")]
-                    std::println!("0x{:X} adresinden okunan değer: 0x{:X}", address_to_read, read_data);
-                     #[cfg(not(feature = "std"))]
-                     println!("0x{:X} adresinden okunan değer: 0x{:X}", address_to_read, read_data);
-                }
-                Err(e) => {
-                     #[cfg(feature = "std")]
-                    std::eprintln!("Okuma hatası: {:?}", e);
-                     #[cfg(not(feature = "std"))]
-                     eprintln!("Okuma hatası: {:?}", e);
-                }
-            }
-
-            // Bellek türünü ve boyutunu al
-            if let Some(ddr_type) = ddr_controller.get_ddr_type() {
-                 #[cfg(feature = "std")]
-                std::println!("Kullanılan DDR Türü: {:?}", ddr_type);
-                 #[cfg(not(feature = "std"))]
-                println!("Kullanılan DDR Türü: {:?}", ddr_type);
-            }
-             #[cfg(feature = "std")]
-            std::println!("Toplam Bellek Boyutu: {} bayt", ddr_controller.get_memory_size());
-             #[cfg(not(feature = "std"))]
-            println!("Toplam Bellek Boyutu: {} bayt", ddr_controller.get_memory_size());
-
-            // --- Hata senaryoları ---
-             #[cfg(feature = "std")]
-            std::println!("\n--- Hata Senaryoları ---");
-             #[cfg(not(feature = "std"))]
-            println!("\n--- Hata Senaryoları ---");
-
-
-            // Adres aralığı dışında okuma yapmaya çalışma
-            let invalid_address = ddr_controller.get_memory_size(); // Bellek boyutunun dışında bir adres
-            match ddr_controller.read_byte(invalid_address) {
-                Ok(_) => {
-                     #[cfg(feature = "std")]
-                    std::println!("Bu olmamalı! Başarılı okuma beklenmiyordu.");
-                     #[cfg(not(feature = "std"))]
-                     println!("Bu olmamalı! Başarılı okuma beklenmiyordu.");
-                }
-                Err(e) => {
-                     #[cfg(feature = "std")]
-                    std::eprintln!("Adres aralığı dışı okuma hatası alındı: {:?}", e); // Bu bekleniyor
-                     #[cfg(not(feature = "std"))]
-                     eprintln!("Adres aralığı dışı okuma hatası alındı: {:?}", e); // Bu bekleniyor
-                }
-            }
-             // Adres aralığı dışında 32-bit okuma yapmaya çalışma (limit + 4)
-            let invalid_address_u32 = ddr_controller.get_memory_size().checked_sub(3).unwrap_or(0); // Sondan 3 byte öncesi
-            match ddr_controller.read_u32(invalid_address_u32) {
-                Ok(_) => {
-                     #[cfg(feature = "std")]
-                    std::println!("Bu olmamalı! Başarılı 32-bit okuma beklenmiyordu.");
-                     #[cfg(not(feature = "std"))]
-                     println!("Bu olmamalı! Başarılı 32-bit okuma beklenmiyordu.");
-                }
-                Err(e) => {
-                     #[cfg(feature = "std")]
-                    std::eprintln!("Adres aralığı dışı 32-bit okuma hatası alındı: {:?}", e); // Bu bekleniyor
-                     #[cfg(not(feature = "std"))]
-                     eprintln!("Adres aralığı dışı 32-bit okuma hatası alındı: {:?}", e); // Bu bekleniyor
-                }
-            }
-
-
-            // Bellek yöneticisi scope dışına çıktığında `drop` metodu çağrılacak ve bellek serbest bırakılacaktır.
-        }
-        Err(e) => {
-             #[cfg(feature = "std")]
-            std::eprintln!("DDR Bellek Yöneticisi oluşturma hatası: {:?}", e);
-             #[cfg(not(feature = "std"))]
-            eprintln!("DDR Bellek Yöneticisi oluşturma hatası: {:?}", e);
-        }
-    }
-}
+// TODO: Paylaşılan bellek fonksiyonları (shared_mem_create, map, unmap) implementasyonu
+// Bunlar da sanal bellek yönetimini ve farklı görevlerin aynı fiziksel çerçeveleri kendi
+// sanal adres alanlarına eşlemesini gerektirir.
+ pub fn shared_mem_create(size: usize) -> Result<KHandle, KError> { /* ... */ }
+ pub fn shared_mem_map(k_handle_value: u64, offset: usize, size: usize) -> Result<*mut u8, KError> { /* ... */ }
+ pub fn shared_mem_unmap(ptr: *mut u8, size: usize) -> Result<(), KError> { /* ... */ }
