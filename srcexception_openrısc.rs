@@ -1,190 +1,226 @@
-#![no_std]
+#![no_std] // Standart kütüphaneye ihtiyaç duymuyoruz
+#![allow(dead_code)] // Geliştirme sırasında kullanılmayan kod veya argümanlar için izin
+#![allow(unused_variables)]
 
-use core::arch::asm;
-use core::fmt;
-use core::panic::PanicInfo;
+// Karnal64 API'sından ihtiyacımız olanları içeri alalım
+use karnal64::{KError, KHandle, KTaskId, KThreadId};
+use karnal64::{handle_syscall}; // Syscall'leri yönlendireceğimiz ana fonksiyon
+use karnal64::{ktask, kmemory, kresource}; // Dahili modüllerle etkileşim için
 
-// İstisna Sebepleri (OpenRISC 1000 mimarisi için)
-#[repr(u32)]
-enum ExceptionCause {
-    Reset = 0x00,
-    BusErrorInstructionFetch = 0x01,
-    BusErrorDataLoad = 0x02,
-    BusErrorDataStore = 0x03,
-    IllegalInstruction = 0x04,
-    PrivilegedInstruction = 0x05,
-    Trap = 0x06,
-    SystemCall = 0x07,
-    FloatingPointException = 0x08,
-    DataPageFault = 0x09,
-    InstructionPageFault = 0x0A,
-    TickTimer = 0x0B,
-    AlignmentError = 0x0C,
-    Unknown = 0xFFFF, // Bilinmeyen sebepler için
-}
+// Mimariye özel yapılar/sabitler (Bunlar gerçek donanıma göre ayarlanmalı)
+// Örnek RISC-V mcause değerleri (Kullanılan mimariye göre değişir!)
+const TRAP_CAUSE_USER_ECALL: u64 = 8;
+const TRAP_CAUSE_SUPERVISOR_ECALL: u64 = 9;
+// ... diğer ecall/trap nedenleri ...
+const TRAP_CAUSE_TIMER_INTERRUPT: u64 = 0x8000000000000007; // Supervisor Timer Interrupt
 
-impl fmt::Display for ExceptionCause {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ExceptionCause::Reset => write!(f, "Sıfırlama"),
-            ExceptionCause::BusErrorInstructionFetch => write!(f, "Veriyolu Hatası (Talimat Getirme)"),
-            ExceptionCause::BusErrorDataLoad => write!(f, "Veriyolu Hatası (Veri Yükleme)"),
-            ExceptionCause::BusErrorDataStore => write!(f, "Veriyolu Hatası (Veri Saklama)"),
-            ExceptionCause::IllegalInstruction => write!(f, "Geçersiz Komut"),
-            ExceptionCause::PrivilegedInstruction => write!(f, "Ayrıcalıklı Komut"),
-            ExceptionCause::Trap => write!(f, "Tuzak"),
-            ExceptionCause::SystemCall => write!(f, "Sistem Çağrısı"),
-            ExceptionCause::FloatingPointException => write!(f, "Kayan Nokta İstisnası"),
-            ExceptionCause::DataPageFault => write!(f, "Veri Sayfası Hatası"),
-            ExceptionCause::InstructionPageFault => write!(f, "Talimat Sayfası Hatası"),
-            ExceptionCause::TickTimer => write!(f, "Tick Zamanlayıcı"),
-            ExceptionCause::AlignmentError => write!(f, "Hizalama Hatası"),
-            ExceptionCause::Unknown => write!(f, "Bilinmeyen Sebep"),
-        }
-    }
-}
-
-// ExceptionContext yapısı (OpenRISC için)
-#[derive(Debug)]
+// Kaydedilmiş register'ları tutacak yapı
+// Bu yapı, trap/kesme işleyicisi girişindeki assembly kodunda doldurulmalı ve
+// çıkışındaki assembly kodunda geri yüklenmelidir.
+// RISC-V genel amaçlı register'ları (x0-x31) temsil eder.
+// ABI'ye göre syscall numarası ve argümanlarının hangi register'larda olacağı belirlidir.
 #[repr(C)]
-pub struct ExceptionContext {
-    pub pc: u32,        // Program Sayacı
-    pub spr_ адреси: u32, // SPR'lerin adresi (gerektiğinde daha fazla SPR eklenebilir)
-    pub vector: u32,    // İstisna Vektör Adresi
-    pub epcr: u32,      // İstisna Program Sayacı Kaydı
-    pub eear: u32,      // İstisna Etkin Adres Kaydı
-    pub esr: u32,       // İstisna Durum Kaydı
-    // ... diğer ilgili kayıtlar eklenebilir
+pub struct TrapFrame {
+    // Genel amaçlı register'lar (x0 is zero, x1 is ra, x2 is sp, ...)
+    // x0'dan x31'e kadar hepsi burada temsil edilmeli.
+    // Sıralama, assembly girişindeki kaydetme sırasıyla eşleşmelidir!
+    pub regs: [u64; 32],
+
+    // Kontrol ve Durum Register'ları (örnek RISC-V S-mode)
+    // SePC: Program Sayacı (Trap sonrası dönecek adres)
+    pub sepc: u64,
+    // SCAUSE: Trap nedeni
+    pub scause: u64,
+    // STVAL: Trap ile ilgili adres/değer (örn. sayfa hatası adresi)
+    pub stval: u64,
+    // SSTATUS: Durum register'ı (örneğin SPIE, SPP bitleri)
+    pub sstatus: u64,
+
+    // İş parçacığı/Görev kimliği (isteğe bağlı, kolaylık için)
+    pub task_id: KTaskId,
 }
 
-// Basit çıktı mekanizması (UART MMIO adresleri örnek)
-mod io {
-    use core::fmt::Write;
+// Kernel trap/exception/interrupt giriş noktası
+// Bu fonksiyon, trap vektörüne konulan düşük seviyeli assembly tarafından çağrılır.
+// Assembly kodu, CPU durumunu (register'ları) TrapFrame'e kaydetmiş olmalıdır.
+#[no_mangle]
+pub extern "C" fn trap_handler(trap_frame: &mut TrapFrame) {
+    // 1. Trap Nedenini Belirle
+    let cause = trap_frame.scause;
+    let is_interrupt = (cause >> 63) & 1 == 1; // En üst bit kesme mi, istisna mı?
+    let cause_code = cause & 0xfff; // Neden kodu (kesmeler için de geçerli)
 
-    // Örnek MMIO adresleri (OpenRISC için tipik adresler kontrol edilmeli)
-    const UART_BASE: u32 = 0x90000000; // Örnek UART temel adresi
-    const UART_DATA: u32 = UART_BASE + 0x00; // Veri yazma/okuma adresi
-    const UART_STATUS: u32 = UART_BASE + 0x04; // Durum kaydı adresi (gerekirse)
+    // 2. Nedenine Göre İşlem Yap
+    match (is_interrupt, cause_code) {
+        // --- İstisnalar (Exceptions) ---
+        (false, TRAP_CAUSE_USER_ECALL) => {
+            // Kullanıcı alanından Sistem Çağrısı (ECALL)
+            // Syscall numarası ve argümanları belirli register'larda bulunur (RISC-V ABI'sine göre a0-a5, a7 syscall numarası).
+            // a7 (x17) genellikle syscall numarasını tutar.
+            // a0-a5 (x10-x15) genellikle argümanları tutar.
 
-    struct Stdout;
+            // syscall numarasını ve argümanları TrapFrame'den al
+            let syscall_number = trap_frame.regs[17]; // a7 (x17)
+            let arg1 = trap_frame.regs[10]; // a0 (x10)
+            let arg2 = trap_frame.regs[11]; // a1 (x11)
+            let arg3 = trap_frame.regs[12]; // a2 (x12)
+            let arg4 = trap_frame.regs[13]; // a3 (x13)
+            let arg5 = trap_frame.regs[14]; // a4 (x14)
 
-    impl Write for Stdout {
-        fn write_str(&mut self, s: &str) -> core::fmt::Result {
-            for byte in s.bytes() {
-                unsafe {
-                    // Basit MMIO simülasyonu
-                    core::ptr::write_volatile(UART_DATA as *mut u8, byte);
+            // Güvenlik Notu: Burada Karnal64'e geçirilen user_buffer_ptr, resource_id_ptr gibi
+            // pointer argümanlarının kullanıcı alanında geçerli ve erişilebilir
+            // olduklarının *handle_syscall* içinde veya öncesinde doğrulanması GEREKİR!
+
+            // Karnal64 sistem çağrısı işleyicisini çağır
+            let syscall_result = handle_syscall(syscall_number, arg1, arg2, arg3, arg4, arg5);
+
+            // Syscall sonucunu kullanıcı alanına dönecek register'a yaz (genellikle a0 - x10)
+            trap_frame.regs[10] = syscall_result as u64; // i64 -> u64 dönüşümü hata kodları için uygundur
+
+            // Syscall istisnasından sonra PC'yi bir sonraki komuta ilerlet
+            // (ECALL komutu genellikle 4 byte uzunluğundadır)
+            trap_frame.sepc += 4;
+        }
+        (false, TRAP_CAUSE_SUPERVISOR_ECALL) => {
+             // Supervisor (Kernel) alanından Ecall - Normalde olmamalı veya özel amaçlı olmalı
+             // Panikleyebilir veya bu tür çağrıları engelleyebiliriz.
+             // Eğer kernel thread'ler kendi aralarında syscall benzeri çağrılar yapıyorsa, burası işlenir.
+             // Bu örnekte panikliyoruz.
+             panic!("Supervisor ECALL occurred! Cause: {}", trap_frame.scause);
+        }
+        (false, 12) => { // Instruction page fault
+             // Talimat (Instruction) Sayfa Hatası
+             // Hataya neden olan adres STVAL register'ında bulunur.
+             let fault_addr = trap_frame.stval;
+             println!("Instruction Page Fault at address: {:#x}", fault_addr); // Kernel print!
+
+             // TODO: Bellek yöneticisine page fault'u işlemesini söyle
+              kmemory::handle_page_fault(fault_addr, FaultType::Instruction);
+             // Başarılı olursa devam eder, başarısız olursa mevcut görevi sonlandırır.
+
+             // Şimdilik basitçe panikleyelim
+             panic!("Unhandled Instruction Page Fault at {:#x}", fault_addr);
+        }
+        (false, 13) => { // Load page fault
+             // Yükleme (Load) Sayfa Hatası
+             let fault_addr = trap_frame.stval;
+             println!("Load Page Fault at address: {:#x}", fault_addr); // Kernel print!
+
+             // TODO: Bellek yöneticisine page fault'u işlemesini söyle
+              kmemory::handle_page_fault(fault_addr, FaultType::Load);
+
+             // Şimdilik basitçe panikleyelim
+             panic!("Unhandled Load Page Fault at {:#x}", fault_addr);
+        }
+        (false, 15) => { // Store/AMO page fault
+             // Yazma (Store/AMO) Sayfa Hatası
+             let fault_addr = trap_frame.stval;
+             println!("Store Page Fault at address: {:#x}", fault_addr); // Kernel print!
+
+             // TODO: Bellek yöneticisine page fault'u işlemesini söyle
+              kmemory::handle_page_fault(fault_addr, FaultType::Store);
+
+             // Şimdilik basitçe panikleyelim
+             panic!("Unhandled Store Page Fault at {:#x}", fault_addr);
+        }
+        // --- Kesmeler (Interrupts) ---
+        (true, cause_code) => {
+            match cause_code {
+                7 => { // Supervisor Timer Interrupt (STIMER)
+                    // Zamanlayıcı Kesmesi - Görev değiştirme için uygun zaman
+                     println!("Timer Interrupt"); // Debug amaçlı
+
+                    // TODO: Zamanlayıcı aygıtını bir sonraki kesme için yeniden programla
+                    // Bu genellikle platforma özel bir donanım erişimi gerektirir.
+
+                    // TODO: Görev zamanlayıcısını çalıştır (Karnal64 ktask modülü)
+                    // Zamanlayıcı, mevcut görevi durdurup yeni bir görev seçebilir.
+                     ktask::schedule(); // Zamanlayıcı çağrısı
+                     println!("Scheduler called due to Timer Interrupt"); // Yer tutucu
+                }
+                // TODO: Diğer kesme türleri (Harici Kesmeler vb.)
+                _ => {
+                    // Bilinmeyen veya işlenmemiş kesme
+                    println!("Unhandled Interrupt! Cause Code: {}", cause_code); // Kernel print!
+                    // Kritik olmayan kesmeler görmezden gelinebilir veya loglanabilir.
                 }
             }
-            Ok(())
+            // Kesmelerden sonra PC'yi ilerletmeye gerek yok, donanım halleder.
+        }
+        // --- Bilinmeyen İstisnalar ---
+        _ => {
+            // Bilinmeyen veya işlenmemiş istisna
+            println!("Unhandled Exception! Cause: {:#x}, STVAL: {:#x}, SEPC: {:#x}",
+                     trap_frame.scause, trap_frame.stval, trap_frame.sepc); // Kernel print!
+            // Kurtarılamaz bir hata, mevcut görevi sonlandırabilir veya panikleyebiliriz.
+            // Güvenlik nedeniyle paniklemek daha iyi olabilir başlangıçta.
+            panic!("Unhandled Exception!");
         }
     }
 
-    pub fn println(s: &str) {
-        let mut stdout = Stdout;
-        core::fmt::write!(&mut stdout, "{}\n", s).unwrap();
-    }
+    // 3. Konteksti Geri Yükle ve Dön
+    // TrapHandler'dan dönüldüğünde, çağırılan assembly kodu `trap_frame`'deki değerleri kullanarak
+    // register'ları geri yüklemeli ve `sret` (Supervisor Return) gibi bir komutla
+    // kesintiye uğrayan işin adresine (sepc) geri dönmelidir.
+    // Eğer `ktask::schedule()` yeni bir görev seçtiyse, assembly kodu o yeni görevin
+    // TrapFrame'ini yükleyecektir.
 }
 
 
-#[no_mangle]
-extern "C" fn exception_handler(context: &ExceptionContext) {
-    let cause = match context.esr { // ESR (Exception Status Register) içindeki sebep kodunu kullan
-        0x00 => ExceptionCause::Reset,
-        0x01 => ExceptionCause::BusErrorInstructionFetch,
-        0x02 => ExceptionCause::BusErrorDataLoad,
-        0x03 => ExceptionCause::BusErrorDataStore,
-        0x04 => ExceptionCause::IllegalInstruction,
-        0x05 => ExceptionCause::PrivilegedInstruction,
-        0x06 => ExceptionCause::Trap,
-        0x07 => ExceptionCause::SystemCall,
-        0x08 => ExceptionCause::FloatingPointException,
-        0x09 => ExceptionCause::DataPageFault,
-        0x0A => ExceptionCause::InstructionPageFault,
-        0x0B => ExceptionCause::TickTimer,
-        0x0C => ExceptionCause::AlignmentError,
-        _ => ExceptionCause::Unknown,
-    };
+// --- Yer Tutucu Yardımcı Fonksiyonlar/Yapılar ---
+// Gerçek implementasyonda bunlar Karnal64'ün ilgili modüllerinde (kmemory, ktask vb.) olacaktır.
 
-    io::println!("İstisna Oluştu (OpenRISC)!");
-    io::println!("PC: {:#x}", context.pc);
-    io::println!("EPCR: {:#x}", context.epcr);
-    io::println!("EEAR (Hata Adresi): {:#x}", context.eear);
-    io::println!("ESR (Sebep Kodu): {:#x}", context.esr);
-    io::println!("Sebep: {}", cause);
-    io::println!("Bağlam: {:?}", context); // Tüm bağlamı yazdır (isteğe bağlı)
+// Karnal64 KTask modülünden çağrılacak bir zamanlayıcı fonksiyonu örneği
+// Bu fonksiyon, zamanlayıcı kesmesi veya görev bitişi gibi durumlarda çağrılır.
+// Yeni bir görev seçer ve TrapFrame pointer'ını o görevin TrapFrame'ine günceller.
+mod ktask {
+    use super::*;
 
-
-    // Genel amaçlı kayıtları (örnek olarak r1-r7) alıp yazdırma (dikkatli olunmalı, bağlama bağlı)
-    let r1;
-    let r2;
-    let r3;
-    let r4;
-    let r5;
-    let r6;
-    let r7;
-    unsafe {
-        asm!("l.mvz\t{}, r1", out(reg) r1);
-        asm!("l.mvz\t{}, r2", out(reg) r2);
-        asm!("l.mvz\t{}, r3", out(reg) r3);
-        asm!("l.mvz\t{}, r4", out(reg) r4);
-        asm!("l.mvz\t{}, r5", out(reg) r5);
-        asm!("l.mvz\t{}, r6", out(reg) r6);
-        asm!("l.mvz\t{}, r7", out(reg) r7);
+    // Bu fonksiyon gerçek zamanlayıcı mantığını içerir
+    pub fn schedule_if_needed(current_trap_frame: &mut TrapFrame) {
+        // TODO: Mevcut görevin TrapFrame'ini kaydet (Zaten current_trap_frame referansı var)
+        // TODO: Çalıştırılabilir görevler listesinden bir sonraki görevi seç
+        // TODO: Eğer farklı bir görev seçildiyse, o görevin TrapFrame'ini yükle
+        //       (yani current_trap_frame referansını yeni görevin TrapFrame'ini işaret edecek şekilde ayarla).
+        //       Bu genellikle global bir görev yöneticisi yapısı üzerinden yapılır.
+        //       Bu örnekte sadece print ediyoruz.
+        println!("ktask::schedule() called.");
     }
 
-    io::println!("Kayıtlar (r1-r7 Örnek):");
-    io::println!("  r1: {:#x}", r1);
-    io::println!("  r2: {:#x}", r2);
-    io::println!("  r3: {:#x}", r3);
-    io::println!("  r4: {:#x}", r4);
-    io::println!("  r5: {:#x}", r5);
-    io::println!("  r6: {:#x}", r6);
-    io::println!("  r7: {:#x}", r7);
-
-
-    panic!("İstisna İşlenemedi (OpenRISC): {}", cause);
+    // ... Diğer ktask fonksiyonları (spawn, exit, get_current_task_id)
 }
 
-#[panic_handler]
-fn panic(info: &PanicInfo) -> ! {
-    io::println!("PANIC! (OpenRISC)");
-    if let Some(location) = info.location() {
-        io::println!("Dosya: {}, Satır: {}", location.file(), location.line());
-    }
-    if let Some(message) = info.message() {
-        io::println!("Mesaj: {}", message);
-    }
+// Karnal64 KMemory modülünden çağrılacak bir sayfa hatası işleyici örneği
+// Bu fonksiyon, sayfa hatası oluştuğunda çağrılır.
+// Gerekirse sayfayı belleğe yükler, haritalar veya hatayı ölümcül olarak işaretler.
+mod kmemory {
+    use super::*;
 
-    loop {} // Sonsuz döngü
+    pub enum FaultType { Instruction, Load, Store }
+
+    pub fn handle_page_fault(fault_addr: u64, fault_type: FaultType) -> Result<(), KError> {
+        // TODO: Hata adresini ve türünü kullanarak bellek yönetimi mantığını çalıştır
+        // Olası senaryolar:
+        // - Copy-on-Write hatası: Sayfayı kopyala ve yazılabilir yap.
+        // - Demand Paging: Diskteki sayfayı belleğe yükle ve haritala.
+        // - Genişleyen yığın/heap: Yeni sayfalar ayır ve haritala.
+        // - Geçersiz erişim: Adres gerçekten geçersizse Err(KError::BadAddress) dön.
+
+        println!("kmemory::handle_page_fault({:#x}, {:?}) called.", fault_addr, fault_type);
+
+        // Şimdilik her şeyi geçersiz kabul edelim
+        Err(KError::BadAddress)
+    }
+    // ... Diğer kmemory fonksiyonları (allocate, free, map, unmap)
 }
 
-pub fn init() {
-    // Vektör tablosunu ayarlayın (OpenRISC için uygun yöntemi kullanın, genellikle SPR'ler aracılığıyla)
-    // OpenRISC'te vektör tabanı genellikle SPR'ler aracılığıyla ayarlanır (örneğin, EVBAR - Exception Vector Base Address Register).
-    // Ancak, doğrudan Rust'tan SPR'lere erişim karmaşık olabilir ve donanım destek kütüphaneleri veya assembly gerekebilir.
-    // Bu örnekte, vektör tablosunu ayarlamak için temel bir yaklaşım sergilenmektedir.
-    // Gerçek uygulamada, OpenRISC mimarisine özgü başlatma yöntemlerini takip etmelisiniz.
-
-    // Örnek: Vektör tablosu adresini doğrudan ayarlamak (bu gerçek OpenRISC donanımına göre değişebilir)
-    unsafe {
-        // **DİKKAT**: Bu satır OpenRISC için doğru olmayabilir.
-        // Vektör tablosu kurulumu OpenRISC mimarisine ve kullanılan donanıma özgüdür.
-        // Doğru yöntem için OpenRISC mimari referans kılavuzuna ve donanım belgelerine bakın.
-        // Tipik olarak, bu işlem assembly kodu ve SPR'ler (Special Purpose Registers) kullanılarak yapılır.
-
-        // Aşağıdaki örnek satır, YANLIŞ bir yöntem olabilir ve sadece kavramsal amaçlıdır.
-        // Gerçekte SPR'ler üzerinden vektör tablosu adresi ayarlanmalıdır.
-        // asm!("mtspr\t...", in(reg) exception_handler as u32); // YANLIŞ ÖRNEK! SPR adresi ve komut doğru DEĞİL!
-        // Doğru SPR ve komutları OpenRISC mimarisi belgelerinden öğrenin.
-
-        // **ÖNEMLİ NOT**: OpenRISC'te istisna vektör tablosu kurulumu RISC-V'den farklıdır ve
-        // genellikle SPR'ler (Special Purpose Registers) kullanılarak yapılır.
-        // Bu kısım, gerçek OpenRISC donanımında çalışacak şekilde UYARLANMALIDIR.
-        // Bu örnek, sadece kavramsal bir başlangıç noktası sunmaktadır.
-    }
-
-
-    io::println!("OpenRISC İstisna işleyicisi başlatıldı (Vektör tablosu AYARLANMADI - UYARLANMALI!)");
-    io::println!("Vektör tablosu kurulumu için OpenRISC mimarisi belgelerine başvurun.");
+// Karnal64 KResource modülünden çağrılacak örnek fonksiyonlar
+mod kresource {
+    use super::*;
+    // ... kaynağa özel fonksiyonlar (register_provider, lookup_provider_by_name, issue_handle, release_handle)
 }
+
+// Karnal64 main API fonksiyonları (Bunlar karnal64.rs içinde olmalı, burada sadece referans için var)
+ #[no_mangle]
+ pub extern "C" fn handle_syscall(...) -> i64 { ... }
+// ... diğer syscall handler fonksiyonları ...
