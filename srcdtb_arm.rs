@@ -1,166 +1,314 @@
-#![no_std]
+#![no_std] // Standart kütüphane yok, çekirdek alanındayız
+#![allow(dead_code)] // Geliştirme sırasında kullanılmayan kodlara izin ver
+#![allow(unused_variables)] // Geliştirme sırasında kullanılmayan değişkenlere izin ver
 
-use core::arch::asm;
-use core::ptr::NonNull;
-use fdt::{Fdt, FdtError};
+// Karnal64 çekirdek tiplerini ve traitlerini içe aktar
+// Karnal64 API yüzeyi ve dahili modüllerle etkileşim için gerekli
+use crate::karnal64::{
+    KError, // Çekirdek hata tipi
+    ResourceProvider, // Kaynak sağlayıcı trait'i
+    KHandle, // Kaynak handle tipi
+    // Diğer Karnal64 modüllerinden ihtiyaç duyulacak fonksiyonlar/türler
+     use crate::karnal64::kresource;
+     use crate::karnal64::kmemory;
+     use crate::karnal64::ktask;
+};
 
-/// ARM mimarisinde DTB adresini almak için kullanılan fonksiyon.
-///
-/// # ARM Mimarisine Özgü Notlar
-///
-/// ARM mimarisinde DTB adresi genellikle önyükleyici (bootloader) tarafından belirli bir yazmaca veya
-/// bellekte belirli bir adrese yerleştirilir. Bu adresin konumu, kullanılan önyükleyiciye, platforma ve
-/// ARM mimarisinin (32-bit ARMv7, 64-bit AArch64 vb.) türüne göre değişiklik gösterebilir.
-///
-/// **Örnek Yaklaşımlar (Platforma ve Önyükleyiciye Bağlı Değişir):**
-///
-/// 1.  **Yazmaçlardan Alma (Örnek):** Bazı önyükleyiciler DTB adresini belirli bir yazmaca (örneğin R1, R2 veya AArch64'te X1, X2) yerleştirebilir.
-///     Bu örnek kodda, **varsayılan olarak X2 (AArch64) veya R2 (ARM)** yazmacından DTB adresinin alındığı varsayılmıştır.
-///     **UYARI:** Bu sadece bir örnektir ve gerçek sistemlerde DTB adresi farklı yazmaçlarda veya yöntemlerle iletilebilir.
-///
-/// 2.  **Bellek Konumundan Alma (ATAG'ler, vb.):**  Eski ARM sistemlerinde veya bazı önyükleyicilerde, ATAG listesi gibi yapılar aracılığıyla
-///     DTB adresi bellekte belirli bir konumda saklanabilir. ATAG'ler, bellekteki etiketlenmiş yapılar olup, sistem belleği ve donanımı
-///     hakkında bilgi içerir. ATAG listesi içinde DTB adresini işaret eden bir etiket bulunabilir.
-///
-/// 3.  **UEFI Konfigürasyon Tabloları (Modern Sistemler):** UEFI (Unified Extensible Firmware Interface) kullanan modern ARM sistemlerinde,
-///     DTB adresi UEFI konfigürasyon tabloları aracılığıyla elde edilebilir. Bu, daha standart bir yaklaşımdır ve işletim sisteminin
-///     UEFI ortamından DTB'yi bulmasını sağlar.
-///
-/// **Bu Fonksiyonun Uygulanması:**
-///
-/// Bu `get_dtb_address` fonksiyonu, hedef ARM platformunuza ve kullandığınız önyükleyiciye göre uyarlanmalıdır.
-/// Aşağıdaki örnek kod, **X2 (AArch64) veya R2 (ARM)** yazmacından DTB adresini almayı varsayar. Gerçek bir sistemde,
-/// bu fonksiyonun içeriği farklılık gösterebilir. Örneğin, ATAG listesini taramak veya UEFI tablolarını okumak gerekebilir.
-///
-/// **Önemli:** Doğru DTB adresini alma yöntemi, donanım platformuna ve önyükleyiciye özgüdür. Üretici belgelerini ve önyükleyici
-/// kaynak kodunu inceleyerek doğru yöntemi belirlemeniz gereklidir.
-#[cfg(target_arch = "aarch64")]
-pub fn get_dtb_address() -> usize {
-    let dtb_address: usize;
-    unsafe {
-        // AArch64 mimarisinde DTB adresini X2 yazmacından al (varsayılan yaklaşım, platforma göre değişebilir).
-        asm!("mov {}, x2", out(reg) dtb_address);
-    }
-    dtb_address
+// Bellek haritası ve cihaz bilgileri için Karnal64'ün bellek modülüyle etkileşim
+// Bellek modülünün çekirdek içi API'sini kullanırız (kullanıcıya açık değildir)
+ use crate::karnal64::kmemory::{self, MemoryRegion, MemoryRegionKind}; // Varsayımsal kmemory tipleri
+
+// Kaynak yönetimi için Karnal64'ün kaynak modülüyle etkileşim
+ use crate::karnal64::kresource::{self, ResourceRegistrationInfo, ResourceType}; // Varsayımsal kresource tipleri
+
+
+// --- DTB Ayrıştırma Sonuçları İçin Yapılar ---
+// DTB'den çıkarılacak temel donanım bilgilerini tutacak yapılar
+
+/// Bellek bölgesini tanımlayan yapı (DTB'den okunur)
+#[derive(Debug, Copy, Clone)]
+pub struct DtbMemoryRegion {
+    pub base_address: u64,
+    pub size: u64,
+    // pub flags: u32, // Bellek türü (RAM, ROM, MMIO?) DTB formatına bağlı
 }
 
-#[cfg(target_arch = "arm")]
-pub fn get_dtb_address() -> usize {
-    let dtb_address: usize;
-    unsafe {
-        // ARM mimarisinde DTB adresini R2 yazmacından al (varsayılan yaklaşım, platforma göre değişebilir).
-        asm!("mov {}, r2", out(reg) dtb_address);
-    }
-    dtb_address
+/// Belirli bir cihazı (UART, Timer, GIC vb.) tanımlayan yapı (DTB'den okunur)
+#[derive(Debug, Clone)]
+pub struct DtbDeviceInfo {
+    pub name: alloc::string::String, // Cihaz düğümünün adı (örn: "uart0")
+    pub compatible: alloc::string::String, // Cihazın uyumlu olduğu string (örn: "arm,pl011")
+    pub base_address: Option<u64>, // MMIO adresi varsa
+    pub size: Option<u64>, // MMIO bölgesi boyutu varsa
+    pub interrupt: Option<u32>, // Kesme numarası (IRQ) varsa
+     pub properties: Vec<(alloc::string::String, DtbProperty)>, // Diğer özellikler (reg, interrupt, clock, status vb.)
+    // DTB formatına göre buraya daha fazla alan eklenebilir (örn. çocuk düğümler, phandle'lar)
 }
 
-#[cfg(not(any(target_arch = "aarch64", target_arch = "arm")))]
-pub fn get_dtb_address() -> usize {
-    // ARM mimarisi dışında bir mimari için DTB adresi alma yöntemi tanımlanmamış.
-    // Bu durumda varsayılan bir adres döndürülüyor.
-    // UYARI: Bu sadece bir örnektir ve gerçek sistemlerde doğru adres alma yöntemi platforma özgü olmalıdır!
-    println!("UYARI: ARM dışı mimari için varsayılan DTB adresi (0x1000000) kullanılıyor. Doğru adres alma yöntemini uygulayın!");
-    0x1000000 // Varsayılan adres (Örnek değer, gerçekte platforma göre değişir!)
-}
+// Varsayımsal DTB özellik değeri türü
+ #[derive(Debug, Clone)]
+ pub enum DtbProperty {
+     U32(u32),
+     U64(u64),
+     String(alloc::string::String),
+     Bytes(alloc::vec::Vec<u8>),
+//     // ... diğer DTB türleri
+ }
 
 
-/// Verilen bellek adresinden bir Fdt (Device Tree Blob) yapısı yükler.
-///
-/// # Arguments
-///
-/// * `dtb_address` - DTB'nin bellek adresi.
-///
-/// # Returns
-///
-/// `Ok(Fdt)` eğer DTB başarıyla yüklendiyse, `Err(FdtError)` aksi takdirde.
-///
-/// # Errors
-///
-/// `FdtError::NullPtr` eğer verilen adres geçerli bir işaretçi değilse.
-pub fn load_dtb(dtb_address: usize) -> Result<Fdt<'static>, FdtError> {
-    // Verilen adresi ham bir işaretçiye dönüştür ve NonNull ile kontrol et.
-    let ptr = NonNull::new(dtb_address as *const u8).ok_or(FdtError::NullPtr)?;
-    // Güvenli olmayan blok: ham işaretçiden Fdt yapısı oluşturuluyor.
-    unsafe { Fdt::from_ptr(ptr.as_ptr()) }
-}
+// --- DTB Ayrıştırıcısı (Yer Tutucu / Dış Kütüphane Bağlantısı) ---
+// DTB blob'unu okuyup yukarıdaki yapılara dönüştürecek asıl ayrıştırma mantığı
+// Bu kısım genellikle karmaşıktır ve harici bir DTB ayrıştırma kütüphanesi (örn. `dtb-rs`)
+// kullanılabilir veya elle yazılmış FDT ayrıştırma kodu gerekebilir.
 
-/// Bir Device Tree node'unun belirli bir özelliğini alır.
-///
-/// # Arguments
-///
-/// * `dtb` - Fdt yapısı referansı.
-/// * `node_path` - Node'un yolu (örneğin "/memory").
-/// * `property_name` - Özellik adı (örneğin "reg").
-///
-/// # Returns
-///
-/// `Some(&[u8])` eğer özellik bulunduysa, `None` aksi takdirde.
-pub fn get_property<'a>(dtb: &'a Fdt, node_path: &str, property_name: &str) -> Option<&'a [u8]> {
-    dtb.find_node(node_path) // Node'u bul
-        .and_then(|node| node.property(property_name)) // Node içinde özelliği bul
-        .map(|property| property.value()) // Özellik değerini al
-}
+/// Bootloader tarafından sağlanan ham DTB pointer'ını alıp ayrıştırır.
+/// Başarı durumunda çıkarılan donanım bilgilerini döndürür.
+/// Güvenlik Notu: `dtb_ptr` ve `dtb_size` mutlaka güvenli bir şekilde doğrulanmalı,
+/// bellek haritasında geçerli ve okunabilir oldukları teyit edilmelidir.
+fn parse_dtb_from_ptr(dtb_ptr: *const u8, dtb_size: usize) -> Result<ParsedDtbInfo, KError> {
+    // TODO: dtb_ptr ve dtb_size'ın geçerli ve güvenli kullanıcı alanı (veya bootloader)
+    // belleğinde olduğunu doğrulayın. MMU'yu kullanarak bu bölgeyi çekirdek alanına
+    // geçici olarak haritalamak veya fiziksel adres ise doğrudan kullanmak gerekebilir.
 
-/// Bir Device Tree node'unun belirli bir string özelliğini alır.
-///
-/// # Arguments
-///
-/// * `dtb` - Fdt yapısı referansı.
-/// * `node_path` - Node'un yolu.
-/// * `property_name` - Özellik adı.
-///
-/// # Returns
-///
-/// `Some(&str)` eğer özellik bulundu ve UTF-8 string olarak çözümlenebildiyse, `None` aksi takdirde.
-pub fn get_property_str(dtb: &Fdt, node_path: &str, property_name: &str) -> Option<&str> {
-    get_property(dtb, node_path, property_name) // Özelliği byte dizisi olarak al
-        .and_then(|value| core::str::from_utf8(value).ok()) // Byte dizisini UTF-8 string'e dönüştürmeyi dene
-}
-
-/// Kök node'un "compatible" özelliğini okur ve yazdırır.
-/// Bu genellikle cihaz uyumluluğunu belirten bir stringdir.
-///
-/// # Arguments
-///
-/// * `dtb` - Fdt yapısı referansı.
-pub fn print_compatible(dtb: &Fdt) {
-    if let Some(compatible) = get_property_str(dtb, "/", "compatible") {
-        println!("Cihaz uyumluluğu: {}", compatible);
-    } else {
-        println!("Uyumluluk bilgisi bulunamadı."); // Uyumluluk özelliği bulunamazsa bilgi mesajı
-    }
-}
-
-/// Örnek init fonksiyonu: DTB'yi yükler ve uyumluluk bilgisini yazdırır.
-/// Bu fonksiyon, çekirdek veya bootloader gibi ortamlarda kullanılmak üzere tasarlanmıştır.
-///
-/// # Returns
-///
-/// `Ok(())` eğer init başarıyla tamamlandıysa, `Err(FdtError)` aksi takdirde.
-///
-/// # Errors
-///
-/// `FdtError` DTB yükleme sırasında bir hata oluşursa.
-pub fn init() -> Result<(), FdtError>{
-    let dtb_address: usize;
-
-    #[cfg(any(target_arch = "aarch64", target_arch = "arm"))]
-    {
-        // ARM mimarisinde DTB adresini al.
-        dtb_address = get_dtb_address();
-    }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "arm")))]
-    {
-        // Diğer mimariler için varsayılan bir adres (UYARI: Bu sadece bir örnektir, gerçekte mimariye göre değişir!)
-        dtb_address = 0x100000;
-        println!("UYARI: ARM dışı mimari için varsayılan DTB adresi kullanılıyor: 0x{:X}. Doğru adresi ayarlayın!", dtb_address);
+    if dtb_ptr.is_null() || dtb_size == 0 {
+        return Err(KError::InvalidArgument); // Geçersiz DTB pointer'ı
     }
 
-    // DTB'yi yükle ve olası hataları işle.
-    let dtb = load_dtb(dtb_address)?;
+    // UNSAFE: Ham pointer'dan slice oluşturuluyor. Güvenlik doğrulaması ÇOK ÖNEMLİ!
+    let dtb_slice = unsafe {
+        core::slice::from_raw_parts(dtb_ptr, dtb_size)
+    };
 
-    // Uyumluluk bilgisini yazdır.
-    print_compatible(&dtb);
+    // TODO: Burada asıl DTB ayrıştırma mantığı yer alacak.
+    // dtb_slice'ı ayrıştırarak memory_regions ve device_infos yapılarını doldurun.
+    // Örnek: dtb-rs kütüphanesi kullanılabilir veya elle FDT ayrıştırma kodu yazılır.
+
+    println!("DTB: Ham veri ayrıştırılıyor... (Yer Tutucu)"); // Çekirdek içi print!
+
+    // --- Yer Tutucu Ayrıştırma Sonuçları (Simülasyon) ---
+    // Gerçek ayrıştırma yapılana kadar kullanılacak örnek veriler
+    let memory_regions = alloc::vec![
+        DtbMemoryRegion { base_address: 0x40000000, size: 0x40000000 }, // Örn: 1GB RAM
+        // Diğer bellek bölgeleri...
+    ];
+
+    let device_infos = alloc::vec![
+        DtbDeviceInfo {
+            name: alloc::string::String::from("uart0"),
+            compatible: alloc::string::String::from("arm,pl011"),
+            base_address: Some(0x09000000), // Örn: UART'ın MMIO adresi
+            size: Some(0x1000), // Örn: UART MMIO boyutu
+            interrupt: Some(33), // Örn: UART'ın IRQ numarası
+            // properties: ...
+        },
+        DtbDeviceInfo {
+             name: alloc::string::String::from("timer0"),
+             compatible: alloc::string::String::from("arm,cortex-a15-global-timer"),
+             base_address: None, // Varsayımsal olarak yok
+             size: None,
+             interrupt: Some(27), // Örn: Zamanlayıcının IRQ numarası
+             // properties: ...
+        },
+        // Diğer cihazlar (GIC, diğer UART'lar, disk denetleyicileri vb.)
+    ];
+    // --- Yer Tutucu Bitiş ---
+
+    // Ayrıştırılan bilgileri içeren yapı
+    Ok(ParsedDtbInfo {
+        memory_regions,
+        device_infos,
+        // Diğer DTB bilgileri (CPU sayısı, bootargs vb.)
+    })
+}
+
+/// Ayrıştırılmış DTB'den çıkarılan donanım bilgilerini tutan ana yapı.
+struct ParsedDtbInfo {
+    memory_regions: alloc::vec::Vec<DtbMemoryRegion>,
+    device_infos: alloc::vec::Vec<DtbDeviceInfo>,
+    // TODO: CPU bilgileri, bootargs, vb.
+}
+
+
+// --- Karnal64 ile Entegrasyon Fonksiyonu ---
+// Bu fonksiyon, ayrıştırılmış DTB bilgilerini alarak Karnal64'ün
+// ilgili yöneticilerini (kmemory, kresource) başlatır ve yapılandırır.
+
+/// Ayrıştırılmış DTB bilgilerini kullanarak Karnal64'ün donanıma bağımlı
+/// bileşenlerini yapılandırır ve temel kaynakları kaydeder.
+/// Karnal64'ün ana `init()` fonksiyonu tarafından çağrılmalıdır.
+pub fn initialize_karnal64_from_dtb(dtb_info: ParsedDtbInfo) -> Result<(), KError> {
+    println!("DTB: Karnal64 bileşenleri yapılandırılıyor..."); // Çekirdek içi print!
+
+    // 1. Bellek Bölgelerini Kaydet
+    // Bellek Yöneticisi'ne (kmemory) DTB'den okunan fiziksel bellek bölgelerini bildirir.
+    for region in dtb_info.memory_regions {
+        println!("DTB: Bellek bölgesi kaydı: 0x{:x} - 0x{:x} ({} MB)",
+                 region.base_address, region.base_address + region.size, region.size / (1024*1024));
+
+        // TODO: kmemory modülünün API'sını kullanarak bu bölgeyi fiziksel ayırıcıya kaydet.
+         kmemory::register_physical_region(region.base_address, region.size, MemoryRegionKind::Ram)?;
+    }
+
+    // 2. Cihazları Kaydet ve Sürücüleri Bağla
+    // Kaynak Yöneticisi'ne (kresource) DTB'den okunan cihazları kaydeder.
+    // Kernel'ın bu cihazlar için sürücüsü varsa, sürücü örneği oluşturulur.
+    for device in dtb_info.device_infos {
+        println!("DTB: Cihaz bulundu: {} (uyumlu: {})", device.name, device.compatible);
+
+        // TODO: Cihazın 'compatible' stringine bakarak uygun sürücüyü (ResourceProvider implementasyonunu) bul.
+        // Bu genellikle ayrı bir sürücü kayıt mekanizması gerektirir.
+        // Örnek: Bir sürücü kayıt tablosu veya eşleştirmesi olabilir.
+
+        let driver_provider: Option<Box<dyn ResourceProvider>> = match device.compatible.as_str() {
+            "arm,pl011" => {
+                println!("DTB: PL011 UART sürücüsü bulunuyor...");
+                // TODO: Gerçek PL011 sürücüsünün bir örneğini oluştur.
+                // Sürücü örneği, cihazın adresini ve kesme bilgisini almalıdır.
+                 let uart_driver = Box::new(crate::drivers::arm::pl011::Pl011Uart::new(
+                     device.base_address.expect("UART DTB'de adres olmalı"),
+                     device.interrupt, // Some(irq) veya None olabilir
+                 ));
+                 Some(uart_driver)
+                None // Yer tutucu: Sürücü örneği oluşturulmadı
+            },
+            "arm,cortex-a15-global-timer" => {
+                 println!("DTB: ARM Global Timer sürücüsü bulunuyor...");
+                 // TODO: Zamanlayıcı sürücüsü örneği oluştur
+                  let timer_driver = Box::new(crate::drivers::arm::timer::ArmTimer::new(
+                       device.interrupt.expect("Timer DTB'de kesme olmalı")
+                  ));
+                  Some(timer_driver)
+                 None // Yer tutucu
+            },
+            // TODO: Diğer cihaz türleri için eşleşmeler...
+            _ => {
+                println!("DTB: Uyumlu sürücü bulunamadı veya desteklenmiyor.");
+                None
+            }
+        };
+
+        // Eğer bir sürücü bulunduysa, bunu Kaynak Yöneticisi'ne kaydet.
+        if let Some(provider) = driver_provider {
+            // Kaynak adı olarak DTB yolunu veya adını kullanabiliriz.
+            let resource_name = format!("dtb://{}", device.name);
+            println!("DTB: Kaynak Kaydediliyor: {}", resource_name);
+
+            // TODO: kresource modülünün API'sını kullanarak sürücüyü kaydet.
+            // Kayıt fonksiyonu, provider'ı ve kaynak adını almalı, bir KHandle (dahili) dönebilir.
+             let _handle = kresource::register_provider(&resource_name, provider)?;
+        }
+    }
+
+    // TODO: Diğer DTB bilgileri (CPU sayısı, bootargslar) ile Task Yöneticisi (ktask) vb. yapılandırılabilir.
+
+    println!("DTB: Karnal64 donanım yapılandırması tamamlandı.");
 
     Ok(())
 }
+
+
+// --- Ana Başlatma Noktası (Karnal64 init tarafından çağrılır) ---
+
+/// Bootloader tarafından sağlanan DTB'yi ayrıştırır ve Karnal64'ü donanım
+/// bilgilerine göre yapılandırır.
+/// `dtb_pointer`: Bootloader'ın DTB'nin fiziksel adresini koyduğu yerdeki değer
+/// `dtb_max_size`: DTB için ayrılabilecek maksimum boyut (güvenlik için)
+///
+/// Bu fonksiyon, genellikle çekirdek başlatma (boot) sürecinde, donanım
+/// başlatıldıktan ve temel bellek yönetimi ayarlandıktan sonra çağrılır.
+///
+/// Güvenlik Notu: `dtb_pointer`'daki adresin geçerli ve güvenli olduğu
+/// varsayılır VEYA bu fonksiyonun çağrıldığı yerden önce
+/// çok sıkı doğrulama ve MMU haritalaması yapılmalıdır!
+#[no_mangle] // Bootloader tarafından çağrılabilmesi için isim düzenlemesi yapılmaz
+pub extern "C" fn initialize_dtb_and_karnal64(dtb_physical_address: u64, dtb_max_size: usize) -> i64 {
+    // TODO: Fiziksel adresi (dtb_physical_address) çekirdeğin sanal adres alanına haritala.
+    // Bu adım, kmemory modülünün haritalama fonksiyonları kullanılarak yapılmalıdır.
+    // Veya, eğer çekirdek identity mapping kullanıyorsa, doğrudan erişim mümkün olabilir.
+    // UNSAFE: Doğrudan fiziksel adrese erişim veya haritalama burada simüle ediliyor.
+    let dtb_virtual_address = dtb_physical_address; // Identity mapping varsayımı
+
+    let dtb_ptr = dtb_virtual_address as *const u8;
+
+    println!("DTB: Başlatılıyor. Ham DTB adresi: 0x{:x}", dtb_physical_address);
+
+    // Ham DTB'yi ayrıştır
+    let parse_result = parse_dtb_from_ptr(dtb_ptr, dtb_max_size);
+
+    match parse_result {
+        Ok(dtb_info) => {
+            println!("DTB: Ayrıştırma başarılı.");
+            // Ayrıştırılan bilgileri kullanarak Karnal64'ü yapılandır
+            match initialize_karnal64_from_dtb(dtb_info) {
+                Ok(_) => {
+                    println!("DTB: Karnal64 donanım entegrasyonu başarılı.");
+                    0 // Başarı (sistem çağrısı gibi i64 döndürme simülasyonu)
+                },
+                Err(err) => {
+                    eprintln!("DTB: Karnal64 donanım entegrasyonu hatası: {:?}", err); // Çekirdek içi hata yazdırma
+                    err as i64 // Hata kodu döndür
+                }
+            }
+        },
+        Err(err) => {
+            eprintln!("DTB: Ayrıştırma hatası: {:?}", err);
+            err as i64 // Hata kodu döndür
+        }
+    }
+
+    // TODO: İşlem bittikten sonra geçici MMU haritalaması yapıldıysa geri alınmalı.
+}
+
+
+// --- Dummy ResourceProvider Örneği (İhtiyaç Duyulursa Test veya Yer Tutucu Olarak) ---
+// Gerçek cihaz sürücüleri ResourceProvider traitini implemente edecektir.
+
+// pub mod implementations {
+     use super::*;
+     use alloc::string::String;
+
+//     // Dummy konsol sürücüsü
+     pub struct DummyConsole;
+
+     impl ResourceProvider for DummyConsole {
+         fn read(&self, buffer: &mut [u8], offset: u64) -> Result<usize, KError> {
+//             // Konsoldan okuma (simülasyon veya temel implementasyon)
+             println!("DummyConsole: Okuma isteği ({} byte)", buffer.len());
+//             // Gerçekte kullanıcıdan input almak gerekir
+             Ok(0) // Şimdilik hep 0 byte oku
+         }
+
+         fn write(&self, buffer: &[u8], offset: u64) -> Result<usize, KError> {
+//             // Konsola yazma (simülasyon veya temel implementasyon)
+             let s = core::str::from_utf8(buffer).unwrap_or("<geçersiz UTF8>");
+             print!("DummyConsole: Yaz -> {}", s); // Çekirdek içi print!/println! kullanır
+             Ok(buffer.len()) // Yazılan byte sayısını döndür
+         }
+
+         fn control(&self, request: u64, arg: u64) -> Result<i64, KError> {
+             println!("DummyConsole: Control isteği (req: {}, arg: {})", request, arg);
+//             // Konsola özel kontrol komutları burada işlenir (örn. baud rate ayarı)
+             Err(KError::NotSupported) // Şimdilik desteklenmiyor
+         }
+
+         fn seek(&self, position: KseekFrom) -> Result<u64, KError> {
+             println!("DummyConsole: Seek isteği");
+             Err(KError::NotSupported) // Konsol seek desteklemez
+         }
+
+         fn get_status(&self) -> Result<KResourceStatus, KError> {
+              println!("DummyConsole: Get Status isteği");
+//              // Örn: hazır mı, buffer dolu mu vb.
+              Ok(KResourceStatus { size: 0, flags: 0 }) // Yer tutucu
+         }
+     }
+
+//     // TODO: Diğer dummy veya gerçek sürücüler buraya
+ }
+
+
+// --- İhtiyaç Duyulacak Varsayımsal Tipler (Karnal64'den Gelecek veya Burada Tanımlanacak) ---
+// Karnal64'ün tam implementasyonu tamamlandıkça bunlar oradan import edilecek.
+
+// enum KseekFrom { Start, Current, End } // ResourceProvider traitinde kullanılıyor
+ struct KResourceStatus { size: u64, flags: u32 } // ResourceProvider traitinde kullanılıyor
