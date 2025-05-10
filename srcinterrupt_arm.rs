@@ -1,200 +1,490 @@
-#![no_std] // Standart kütüphaneye ihtiyaç duymuyoruz
+#![no_std] // Standart kütüphane yok
 
-// Gerekli core modüllerini içeri aktar
-use core::arch::asm; // Inline assembly için
-use core::ptr;      // Pointer işlemleri için
-use core::mem;      // transmute gibi bellek işlemleri için
+// Gerekli Rust özellikleri (inline assembly gibi)
+#![feature(asm_sym)]
+#![feature(naked_functions)]
+#![feature(global_asm)]
+#![allow(dead_code)] // Henüz kullanılmayan fonksiyonlar olabilir
 
-// `volatile` crate'inden Volatile sarmalayıcıyı içeri aktar (cargo.toml'da tanımlı olmalı)
-use volatile::Volatile;
+// Karnal64 API'nıza erişim için (karnal64.rs dosyanızdaki tipleri/fonksiyonları kullanacak)
+// Bu, karnal64.rs'nin bu modül tarafından erişilebilir olması gerektiğini varsayar.
+use crate::karnal64::{handle_syscall, KError}; // handle_syscall'ı ve KError'u import edin
 
-// Konsol çıktı makrolarını kullanabilmek için (hata durumlarında loglama için)
-// Bu, ya crate root'ta #[macro_use] extern crate sahne64; ile yapılır
-// ya da Sahne64 crate'i makroları public olarak dışa aktarırsa buradan import edilir.
-// Bu örnekte, #[cfg] ile std/no_std çıktısını ayarlayarak makroların
-// uygun ortamda kullanılabilir olduğunu varsayıyoruz.
- use sahne64::eprintln; // Örnek import eğer macro publicse
-
-// **AÇIKLAMA:** Donanım Özelleştirmesi Gereken Değerler **
-// Aşağıdaki sabitler, hedef ARM çipinizin ve ilgili çevre birimlerinin (örn. GIC, USB kontrolcü)
-// teknik özelliklerine göre AYARLANMALIDIR.
-// Veri sayfasına (datasheet) başvurmak esastır!
-
-// Kesme Vektör Tablosu (IVT) veya Vektör Tablosu Ofset Kaydı (VTOR) Adresi
-// VTOR, ARM Cortex-M'de IVT'nin RAM veya Flash'taki başlangıç adresini tutar.
-// Buradaki IVT_ADDRESS, VTOR kaydının adresini simüle ediyor olabilir.
-const IVT_ADDRESS: usize = 0xE000ED08; // Tipik Cortex-M VTOR adresi (Örnek, çipinize göre değişir!)
-// Eğer vektör tablosunu doğrudan RAM'e koyup adresini yazıyorsanız, IVT_ADDRESS yazacağınız donanım kaydının adresi olmalıdır.
-
-// USB Kesme ile ilgili Sabitler
-const USB_IRQ_NUMBER: usize = 12;         // Örnek USB kesme numarası (IRQ numarası), çipinize ve GIC'ye göre!
-const USB_BASE_ADDRESS: usize = 0x40000000;    // Örnek USB temel adresi (Memory-mapped I/O), çipinize göre!
-
-// USB Kayıt Ofsetleri (USB kontrolcü referans kılavuzundan alınmalıdır)
-const USB_DATA_REGISTER_OFFSET: usize = 0x00;        // USB Veri Kaydı Ofseti
-const USB_STATUS_REGISTER_OFFSET: usize = 0x04;      // USB Durum Kaydı Ofseti
-const USB_INTERRUPT_ENABLE_REGISTER_OFFSET: usize = 0x08; // USB Kesme Etkinleştirme Kaydı Ofseti
-const USB_INTERRUPT_FLAG_REGISTER_OFFSET: usize = 0x0C;   // USB Kesme Bayrağı Kaydı Ofseti
-// Bu ofsetler çipe göre değişir. Bit pozisyonları da önemlidir!
-
-// ** Kesme Vektör Tablosu (IVT) Yapılandırması **
-
-// Kesme işleyici fonksiyonları için tip tanımı
-// Kesme işleyicileri genellikle 'extern "C"' ve 'unsafe' olmalıdır.
-// ARM Cortex-M'de işleyiciler argüman almaz ve geri dönmez.
-type InterruptHandler = unsafe extern "C" fn();
-
-// Kesme Vektör Tablosu (IVT) - 256 girişlik statik dizi (Örnek boyut, GIC'ye göre değişir)
-// Bu IVT, RAM'de yer alacak ve adresi VTOR kaydına yazılacaktır.
-#[no_mangle] // Linker script bu simgeye başvurabilir
-static mut IVT: [InterruptHandler; 256] = [default_interrupt_handler; 256];
-
-// Varsayılan kesme işleyicisi (beklenmedik kesmeler için)
-// Güvenli olmayan (unsafe) extern "C" fn olarak tanımlanmalıdır.
-unsafe extern "C" fn default_interrupt_handler() {
-    // ** GÜVENLİK: Bu işleyici unsafe'dir çünkü kesme bağlamında çalışır **
-    // ve muhtemelen donanım veya paylaşılan bellekle etkileşime girecektir.
-
-    // TODO: Beklenmedik bir kesme oluştuğunda yapılacak işlemler (örn. hata kaydı, panik)
-    // Bu, genellikle GIC (Generic Interrupt Controller) gibi bir birimin
-    // ISR (Interrupt Service Register) kaydını okuyarak hangi kesmenin
-    // beklendiği belirlenir. Beklenmeyen bir IRQ gelirse:
-
-    // Hata mesajı loglama (Sahne64 konsol makrolarını kullanarak)
-    // Kesme işleyicileri hassas bir bağlamda çalışır, loglama dikkatli yapılmalıdır.
-    // Loglama fonksiyonu interrupt-safe olmalıdır.
-    #[cfg(feature = "std")] std::eprintln!("UYARI: Beklenmeyen kesme (IRQ).");
-    #[cfg(not(feature = "std"))] eprintln!("UYARI: Beklenmeyen kesme (IRQ)."); // Sahne64 macro varsayımı
-
-    // Kesme nereden geldi? GIC ISR kaydı okunabilir.
-     let irq_source = read_some_gic_register(); // Donanıma özel
-
-    // Kritik bir durumsa sistem durdurulabilir veya panik yapılabilir.
-    // Panik handler'ı kesme bağlamında çalışacak şekilde tasarlanmalıdır.
-     panic!("Beklenmeyen kesme"); // Eğer panik güvenliyse
-     loop {} // Sistem durdurulursa
-
-    // Şimdilik boş işleyici olarak bırakıyoruz (hata ayıklama sırasında kesme kaynağını bulmak gerekebilir).
+// --- İstisna Bağlamını Saklamak İçin Yapı (Trap Frame) ---
+// İstisna/sistem çağrısı gerçekleştiğinde CPU'nun durumunu (register'ları)
+// bu yapıda saklayacağız. Assembly kodu bu yapıyı dolduracak ve boşaltacaktır.
+// Minimum olarak kullanıcı alanındaki register'ları kaydetmemiz gerekir.
+// Tam bir bağlam için ELR_EL1, SPSR_EL1, SP_EL0 gibi register'lar da gereklidir.
+#[repr(C)] // C uyumlu bellek düzeni (assembly ile etkileşim için)
+#[derive(Debug, Default)]
+pub struct TrapFrame {
+    // Genel amaçlı register'lar (x0 - x30)
+    x: [u64; 31],
+    // Stack Pointer (user)
+    sp_el0: u64,
+    // Exception Link Register (dönülecek adres)
+    elr_el1: u64,
+    // Saved Program Status Register (istisna anındaki PSTATE)
+    spsr_el1: u64,
+    // Exception Syndrome Register (istisnanın nedeni hakkında bilgi)
+    esr_el1: u64,
+    // Far Sync Exception Register (bellek hatası adresleri için)
+    far_el1: u64,
 }
 
-// ** USB Kesme İşleme Fonksiyonları **
+// --- İstisna Vektör Tablosu (Assembly) ---
+// AArch64 istisna vektör tablosu, VBAR_EL1 register'ında belirtilen
+// 2048 byte'lık hizalanmış bir adreste bulunur.
+// Her istisna tipi için 8 adet giriş vardır (4 EL'den, SP0/SPx kullanarak).
+// Her giriş 0x80 (128) byte uzunluğundadır.
+// Vektörler:
+// 0: Current EL, SP0
+// 1: Current EL, SPx
+// 2: Lower EL, AArch64
+// 3: Lower EL, AArch32
 
-// USB kesme işleyicisi
-// Güvenli olmayan (unsafe) extern "C" fn olarak tanımlanmalıdır.
-#[no_mangle] // Linker script veya bootloader tarafından çağrılabilir
-pub unsafe extern "C" fn usb_interrupt_handler() {
-    // ** DİKKAT: Bu bölüm DONANIMA ÖZGÜDÜR ve ÇOK DETAYLI UYGULAMA GEREKTİRİR! **
-    // USB kontrolcünüzün referans kılavuzuna bakarak aşağıdaki işlemleri GERÇEKLEŞTİRİN:
-    // Bu işleyici çekirdek içinde çalışır ve donanımla etkileşim kurar.
-    // Kullanıcı alanındaki Sahne64 API'sini doğrudan çağırmaz.
-    // Bunun yerine, gelen USB verisini çekirdek tamponlarına yazar
-    // ve ardından ilgili Sahne64 Kaynak (Resource) veya Görev (Task)
-    // için bekleyenleri uyandırabilir (örn. resource::read için bekleyen görevi uyandır).
+// Her alt vektörde (0, 1, 2, 3) 4 farklı istisna tipi:
+// 0: Synchronous (SVC, Data Abort, Instruction Abort, etc.)
+// 1: IRQ (Interrupt Request)
+// 2: FIQ (Fast Interrupt Request)
+// 3: SError (System Error)
 
-    // 1. Kesme nedenini belirle (USB durum/kesme bayrağı kaydını okuyarak)
-    let usb_interrupt_flag_register_address = USB_BASE_ADDRESS + USB_INTERRUPT_FLAG_REGISTER_OFFSET;
-    let interrupt_status = Volatile::new(usb_interrupt_flag_register_address as *mut u32).read();
+// Bizim için en önemli olanlar:
+// - Lower EL, AArch64 -> Synchronous (Sistem Çağrıları buradan gelir)
+// - Lower EL, AArch64 -> IRQ (Donanım Kesmeleri buradan gelir)
 
-    // Örnek: Gelen veri kesmesi (Rx interrupt) veya TX tamamlandı kesmesi (Tx interrupt)
-    const USB_RX_IRQ_BIT: u32 = 1 << 0; // Örnek bit pozisyonu
-    const USB_TX_DONE_IRQ_BIT: u32 = 1 << 1; // Örnek bit pozisyonu
+global_asm!(r#"
+.align 11 // 2048 byte hizalama (VBAR_EL1 için gerekli)
 
-    if (interrupt_status & USB_RX_IRQ_BIT) != 0 {
-        // Gelen veri kesmesi oluştu
-        // Veriyi USB kontrolcüsünden oku (hardware-specific)
-        // Örnek: Volatile read using the example address
-         let usb_data_register_address = USB_BASE_ADDRESS + USB_DATA_REGISTER_OFFSET;
-         let received_byte = Volatile::new(usb_data_register_address as *mut u8).read(); // Byte okuma örneği
+// İstisna Vektör Tablosunun başlangıcı
+.global vector_table
 
-        // TODO: Okunan veriyi çekirdekteki USB sürücüsü tamponuna yaz
-        // Bu tampon, kullanıcı alanından resource::read ile erişilebilen veriyi tutar.
-        // Bu, çekirdek içindeki başka bir modülle etkileşim demektir, doğrudan API çağrısı değil.
+vector_table:
 
-        // TODO: Resource'u bekleyen görevleri uyandır (örn. resource::read çağrısı yapan görev).
-        // Bu, Sahne64 çekirdeği içinde bir senkronizasyon veya zamanlama mekanizması kullanılarak yapılır.
-         task::wake_up(waiting_task_id); // API gibi görünüyor ama çekirdek fonksiyonu olmalı
-    }
+    // Current EL, SP0
+    .align 7 // 128 byte hizalama
+    b handle_sync_curr_el_sp0
+    .align 7
+    b handle_irq_curr_el_sp0
+    .align 7
+    b handle_fiq_curr_el_sp0
+    .align 7
+    b handle_serror_curr_el_sp0
 
-    if (interrupt_status & USB_TX_DONE_IRQ_BIT) != 0 {
-         // TX tamamlandı kesmesi oluştu
-         // TODO: Gönderilmeyi bekleyen bir sonraki veri bloğunu USB kontrolcüsüne yaz.
-         // TODO: Resource'u bekleyen görevleri uyandır (örn. resource::write çağrısının tamamlanmasını bekleyen görev).
-    }
+    // Current EL, SPx (SP_EL1)
+    .align 7
+    b handle_sync_curr_el_spx
+    .align 7
+    b handle_irq_curr_el_spx
+    .align 7
+    b handle_fiq_curr_el_spx
+    .align 7
+    b handle_serror_curr_el_spx
 
-    // TODO: Diğer kesme nedenleri (hata kesmeleri, bağlantı kesmeleri vb.)
+    // Lower EL, AArch64 (Kullanıcı Alanından İstisnalar, Sistem Çağrıları Buradan Gelir)
+    .align 7
+    b handle_sync_lower_el_aarch64 // <--- Sistem Çağrıları (SVC) Buraya Gelir
+    .align 7
+    b handle_irq_lower_el_aarch64   // <--- Donanım Kesmeleri (IRQ) Buraya Gelir
+    .align 7
+    b handle_fiq_lower_el_aarch64
+    .align 7
+    b handle_serror_lower_el_aarch64
 
-    // --- KESME BAYRAĞINI TEMİZLEME (Donanıma göre MUTLAKA UYGULANMALI) ---
-    // Bu ADIM ÇOK KRİTİKTİR! Bayrak temizlenmezse kesme tekrar tekrar tetiklenir (spinlock gibi olur).
-    // Temizleme yöntemi çipe ve kesme kontrolcüsüne (örn. GIC) göre değişir.
-    // Bazen kesme bayrağı kaydına 1 yazılır, bazen 0 yazılır, bazen de başka bir kayıt kullanılır.
-    // Bu örnekteki yöntem sadece bir simülasyondur.
-    Volatile::new(usb_interrupt_flag_register_address as *mut u32).write(interrupt_status); // Örnek: Okunan bayrağı geri yazarak temizle
-    // ** Mutlaka çipinizin referans kılavuzuna bakın! **
+    // Lower EL, AArch32 (Eğer AArch32 kullanıcı alanı destekleniyorsa)
+    .align 7
+    b handle_sync_lower_el_aarch32
+    .align 7
+    b handle_irq_lower_el_aarch32
+    .align 7
+    b handle_fiq_lower_el_aarch32
+    .align 7
+    b handle_serror_lower_el_aarch32
 
-    // TODO: GIC gibi harici bir kesme kontrolcüsü kullanılıyorsa, burada EOI (End of Interrupt) işlemi yapılmalıdır.
-     write_gic_eoi_register(irq_number); // Donanıma özel GIC işlemi
+// --- Genel İstisna İşleyicisi Şablonu (Assembly) ---
+// Bu makro, her istisna vektör girişi için bağlamı kaydeder, Rust işleyicisini çağırır ve bağlamı geri yükler.
+// $handler: Çağrılacak Rust fonksiyonunun sembol adı (örn: handle_sync_lower_el_aarch64_rust)
+.macro push_and_call_rust_handler handler
+    // İstisna sırasında kullanılmayan temp register'ları sakla (x16, x17)
+    // Stack Pointer EL1 (sp_el1) kullanılıyor.
+    stp x16, x17, [sp, #-16]!
+
+    // TrapFrame için yer ayır ve hizala
+    // TrapFrame boyutu: 31 * 8 (x) + 8 (sp_el0) + 8 (elr_el1) + 8 (spsr_el1) + 8 (esr_el1) + 8 (far_el1) = 360 byte
+    // En yakın 16'ya katı hizalama: 368 (örn)
+    // sp -= 368
+    mov x16, sp
+    sub sp, sp, #(368) // TrapFrame için stack üzerinde yer aç
+
+    // Genel amaçlı register'ları TrapFrame'e kaydet (x0-x30)
+    // x0-x15 (16 register)
+    stp x0, x1, [sp, #(8*0)]
+    stp x2, x3, [sp, #(8*2)]
+    stp x4, x5, [sp, #(8*4)]
+    stp x6, x7, [sp, #(8*6)]
+    stp x8, x9, [sp, #(8*8)]
+    stp x10, x11, [sp, #(8*10)]
+    stp x12, x13, [sp, #(8*12)]
+    stp x14, x15, [sp, #(8*14)]
+
+    // x16-x30 (15 register) - x16, x17 zaten saklandı, geri yüklenip tekrar saklanması gerekir mi?
+    // Basitlik için, x16, x17'yi stack'ten geri alıp TrapFrame'e saklayalım.
+    ldp x16, x17, [x16] // x16 ve x17'yi orijinal yerinden geri al
+    stp x16, x17, [sp, #(8*16)] // TrapFrame'de x16, x17'nin yerine kaydet
+    stp x18, x19, [sp, #(8*18)]
+    stp x20, x21, [sp, #(8*20)]
+    stp x22, x23, [sp, #(8*22)]
+    stp x24, x25, [sp, #(8*24)]
+    stp x26, x27, [sp, #(8*26)]
+    stp x28, x29, [sp, #(8*28)]
+    str x30, [sp, #(8*30)] // x30 (LR)
+
+    // Özel register'ları TrapFrame'e kaydet
+    mrs x16, sp_el0     // SP_EL0 oku
+    str x16, [sp, #(8*31)] // TrapFrame.sp_el0
+    mrs x16, elr_el1    // ELR_EL1 oku
+    str x16, [sp, #(8*32)] // TrapFrame.elr_el1
+    mrs x16, spsr_el1   // SPSR_EL1 oku
+    str x16, [sp, #(8*33)] // TrapFrame.spsr_el1
+    mrs x16, esr_el1    // ESR_EL1 oku
+    str x16, [sp, #(8*34)] // TrapFrame.esr_el1
+    mrs x16, far_el1    // FAR_EL1 oku
+    str x16, [sp, #(8*35)] // TrapFrame.far_el1
+
+
+    // İlk argüman (x0) olarak TrapFrame pointer'ını ayarla
+    mov x0, sp
+
+    // Rust işleyicisini çağır (BL: Branch with Link)
+    bl \handler
+
+    // Rust işleyicisinden döndükten sonra, TrapFrame'den register'ları geri yükle
+    // Özel register'ları yükle
+    ldr x16, [sp, #(8*31)] // TrapFrame.sp_el0
+    msr sp_el0, x16
+    ldr x16, [sp, #(8*32)] // TrapFrame.elr_el1
+    msr elr_el1, x16
+    ldr x16, [sp, #(8*33)] // TrapFrame.spsr_el1
+    msr spsr_el1, x16
+    // ESR_EL1 ve FAR_EL1 genellikle geri yüklenmez
+
+    // Genel amaçlı register'ları geri yükle (x0-x30)
+    ldr x30, [sp, #(8*30)] // x30 (LR)
+    ldp x28, x29, [sp, #(8*28)]
+    ldp x26, x27, [sp, #(8*26)]
+    ldp x24, x25, [sp, #(8*24)]
+    ldp x22, x23, [sp, #(8*22)]
+    ldp x20, x21, [sp, #(8*20)]
+    ldp x18, x19, [sp, #(8*18)]
+    // x16, x17'yi TrapFrame'den yükle
+    ldp x16, x17, [sp, #(8*16)]
+
+    // x0-x15'i yükle (x0, Rust fonksiyonunun dönüş değerini içeriyor olabilir!)
+    // Sistem çağrısı işleyicisi dönüş değerini x0'a yazmış olmalı.
+    // Diğer x1-x15 register'larını TrapFrame'den yükleyebiliriz.
+    ldp x14, x15, [sp, #(8*14)]
+    ldp x12, x13, [sp, #(8*12)]
+    ldp x10, x11, [sp, #(8*10)]
+    ldp x8, x9, [sp, #(8*8)]
+    ldp x6, x7, [sp, #(8*6)]
+    ldp x4, x5, [sp, #(8*4)]
+    ldp x2, x3, [sp, #(8*2)]
+    // x0 ve x1'i en son yükle, böylece x0 dönüş değerini tutmaya devam eder.
+    // Eğer x0'ın orijinal değerine ihtiyaç varsa, onu da yüklemeliyiz.
+    // Sistem çağrısında x0 dönüş değeri olduğu için, x0'ın orijinal değerini kurtarmadan önce
+    // Rust fonksiyonunun döndürdüğü değeri x0'a yazmış olması beklenir.
+    // Varsayım: Rust işleyicisi TrapFrame.x[0]'ı günceller.
+    ldp x0, x1, [sp, #(8*0)]
+
+    // TrapFrame için ayrılan stack alanını geri al
+    add sp, sp, #(368)
+
+    // İstisna sırasında saklanan temp register'ları geri yükle (x16, x17)
+    ldp x16, x17, [sp], #16
+
+    // İstisnadan dön (Exception Return)
+    eret
+.endmacro
+
+// --- İstisna Vektör Tablosu Hedefleri (Assembly) ---
+// Bu etiketler, vector_table'daki dallanmaların hedefleridir.
+// Buradan yukarıdaki push_and_call_rust_handler makrosu ile
+// ilgili Rust işleyicilerine dallanacağız.
+
+handle_sync_curr_el_sp0:
+    // SP0 kullanılmaz, buraya gelmek bir hata olabilir.
+    push_and_call_rust_handler handle_sync_curr_el_sp0_rust
+
+handle_irq_curr_el_sp0:
+    push_and_call_rust_handler handle_irq_curr_el_sp0_rust
+
+handle_fiq_curr_el_sp0:
+    push_and_call_rust_handler handle_fiq_curr_el_sp0_rust
+
+handle_serror_curr_el_sp0:
+    push_and_call_rust_handler handle_serror_curr_el_sp0_rust
+
+
+handle_sync_curr_el_spx:
+    // Çekirdek içinde senkron istisna (örn: sayfa hatası, geçersiz talimat)
+    push_and_call_rust_handler handle_sync_curr_el_spx_rust
+
+handle_irq_curr_el_spx:
+    // Çekirdek içinde kesme
+    push_and_call_rust_handler handle_irq_curr_el_spx_rust
+
+handle_fiq_curr_el_spx:
+    push_and_call_rust_handler handle_fiq_curr_el_spx_rust
+
+handle_serror_curr_el_spx:
+    push_and_call_rust_handler handle_serror_curr_el_spx_rust
+
+
+handle_sync_lower_el_aarch64:
+    // Kullanıcı alanından senkron istisna (SVC, Data Abort, etc.)
+    push_and_call_rust_handler handle_sync_lower_el_aarch64_rust // <--- Sistem Çağrısı İşleyicimiz
+
+handle_irq_lower_el_aarch64:
+    // Kullanıcı alanından kesme (donanım kesmeleri)
+    push_and_call_rust_handler handle_irq_lower_el_aarch64_rust // <--- IRQ İşleyicimiz
+
+handle_fiq_lower_el_aarch64:
+    push_and_call_rust_handler handle_fiq_lower_el_aarch64_rust
+
+handle_serror_lower_el_aarch64:
+    push_and_call_rust_handler handle_serror_lower_el_aarch64_rust
+
+// AArch32 işleyicileri (şimdilik boş bırakılabilir veya panic ile doldurulabilir)
+handle_sync_lower_el_aarch32:
+    push_and_call_rust_handler handle_aarch32_exception
+
+handle_irq_lower_el_aarch32:
+    push_and_call_rust_handler handle_aarch32_exception
+
+handle_fiq_lower_el_aarch32:
+    push_and_call_rust_handler handle_aarch32_exception
+
+handle_serror_lower_el_aarch32:
+    push_and_call_rust_handler handle_aarch32_exception
+
+"#);
+
+// --- Rust İstisna İşleyicileri ---
+// Bu fonksiyonlar assembly şablonu tarafından çağrılır.
+// Parametre olarak TrapFrame'in mutable bir referansını alırlar.
+
+/// Geçersiz bir istisna tipi için genel işleyici (şimdilik panik yapabiliriz)
+#[no_mangle] // Assembly'den çağrılacak
+extern "C" fn handle_invalid_exception(frame: &mut TrapFrame, message: &str) {
+    // TODO: Daha sofistike hata işleme veya loglama
+    println!("Çekirdek Hatası: Geçersiz istisna veya unimplemented handler: {}", message);
+    println!("Trap Frame: {:?}", frame);
+    // Çekirdek panikledi!
+    loop {} // Sonsuz döngüde kal
 }
 
-// ** Başlatma Fonksiyonu **
-/// ARM özelindeki kesme alt sistemini başlatır.
-/// Kesme Vektör Tablosu'nu kurar, ilgili kesme işleyicilerini yerleştirir ve kesmeleri etkinleştirir.
-/// Bu fonksiyon, sistem başlangıcında (kernel init sürecinde) çağrılmalıdır.
-pub fn init() {
-    // Bu fonksiyon kernel privilege seviyesinde çalışmalıdır.
-    unsafe {
-        // 1. Kesme Vektör Tablosu (IVT) Kurulumu
-        // IVT dizisinin adresini donanımdaki VTOR kaydına yaz.
-        let ivt_ptr = IVT.as_mut_ptr() as usize; // IVT dizisinin bellekteki adresi
+#[no_mangle]
+extern "C" fn handle_sync_curr_el_sp0_rust(frame: &mut TrapFrame) {
+    handle_invalid_exception(frame, "Senkron (Current EL, SP0)");
+}
 
-        // IVT_ADDRESS (VTOR) adresine IVT dizisinin adresini volatile olarak yaz.
-        // Bu, CPU'ya kesme vektörlerini nerede bulacağını söyler.
-        ptr::write_volatile(IVT_ADDRESS as *mut usize, ivt_ptr);
-        // ** AÇIKLAMA: IVT adresini sisteme bildirme işlemi DONANIMA ÖZGÜDÜR! **
-        // Bazı ARM çiplerde SCB (System Control Block) veya benzeri bir birime
-        // IVT adresini yazmak gerekebilir. VTOR Cortex-M'de standarttır.
-        // Çipinizin referans kılavuzunu kontrol edin!
+#[no_mangle]
+extern "C" fn handle_irq_curr_el_sp0_rust(frame: &mut TrapFrame) {
+     handle_invalid_exception(frame, "IRQ (Current EL, SP0)");
+}
+
+#[no_mangle]
+extern "C" fn handle_fiq_curr_el_sp0_rust(frame: &mut TrapFrame) {
+     handle_invalid_exception(frame, "FIQ (Current EL, SP0)");
+}
+
+#[no_mangle]
+extern "C" fn handle_serror_curr_el_sp0_rust(frame: &mut TrapFrame) {
+     handle_invalid_exception(frame, "SError (Current EL, SP0)");
+}
 
 
-        // 2. USB Kesme İşleyicisini IVT'ye Yerleştirme
-        // USB IRQ numarasına karşılık gelen IVT girişine usb_interrupt_handler fonksiyonunun adresini yaz.
-        // Fonksiyon pointer'ını doğru tipe dönüştürmek için transmute kullanılır.
-        if USB_IRQ_NUMBER < IVT.len() {
-             let handler_fn_ptr = usb_interrupt_handler as InterruptHandler; // Fonksiyon pointer'ı
-             IVT[USB_IRQ_NUMBER] = handler_fn_ptr; // IVT'ye yerleştir
-             // core::mem::transmute(usb_interrupt_handler_address) yerine doğrudan pointer ataması daha temiz.
-        } else {
-             // USB_IRQ_NUMBER IVT boyutundan büyükse kritik hata
-             #[cfg(feature = "std")] std::eprintln!("KRİTİK HATA: USB IRQ numarası ({}) IVT boyutundan ({}) büyük!", USB_IRQ_NUMBER, IVT.len());
-             #[cfg(not(feature = "std"))] eprintln!("KRİTİK HATA: USB IRQ numarası ({}) IVT boyutundan ({}) büyük!", USB_IRQ_NUMBER, IVT.len());
-             // Bu durumda sistem başlamamalı veya durdurulmalıdır.
-             // halt_system(); // Tanımlıysa çağrılabilir
-             loop { core::hint::spin_loop(); } // Veya sonsuz döngü
+#[no_mangle]
+extern "C" fn handle_sync_curr_el_spx_rust(frame: &mut TrapFrame) {
+    // TODO: Çekirdek içinde oluşan senkron istisnaları işle
+    // Örneğin: Sayfa hatası (Data/Instruction Abort), Geçersiz talimat
+    // ESR_EL1 register'ına bakarak hatanın tipini belirleyin.
+    let esr = frame.esr_el1;
+    let ec = (esr >> 26) & 0x3f; // Exception Class
+
+    match ec {
+        0b100000 | 0b100001 => { // Instruction Abort from Current EL
+            println!("Çekirdek Hatası: Çekirdek içinde talimat hatası!");
+            println!("ESR: {:#x}, ELR: {:#x}", esr, frame.elr_el1);
+             // TODO: Sayfa hatası işleyicisini çağır veya panik
+            loop {}
         }
-
-
-        // 3. İlgili Çevre Birimi Kesmesini Etkinleştirme (DONANIMA ÖZGÜ)
-        // USB kontrolcüsünün kesme etkinleştirme kaydını ayarla.
-        let usb_interrupt_enable_register_address = USB_BASE_ADDRESS + USB_INTERRUPT_ENABLE_REGISTER_OFFSET;
-        // Kesme etkinleştirme kaydına ilgili bit maskesini volatile olarak yaz.
-        // Bu, USB kontrolcüsünün kesme üretmesine izin verir.
-        // ** DİKKAT: Kesme etkinleştirme yöntemi ve bit maskesi DONANIMA ÖZGÜDÜR! **
-        // Genellikle "set enable" veya "clear enable" kayıdı olur. Buradaki offset ve bit sadece örnek.
-        Volatile::new(usb_interrupt_enable_register_address as *mut u32).write(1 << USB_IRQ_NUMBER); // Örnek: IRQ numarasının bitini set et
-
-
-        // TODO: GIC gibi harici bir kesme kontrolcüsü kullanılıyorsa, GIC'de de bu IRQ etkinleştirilmelidir.
-         enable_gic_irq(USB_IRQ_NUMBER); // Donanıma özel GIC işlemi
-
-
-        // 4. Genel Kesmeleri Etkinleştirme (ARM CPSR register'ı veya özel yönergeler ile)
-        // CPSR (Current Program Status Register) içindeki I (IRQ) bitini temizle.
-        // Bu, işlemcinin IRQ istisnalarını almasına izin verir.
-        asm!("cpsie i", options(nostack)); // cpsie i: Change Processor State, Enable Interrupts (IRQ)
-                                            // options(nostack) kesme işleyicilerinde kullanılabilir, burada init'te
-                                            // stack manipulation olmadığından güvenli sayılabilir.
-        // ** UYARI: Genel kesmeleri etkinleştirmeden önce IVT ve TÜM kesme işleyicilerin
-        // doğru yapılandırıldığından ve geçerli olduğundan EMİN OLUN! **
-        // Aksi halde ilk kesmede çift hata (double fault) veya kilitlenme olabilir.
+         0b100100 | 0b100101 => { // Data Abort from Current EL
+            println!("Çekirdek Hatası: Çekirdek içinde veri hatası (Sayfa Hatası?)!");
+            println!("ESR: {:#x}, FAR: {:#x}, ELR: {:#x}", esr, frame.far_el1, frame.elr_el1);
+             // TODO: Sayfa hatası işleyicisini çağır veya panik
+            loop {}
+         }
+        // TODO: Diğer EC değerlerini işle
+        _ => handle_invalid_exception(frame, &format!("Senkron (Current EL, SPx), EC: {:#b}", ec)),
     }
-    // init fonksiyonu başarıyla tamamlanırsa geri döner.
 }
+
+#[no_mangle]
+extern "C" fn handle_irq_curr_el_spx_rust(frame: &mut TrapFrame) {
+    // TODO: Çekirdek içinde oluşan kesmeleri işle (zamanlayıcı kesmesi vb.)
+     // Genellikle GIC (Generic Interrupt Controller) ile etkileşime girilir.
+    println!("Çekirdek İçi IRQ alındı! (Yer Tutucu)");
+    // TODO: GIC'ten kesme ID'sini oku, ilgili işleyiciye yönlendir, kesmeyi onayla.
+}
+
+#[no_mangle]
+extern "C" fn handle_fiq_curr_el_spx_rust(frame: &mut TrapFrame) {
+     handle_invalid_exception(frame, "FIQ (Current EL, SPx)");
+}
+
+#[no_mangle]
+extern "C" fn handle_serror_curr_el_spx_rust(frame: &mut TrapFrame) {
+     handle_invalid_exception(frame, "SError (Current EL, SPx)");
+}
+
+
+/// --- Kullanıcı Alanından Gelen Senkron İstisnaları İşleyici (Sistem Çağrıları Buradan Geçer) ---
+#[no_mangle]
+extern "C" fn handle_sync_lower_el_aarch64_rust(frame: &mut TrapFrame) {
+    let esr = frame.esr_el1;
+    let ec = (esr >> 26) & 0x3f; // Exception Class
+
+    match ec {
+        0b010101 => { // EC: 0b010101 -> SVC instruction (SVC64)
+            // Sistem Çağrısı!
+            // Varsayım: Sistem çağrısı numarası x8 register'ında,
+            // argümanlar x0, x1, x2, x3, x4, x5 register'larında.
+            // Bu bir ABI (Application Binary Interface) kuralıdır ve kullanıcı
+            // alanı kodunuzun buna uyması gerekir.
+
+            let syscall_number = frame.x[8]; // x8 = syscall numarası
+            let arg1 = frame.x[0];           // x0 = arg1
+            let arg2 = frame.x[1];           // x1 = arg2
+            let arg3 = frame.x[2];           // x2 = arg3
+            let arg4 = frame.x[3];           // x3 = arg4
+            let arg5 = frame.x[4];           // x4 = arg5
+            // not: arg5 aslında x5'te olmalı, ama kodda x4'e kadar kullanılmış.
+            // ABI'nıza göre bunu düzeltin. Varsayımsal olarak x0-x5 argümanlar.
+            let arg6 = frame.x[5]; // x5 = arg6 (Eğer 6 argüman kullanılıyorsa)
+
+            // Karnal64 API'sındaki sistem çağrısı işleyicisini çağır
+            // handle_syscall fonksiyonu i64 döndürüyor (başarı için >= 0, hata için negatif KError değeri)
+            let result = handle_syscall(syscall_number, arg1, arg2, arg3, arg4, arg5); // Sadece 5 argüman geçelim API tanımına göre
+
+            // Sistem çağrısının dönüş değerini kullanıcı alanının göreceği x0 register'ına yaz.
+            // assembly kodu geri dönerken bu x0'ı kullanıcı stack'ine yazacaktır.
+            frame.x[0] = result as u64; // i64'ü u64'e çevirirken dikkatli olun (negatif değerler için)
+                                        // KError değerleri zaten negatif i64 olduğu için bu dönüşüm doğrudur.
+        }
+        0b100000 | 0b100001 => { // Instruction Abort from Lower EL
+            // Kullanıcı alanında geçersiz talimat
+             println!("Kullanıcı Alanı Hatası: Geçersiz talimat! ELR: {:#x}", frame.elr_el1);
+            // TODO: Süreci sonlandır veya sinyal gönder
+            loop{}
+        }
+         0b100100 | 0b100101 => { // Data Abort from Lower EL
+            // Kullanıcı alanında veri hatası (genellikle sayfa hatası)
+            println!("Kullanıcı Alanı Hatası: Sayfa hatası! FAR: {:#x}, ELR: {:#x}", frame.far_el1, frame.elr_el1);
+            // TODO: Sayfa hatasını işle (örneğin: copy-on-write, stack büyümesi, mmap),
+            // veya süreci sonlandır
+            loop {}
+         }
+        // TODO: Diğer EC değerlerini işle (FIQ, SError, vb.)
+        _ => {
+            // Bilinmeyen veya beklenmeyen senkron istisna
+            handle_invalid_exception(frame, &format!("Senkron (Lower EL, AArch64), EC: {:#b}", ec));
+        }
+    }
+}
+
+
+/// --- Kullanıcı Alanından Gelen Kesmeleri İşleyici (Donanım Kesmeleri Buradan Geçer) ---
+#[no_mangle]
+extern "C" fn handle_irq_lower_el_aarch64_rust(frame: &mut TrapFrame) {
+    // Donanım kesmesi!
+    // Genellikle GIC (Generic Interrupt Controller) ile etkileşime girilir.
+    println!("IRQ alındı! (Yer Tutucu)");
+
+    // TODO:
+    // 1. GIC'ten hangi kesmenin geldiğini öğren (örneğin, GIC CPU arayüzünden).
+    // 2. Kesmenin ID'sine göre ilgili aygıt sürücüsünün işleyicisini çağır.
+    // 3. GIC'e kesmenin işlendiğini bildir (acknowledge).
+}
+
+#[no_mangle]
+extern "C" fn handle_fiq_lower_el_aarch64_rust(frame: &mut TrapFrame) {
+     handle_invalid_exception(frame, "FIQ (Lower EL, AArch64)");
+}
+
+#[no_mangle]
+extern "C" fn handle_serror_lower_el_aarch64_rust(frame: &mut TrapFrame) {
+     handle_invalid_exception(frame, "SError (Lower EL, AArch64)");
+}
+
+// AArch32 kullanıcı alanı destekleniyorsa bu işleyicileri doldurmanız gerekir.
+// Şimdilik panik yapıyorlar.
+#[no_mangle]
+extern "C" fn handle_aarch32_exception(frame: &mut TrapFrame) {
+     handle_invalid_exception(frame, "AArch32 istisnası (desteklenmiyor)");
+}
+
+
+// --- İstisna Sistemini Başlatma ---
+
+/// İstisna vektör tablosunu kurar. Çekirdek başlangıcında çağrılmalıdır.
+pub fn init() {
+    // `vector_table` sembolünün adresini al (global_asm ile tanımlanan etiket)
+    let vector_table_addr = vector_table as *const () as u64;
+
+    unsafe {
+        // VBAR_EL1 register'ına vektör tablosunun adresini yaz.
+        // Bu, CPU'ya istisna/kesme olduğunda nereye dallanacağını söyler.
+        core::arch::asm!(
+            "msr vbar_el1, {}",
+            in(reg) vector_table_addr,
+            options(nostack, nomem) // Bu talimatın stack veya belleği etkilemediğini belirtir
+        );
+    }
+
+    println!("ARM İstisna Vektör Tablosu kuruldu. Adres: {:#x}", vector_table_addr);
+
+    // TODO: Donanım kesmeleri için GIC (Generic Interrupt Controller) gibi
+    // kesme denetleyicisini de burada başlatmanız gerekebilir.
+    // Kesmeleri global olarak etkinleştirmek (PSTATE.I ve PSTATE.F flagları)
+    // genellikle GIC kurulumu veya zamanlayıcı başlangıcı sırasında yapılır.
+    // Basitçe kesmeleri etkinleştirmek için:
+     unsafe { core::arch::asm!("msr daifclr, #2") }; // DAIF I bitini temizle (kesmeleri etkinleştir)
+}
+
+// --- Assembly Sembolünün Harici Tanımı ---
+// global_asm tarafından tanımlanan 'vector_table' sembolünü Rust tarafında
+// kullanabilmek için harici (extern) olarak bildirmemiz gerekir.
+extern "C" {
+    fn vector_table();
+}
+
+// TODO: Yardımcı print! macro'su veya loglama mekanizması gereklidir.
+// no_std ortamında std::println doğrudan kullanılamaz.
+// Kendi konsol/UART sürücünüz üzerinden yazan bir macro implemente etmelisiniz.
+macro_rules! println {
+    ($($arg:tt)*) => ({
+        // Buraya konsol/UART sürücünüzü kullanarak yazdırma mantığını ekleyin.
+        // Şimdilik boş bırakılabilir veya dummy bir implementasyon konabilir.
+         crate::driver::uart::print_fmt(format_args!($($arg)*));
+    });
+}
+
+// TODO: panic handler implementasyonu gereklidir (`panic_handler` özelliği).
+// Bir panik durumunda ne yapılacağını tanımlar.
+
+// TODO: ResourceProvider traitini implemente eden dummy bir konsol sürücüsü
+// (println! macro'su için gerekli olabilir) veya çekirdek içi bir loglama yapısı.
+
+// TODO: GIC (Generic Interrupt Controller) etkileşimi için kodlar (IRQ işleyicisi için).
+// Kesmeleri kaydetme, etkinleştirme, devre dışı bırakma, onayla vb. fonksiyonlar.
