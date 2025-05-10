@@ -1,233 +1,221 @@
 #![no_std] // Standart kütüphaneye ihtiyaç duymuyoruz
 
-// Gerekli core modüllerini içeri aktar
-use core::arch::asm; // Inline assembly (CP0 register erişimi için)
-use core::ptr;      // Pointer işlemleri için
-// use core::mem;      // Gerekirse bellek işlemleri için (Örn: size_of, align_of) - şu an kullanılmıyor
+// Karnal64 çekirdek API'sından ihtiyacımız olan fonksiyonları ve tipleri içeri alalım.
+// Özellikle sistem çağrısı işleyicisi handle_syscall bizim için önemli.
+// Varsayım: 'karnal64' crate'i projenize eklenmiş ve public üyeleri mevcut.
+use karnal64::{handle_syscall, KError, KHandle, KTaskId}; // Örnek için bazı tipleri de alalım
 
-// `volatile` crate'inden Volatile sarmalayıcıyı içeri aktar (cargo.toml'da tanımlı olmalı)
-use volatile::Volatile; // <-- Added import
+// MIPS mimarisine özgü CP0 registerlarına erişim için helper fonksiyonlar veya bir crate gerekebilir.
+// Bu örnekte, sadece TrapFrame yapısı üzerinden registerlara erişimi simüle ediyoruz.
+// Gerçekte, unsafe { read_cp0_register(...) } gibi çağrılar yapmanız gerekir.
 
-// Konsol çıktı makrolarını kullanabilmek için (hata durumlarında loglama veya debug çıktısı için)
-// Bu makrolar Sahne64 crate'i tarafından sağlanır ve resource API'sini kullanır.
-// Bu crate'te kullanılabilir olmaları için uygun kurulum (örn. #[macro_use]) gereklidir.
-// Bu örnekte, #[cfg] ile std/no_std çıktısını ayarlayarak makroların
-// uygun ortamda kullanılabilir olduğunu varsayıyoruz.
-// use sahne64::eprintln; // Örnek import eğer macro publicse
+// MIPS64 mimarisine özgü bir TrapFrame yapısı.
+// Bir exception (istisna) veya interrupt (kesme) meydana geldiğinde, CPU'nun
+// tüm kritik registerlarının durumunu kaydetmek için kullanılır.
+// #[repr(C)] buranın C uyumlu olmasını ve düşük seviyeli montaj kodu tarafından
+// doğru şekilde erişilebilir olmasını sağlar.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)] // Debug ve Copy/Clone traitleri hata ayıklama ve kolay kullanım için faydalı
+pub struct TrapFrame {
+    // Genel Amaçlı Registerlar (GPRs) - MIPS64'te 32 adet 64-bit register (r0-r31).
+    // r0 her zaman 0'dır, ancak tutarlılık için dizide yer alabilir.
+    // Syscall argümanları: a0-a4 (regs[4] - regs[8])
+    // Syscall dönüş değeri: v0 (regs[2])
+    // Return address: ra (regs[31])
+    // Stack pointer: sp (regs[29])
+    // Diğer registerlar da kaydedilmelidir (s0-s7, t0-t9, gp, fp, vb.)
+    // Tam bir TrapFrame tüm GPR'leri içermelidir:
+    pub regs: [u64; 32], // r0-r31
 
-// MIPS mimarisine özgü ve donanıma bağımlı sabitler
-// ** GERÇEK DEĞERLERİ İŞLEMCİ VE ÇEVRE BİRİMİ REFERANS KILAVUZLARINDAN ALIN! **
-// Bu değerler çip modeline ve çevre birimi instancelarına göre değişir.
-
-// MIPS CP0 Register Adresleri (Örnek: MIPS32/64)
-// Status Register: CP0 register 12, select 0
-// Cause Register: CP0 register 13, select 0
-// EBase Register: CP0 register 15, select 1 (MIPS32) veya CP0 register 15, select 0 (MIPS64)
-// Bu örnek MIPS32 varsayıyor olabilir, EBase 15 select 1 veya Status/Cause 12/13 select 0 yaygındır.
-// Kesin adresler ve select değerleri için kullandığınız MIPS CPU kılavuzuna bakın.
-
-// Status register'daki bitler
-const STATUS_IE_BIT: u32 = 1 << 0; // Interrupt Enable (Global) bit 0
-const STATUS_EXL_BIT: u32 = 1 << 1; // Exception Level (1: Kernel, 0: User) bit 1
-// IM (Interrupt Mask) bitleri: Status register'ın 8-15 bitleri (IP0-IP7'ye karşılık gelir)
-// Örneğin, IP2 (Cause'taki bit 10) maskesi Status'ta bit 10'dadır.
-// cause register'daki IP (Interrupt Pending) bitleri
-const CAUSE_IP_SHIFT: u32 = 10; // IP bitlerinin Cause register'daki başlangıç bit pozisyonu (tipik)
-const CAUSE_IP_MASK: u32 = 0xFF << CAUSE_IP_SHIFT; // IP bitlerinin maskesi
-
-
-// USB ile ilgili kesme biti (DONANIMA ÖZGÜ! Çipe göre değişir)
-// Cause register'da bir IP[n] biti ve Status register'da buna karşılık gelen IM[n] biti vardır.
-// USB_IRQ_IP_BIT: USB kesmesini bekleyen durumunu gösteren Cause register IP bit pozisyonu.
-// USB_IRQ_IM_BIT: USB kesmesinin *işlenmesini* etkinleştiren Status register IM bit pozisyonu.
-// Genellikle IP[n] Cause register'da bit (10 + n), IM[n] Status register'da bit (8 + n)'dir.
-// veya ikisi de (10+n) olabilir, kılavuza bakın.
-const USB_IRQ_IP_BIT_POS: u32 = 5; // ÖRNEK DEĞER! Cause register'da IP[5] için bit pozisyonu (Cause bit 10+5 = 15)
-const USB_IRQ_IM_BIT_POS: u32 = 13; // ÖRNEK DEĞER! Status register'da IM[5] için bit pozisyonu (Status bit 8+5 = 13)
-
-const USB_IRQ_CAUSE_MASK: u32 = 1 << (CAUSE_IP_SHIFT + USB_IRQ_IP_BIT_POS); // USB IRQ için Cause'taki pending bit maskesi
-const USB_IRQ_STATUS_MASK: u32 = 1 << USB_IRQ_IM_BIT_POS; // USB IRQ için Status'taki enable maskesi
-
-
-// Makine Zamanlayıcı Kesmesi (Cause register'da IP[n], Status register'da IM[n])
-// Timer kesmesi genellikle IP[7] veya IP[6] kullanılır.
-const TIMER_IRQ_IP_BIT_POS: u32 = 7; // ÖRNEK DEĞER! Cause register'da IP[7] için bit pozisyonu (Cause bit 10+7 = 17)
-const TIMER_IRQ_IM_BIT_POS: u32 = 15; // ÖRNEK DEĞER! Status register'da IM[7] için bit pozisyonu (Status bit 8+7 = 15)
-
-const TIMER_IRQ_CAUSE_MASK: u32 = 1 << (CAUSE_IP_SHIFT + TIMER_IRQ_IP_BIT_POS); // Timer IRQ için Cause'taki pending bit maskesi
-const TIMER_IRQ_STATUS_MASK: u32 = 1 << TIMER_IRQ_IM_BIT_POS; // Timer IRQ için Status'taki enable maskesi
-
-
-extern "C" {
-    // Kesme Vektör Tablosu (Interrupt Vector Table) başlangıç adresi
-    // EBase register'ı bu adresin başlangıcını işaret eder.
-    // Bu sembol, linker script veya trap/exception handling kodunda tanımlanmalıdır.
-   pub static __exception_vector_table: u32; // Linker script veya trap handling'den gelen sembol adı (32-bit mimari varsayımı)
+    // MIPS CP0 Registerları
+    pub status: u64, // Durum Registerı (SR)
+    pub cause: u64,  // Neden Registerı
+    pub epc: u64,    // Exception Program Counter (Exception'a neden olan instruction'ın adresi)
+    pub bad_vaddr: u64, // Geçersiz sanal adres (TLB, Adres Hatası gibi exception'larda geçerli)
+    // Diğer CP0 registerları (Config, Context, Wired vb.) duruma göre eklenebilir.
 }
 
-// USB ile ilgili donanım adresleri ve register offset'leri (DONANIMA ÖZGÜ!)
-// USB_BASE_ADDRESS: USB kontrolcüsünün bellek eşlemeli (memory-mapped) temel adresi.
-// USB_IRQ_CLEAR_REGISTER: USB kesme bayrağını temizlemek için yazılacak register adresi (veya offset).
-// USB_IRQ_CLEAR_VALUE: USB kesme bayrağını temizlemek için bu register'a yazılacak değer.
-// **DİKKAT:** Bu değerler ve adresler, kullandığınız MIPS çipine ve USB kontrolcüsüne göre DEĞİŞİR.
-// Doğru değerler için çipinizin REFERANS KILAVUZUNA bakmanız ŞARTTIR.
-const USB_BASE_ADDRESS: usize = 0xBF00_0000; // ÖRNEK ADRES! Kılavuza bakınız!
-const USB_IRQ_CLEAR_REGISTER_OFFSET: usize = 0x10; // ÖRNEK OFFSET! Kılavuza bakınız!
-const USB_IRQ_CLEAR_VALUE: u32 = 1; // ÖRNEK DEĞER! Kılavuza bakınız!
+// MIPS Cause Register'ındaki ExcCode (Exception Code) bit alanının maskesi ve kaydırma miktarı
+const CAUSE_EXCCODE_SHIFT: usize = 2;
+const CAUSE_EXCCODE_MASK: u64 = 0x1F; // 5 bitlik alan (0-31)
 
+// MIPS Exception Kodları (ExcCode) - Cause registerından okunur
+// Bu değerler MIPS mimari kılavuzuna göre kontrol edilmelidir.
+const EXCCODE_INT: u64 = 0b00000; // Interrupt (Kesme)
+const EXCCODE_MOD: u64 = 0b00001; // TLB Modified (TLB Değiştirildi)
+const EXCCODE_TLBL: u64 = 0b00010; // TLB Load/Instruction Fetch (TLB Yükleme/Komut Çekme)
+const EXCCODE_TLBS: u64 = 0b00011; // TLB Store (TLB Saklama)
+const EXCCODE_ADDR: u64 = 0b00100; // Address Error (Adres Hatası)
+const EXCCODE_BUSI: u64 = 0b00101; // Bus Error (Instruction Fetch) (Veriyolu Hatası - Komut Çekme)
+const EXCCODE_BUSD: u64 = 0b00110; // Bus Error (Data Load/Store) (Veriyolu Hatası - Veri Yükleme/Saklama)
+const EXCCODE_SYSCALL: u64 = 0b01000; // Syscall (Sistem Çağrısı)
+const EXCCODE_BP: u64 = 0b01001;    // Breakpoint
+const EXCCODE_RI: u64 = 0b01010;    // Reserved Instruction (Ayrılmış Komut)
+const EXCCODE_CPI: u64 = 0b01011;    // Coprocessor Unusable (Yardımcı İşlemci Kullanılamaz)
+const EXCCODE_OV: u64 = 0b01100;     // Overflow (Taşma)
+const EXCCODE_TR: u64 = 0b01101;     // Trap (Tuzak)
+// ... Diğer kodlar ...
 
-/// MIPS mimarisi için kesme ve trap altyapısını başlatır.
-/// EBase, Status (IM ve IE bitleri) gibi ilgili CP0 registerlarını ayarlar.
-/// Bu fonksiyon, sistem başlangıcında (kernel init sürecinde) çağrılmalıdır.
-pub fn init() {
-    // Bu fonksiyon, Kernel mode gibi yüksek privilege seviyesinde çalışmalıdır.
-    unsafe {
-        // 1. EBase (Exception Base Address) Register'ını Ayarlama
-        // EBase register'ı, kesme/istisna vektör tablosunun (IVT) başlangıç adresini tutar.
-        // Kesme/istisna oluştuğunda işlemci, EBase + ofset adresine dallanır.
-        // MIPS'te EBase genellikle CP0 register 15, select 1'dir (kontrol ediniz).
-        let ivt_address = &__exception_vector_table as *const u32 as u32; // IVT'nin 32-bit adresini al (32-bit mimari varsayımı)
+// MIPS Interrupt Pending (IP) bit alanının maskesi ve kaydırma miktarı (Cause registerı)
+const CAUSE_IP_SHIFT: usize = 10;
+const CAUSE_IP_MASK: u64 = 0xFF; // 8 bitlik alan (IP0-IP7)
 
-        // EBase register'ına IVT adresini yazmak için 'mtc0' (Move To CP0) kullanılır.
-        // $15: EBase register numarası, 1: select numarası (MIPS32 için yaygın).
-        asm!(
-            "mtc0 {0}, $15, 1", // mtc0 rt, csr, sel (rt: source reg, csr: cp0 reg num, sel: select num)
-            in(reg) ivt_address,  // Kaynak register olarak IVT adresi
-            options(nostack)      // Stack manipulation olmadığını belirtir
-        );
-        // ** AÇIKLAMA: EBase adresini sisteme bildirme işlemi DONANIMA ÖZGÜDÜR! **
-        // Doğru CP0 register numarası, select değeri ve yazma yönergesi için MIPS ISA ve çip kılavuzuna bakın.
+// MIPS SR (Status Register) ERL/EXL/IE bitleri
+// Exception Return Level (ERL), Exception Level (EXL), Interrupt Enable (IE)
+const SR_IE: u64 = 0x1; // Interrupt Enable bit
+const SR_EXL: u64 = 0x2; // Exception Level bit
+const SR_ERL: u64 = 0x4; // Error Level bit
 
+// --- Ana Exception/Interrupt İşleyici Fonksiyonu ---
+// Bu fonksiyon, düşük seviyeli montaj dili kesme vektörü işleyicisi tarafından çağrılır.
+// Montaj işleyicisi, exception oluştuğunda CPU durumunu TrapFrame yapısına kaydeder
+// ve bu yapının bir pointer'ını bu fonksiyona iletir.
+#[no_mangle] // Montaj kodu tarafından çağrılabilmesi için isim düzenlemesi yapılmaz
+pub extern "C" fn handle_exception(frame: &mut TrapFrame) {
+    // Exception nedenini belirle
+    let exc_code = (frame.cause >> CAUSE_EXCCODE_SHIFT) & CAUSE_EXCCODE_MASK;
 
-        // 2. İlgili Çevre Birimi Kesmelerini Etkinleştirme (Status register'daki IM bitleri)
-        // Zamanlayıcı ve USB kesmelerini Status register'ın IM bitleri (Interrupt Mask) ile etkinleştir.
-        // Önce Status register'ı okuyun, IM bitlerini set edin, geri yazın.
-        // Status register genellikle CP0 register 12, select 0'dır (kontrol ediniz).
-        let interrupt_mask_bits = TIMER_IRQ_STATUS_MASK | USB_IRQ_STATUS_MASK; // Etkinleştirilecek IRQ bit maskesi
+    // Interrupt pending bitlerini kontrol et (sadece EXCCODE_INT durumunda anlamlı)
+    let interrupt_pending = (frame.cause >> CAUSE_IP_SHIFT) & CAUSE_IP_MASK;
 
-        // Status register'ı oku: mfc0 rd, csr, sel (rd: dest reg, csr: cp0 reg num, sel: select num)
-        // $t0 (register 8) geçici olarak kullanılabilecek bir register.
-        asm!("mfc0 $t0, $12, 0", options(nostack));
+    match exc_code {
+        EXCCODE_SYSCALL => {
+            // --- Sistem Çağrısı (Syscall) İşleme ---
+            // Syscall numarası ve argümanları TrapFrame'den oku (MIPS64 ABI konvansiyonu)
+            // Varsayılan MIPS64 N64 ABI'sinde:
+            // Syscall Numarası: v0 (regs[2])
+            // Argümanlar: a0-a7 (regs[4] - regs[11])
+            // Karnal64 handle_syscall 5 arg (u64) alır, bu yüzden a0-a4'ü kullanacağız.
 
-        // Okunan Status değerine maskeyi OR'la (IM bitlerini set et)
-        asm!(
-            "ori $t0, $t0, {0}", // ori rt, rs, immediate (rt = rs | immediate)
-            in(reg) interrupt_mask_bits,
-            options(nostack)
-        );
+            let syscall_number = frame.regs[2]; // v0 registerı (r2)
 
-        // Yeni Status değerini geri yaz: mtc0 rt, csr, sel
-        asm!("mtc0 $t0, $12, 0", options(nostack));
-        // **DİKKAT:** Status register'ı ve IM bit pozisyonları için MIPS ISA ve çip kılavuzuna bakın.
+            // Argümanlar a0-a4 registerlarında (r4-r8)
+            let arg1 = frame.regs[4]; // a0 (r4)
+            let arg2 = frame.regs[5]; // a1 (r5)
+            let arg3 = frame.regs[6]; // a2 (r6)
+            let arg4 = frame.regs[7]; // a3 (r7)
+            let arg5 = frame.regs[8]; // a4 (r8) - 5. argüman için varsayım
 
+            // !!! GÜVENLİK VE BELLEK YÖNETİMİ UYARISI:
+            // Argümanlar arasında kullanıcı alanındaki pointerlar varsa (örn: resource_read için buffer pointerı),
+            // Karnal64 fonksiyonlarına göndermeden ÖNCE, bu pointer'ların mevcut görevin
+            // sanal adres alanında GEÇERLİ, SINIRLAR İÇİNDE ve uygun izinlere sahip (okunabilir/yazılabilir)
+            // olduğunu bellek yönetim alt sistemi tarafından DOĞRULANMALIDIR.
+            // Bu örnekte doğrulama adımları atlanmıştır, gerçek çekirdekte eklenmelidir.
+            // Örneğin, `kmemory::validate_user_pointer(ptr, len, AccessMode::ReadWrite)` gibi bir çağrı yapılmalı.
 
-        // 3. Genel Kesmeleri Etkinleştirme (Status register'daki IE biti)
-        // Status register'daki IE bitini (Interrupt Enable - bit 0) set edin.
-        // Bu bit olmadan, bireysel kesme maskeleme (IM) yeterli DEĞİLDİR.
-        // Status register'ı tekrar okuyun, IE bitini set edin, geri yazın.
-         // $t0 register'ı hala kullanılabilir, veya tekrar okuyun.
-        asm!("mfc0 $t0, $12, 0", options(nostack));
+            // Karnal64'ün genel sistem çağrısı işleyicisini çağır.
+            // Bu fonksiyon çekirdek içinde ilgili Karnal64 API fonksiyonunu (resource_read, task_spawn vb.) çağıracaktır.
+            let syscall_result = handle_syscall(syscall_number, arg1, arg2, arg3, arg4, arg5);
 
-        asm!(
-            "ori $t0, $t0, {0}", // Status değerine IE_BIT'i OR'la
-            in(reg) STATUS_IE_BIT, // STATUS_IE_BIT = 1 << 0
-            options(nostack)
-        );
+            // Karnal64'ten dönen sonucu (i64) kullanıcı alanına döndürmek için
+            // TrapFrame'deki v0 registerına yaz (r2). MIPS'te dönüş değeri v0'a konur.
+            frame.regs[2] = syscall_result as u64; // i64 -> u64 dönüşümü, negatif değerler (KError) için geçerlidir.
 
-        asm!("mtc0 $t0, $12, 0", options(nostack));
-        // **DİKKAT:** Status register'ı ve IE bit pozisyonu için MIPS ISA kılavuzuna bakın.
+            // Syscall instruction'dan sonraki instruction'a atlamak için EPC'yi ilerlet.
+            // MIPS'te syscall instruction 4 byte uzunluğundadır.
+            // Bu, kullanıcının aynı syscall instruction'ı tekrar çalıştırmasını engeller.
+            frame.epc += 4;
 
+            // Syscall sonrası gerekirse durum registerı (Status) güncellenir.
+            // Örneğin, EXL biti exception seviyesinden çıkıldığı için temizlenmelidir (montaj kodu tarafından yapılır).
+            // SR registerındaki IE (Interrupt Enable) biti uygun şekilde yönetilmelidir.
 
-        // NOT: Bu noktada, zamanlayıcı ve USB kesmeleri (ve Status.IM'de etkinleştirilen diğerleri)
-        // gerçekleştiğinde işlemci kontrolü EBase tarafından işaret edilen exception vector'a devredecektir.
-        // Exception vector kodu Cause register'ını okuyup kesme nedenini belirlemeli ve uygun işleyiciye dallanmalıdır.
+             println!("Karnal64 MIPS: Syscall {} handled. Result: {}", syscall_number, syscall_result); // Debug amaçlı
+        }
+        EXCCODE_INT => {
+            // --- Donanım Kesmesi (Interrupt) İşleme ---
+            // Cause registerındaki IP (Interrupt Pending) bitlerini kontrol ederek hangi kesmenin geldiğini bul.
+            let pending_interrupts = interrupt_pending;
 
-        // Diğer platforma özgü başlatma adımları buraya eklenebilir (örn. diğer çevre birimleri init)
+            // Her bir IP biti için ilgili kesme işleyicisini çağır (veya bir kesme denetleyicisine devret)
+            // Örnek: IP0 (Timer), IP1 (I/O), IP2 (IPC)...
+            if (pending_interrupts >> 0) & 1 == 1 {
+                 // IP0 - Zamanlayıcı Kesmesi olduğunu varsayalım
+                  println!("Karnal64 MIPS: Timer Interrupt received."); // Debug amaçlı
+                  ktask::handle_timer_interrupt(); // Zamanlayıcı modülünün kesme işleyicisini çağır
+            }
+            if (pending_interrupts >> 1) & 1 == 1 {
+                 // IP1 - Örneğin UART veya diğer I/O kesmesi
+                  println!("Karnal64 MIPS: I/O Interrupt received."); // Debug amaçlı
+                  kresource::handle_io_interrupt(); // Kaynak yöneticisi veya ilgili sürücüyü çağır
+            }
+            // ... Diğer IP bitleri ve kesme kaynakları ...
+
+            // Kesme işlendikten sonra, Status registerındaki IE bitini tekrar etkinleştirmek gerekebilir.
+            // Ayrıca, MIPS'te kesmelerin neden olduğu EXL/ERL bitleri temizlenmelidir (montaj kodu).
+
+             // Eğer zamanlayıcı kesmesi görev değiştirmeyi tetiklediyse, handle_timer_interrupt
+             // fonksiyonu zamanlayıcıyı çağırabilir ve bu da yeni görevin TrapFrame'ine yükleme yapar.
+        }
+        EXCCODE_TLBL | EXCCODE_TLBS => {
+            // --- TLB Miss (Page Fault benzeri) İşleme ---
+            // BadVAddr registerı geçersiz adresi içerir.
+            // Bellek yönetim birimi (MMU) ile etkileşim gerektiren karmaşık bir konudur.
+            // Çekirdeğin bellek yöneticisi (kmemory), sayfa tablolarını kullanarak bu hatayı çözmeye çalışır.
+            // Hata çözülürse (örn: lazy allocation, demand paging), handler geri döner ve hatayı tetikleyen
+            // instruction yeniden denenir (EPC değeri arttırılmaz). Çözülemezse görev sonlandırılır.
+            println!("Karnal64 MIPS: TLB Miss Exception! ExcCode: {}, BadVAddr: {:#x}, EPC: {:#x}",
+                     exc_code, frame.bad_vaddr, frame.epc);
+            // Bu hatayı çekirdeğin bellek yönetim modülüne devret:
+             match kmemory::handle_tlb_exception(frame) {
+                Ok(_) => { /* Başarılı, EPC yeniden deneme için zaten doğru */ }
+                Err(kerr) => {
+            //        // Hata çözülemedi, görevi sonlandır
+                    println!("Karnal64 MIPS: Unhandled TLB Miss, terminating task.");
+                     ktask::terminate_current_task(ExitReason::MemoryError);
+            //        // terminate_current_task geri dönmeyecek bir çağrıdır
+                    loop {} // Güvenlik için sonsuz döngü eğer terminate geri dönerse
+                }
+             }
+            panic!("TLB Miss Exception - Memory management not fully implemented!"); // Geçici olarak panic
+        }
+         EXCCODE_ADDR => {
+            // --- Adres Hatası İşleme ---
+            // Genellikle hizalama hatası veya çekirdek/kullanıcı ayrımını ihlal eden erişim.
+            println!("Karnal64 MIPS: Address Error Exception! BadVAddr: {:#x}, EPC: {:#x}",
+                     frame.bad_vaddr, frame.epc);
+            // Görevi sonlandır:
+             ktask::terminate_current_task(ExitReason::AddressError);
+            panic!("Address Error Exception!"); // Geçici olarak panic
+         }
+         EXCCODE_BUSI | EXCCODE_BUSD => {
+            // --- Veriyolu Hatası İşleme ---
+            // Erişim olmaya çalışılan fiziksel adresin geçersiz olması gibi donanımsal hatalar.
+             println!("Karnal64 MIPS: Bus Error Exception! BadVAddr: {:#x}, EPC: {:#x}",
+                      frame.bad_vaddr, frame.epc);
+             // Görevi sonlandır veya çekirdek paniği:
+              ktask::terminate_current_task(ExitReason::BusError);
+             panic!("Bus Error Exception!"); // Geçici olarak panic
+         }
+         EXCCODE_RI | EXCCODE_CPI => {
+             // --- Komut Hatası İşleme ---
+             // Ayrılmış komut veya kullanılamayan yardımcı işlemci kullanma girişimi.
+             println!("Karnal64 MIPS: Invalid Instruction Exception! ExcCode: {}, EPC: {:#x}",
+                      exc_code, frame.epc);
+             // Görevi sonlandır:
+              ktask::terminate_current_task(ExitReason::InvalidInstruction);
+             panic!("Invalid Instruction Exception!"); // Geçici olarak panic
+         }
+         EXCCODE_OV => {
+             // --- Taşma Hatası İşleme ---
+             // Aritmetik taşma.
+             println!("Karnal64 MIPS: Overflow Exception! EPC: {:#x}", frame.epc);
+             // Görevi sonlandır:
+              ktask::terminate_current_task(ExitReason::Overflow);
+             panic!("Overflow Exception!"); // Geçici olarak panic
+         }
+        // ... Diğer exception kodları buraya eklenir ve işlenir ...
+
+        _ => {
+            // --- Bilinmeyen veya Desteklenmeyen Exception ---
+            // Beklenmedik bir durum, genellikle çekirdek hatası veya kurtarılamaz bir kullanıcı hatası.
+            println!("Karnal64 MIPS: Unhandled Exception! ExcCode: {}, Cause: {:#x}, EPC: {:#x}",
+                     exc_code, frame.cause, frame.epc);
+            println!("Trap Frame: {:?}", frame); // Hata ayıklama için frame içeriğini yazdır
+            // Bu durumda genellikle çekirdek panic yapar veya mevcut görevi sonlandırır.
+             ktask::terminate_current_task(ExitReason::UnhandledException);
+            panic!("Unhandled Exception!"); // Çekirdeğin durması sağlanır.
+        }
     }
-    // init fonksiyonu başarıyla tamamlanırsa geri döner.
-}
-
-// USB Kesme İşleyicisi (DONANIMA ÖZGÜ UYGULAMA GEREKLİ! - ÖRNEK YAPI)
-// Bu fonksiyon, exception vector veya bir merkezi trap/kesme dispatcher'ından çağrılır.
-// Genellikle ayrı bir kod bölümüne (.text.interrupts gibi) yerleştirilir.
-#[no_mangle] // Linker script veya trap entry tarafından çağrılabilir
-// Kesme işleyici fonksiyonları genellikle 'unsafe extern "C"' olarak tanımlanır.
-pub unsafe extern "C" fn usb_interrupt_handler() {
-    // ** Güvenlik: Bu işleyici unsafe'dir çünkü kesme bağlamında çalışır **
-    // ve donanımla doğrudan etkileşime girer. Yarış durumları ve side effect'lere dikkat!
-
-    // ** DİKKAT: Bu bölüm DONANIMA ÖZGÜDÜR ve KULLANILAN ÇİPİN VE USB KONTROLCÜSÜNÜN KILAVUZUNA GÖRE KODLANMALIDIR! **
-    // Bu işleyici çekirdek içinde çalışır, kullanıcı alanındaki Sahne64 API'sini doğrudan çağırmaz.
-    // Gelen USB verisini alır ve çekirdekteki USB sürücüsü koduna iletir.
-    // Ardından, bu veriyi bekleyen kullanıcı görevini Sahne64 çekirdek zamanlama mekanizması
-    // aracılığıyla uyandırır (örn. resource::read için bekleyen görev).
-
-    // 1. Kesme kaynağını belirle (Genellikle Cause register IP bitlerine ve çevre birimi status registerlarına bakılır)
-    // Cause register'ı oku (CP0 register 13, select 0)
-    let cause: u32;
-    asm!("mfc0 {0}, $13, 0", out(reg) cause, options(nostack));
-
-    // USB kesme pending bitini (Cause.IP[USB_IRQ_IP_BIT_POS]) kontrol et.
-    // Bu, bu handler'ın neden çağrıldığının bir göstergesidir (eğer Cause register'ı dispatch öncesi okunuyorsa).
-    // Veya, bu handler'ın çağrılması zaten USB kesmesinin pending olduğunu gösteriyordur.
-    // Bu kısım, genel exception vector'ın nasıl çalıştığına bağlıdır.
-    // Genellikle işleyicinin içine girmek zaten ilgili IRQ'nun aktif olduğunu gösterir.
-    // Yine de çevre birimi status register'ına bakmak gerekebilir.
-
-    // USB kontrolcüsünün kendi durum register'ına bakarak spesifik nedeni bul.
-    // Örnek: USB durum register'ını oku ve veri var mı, TX bitti mi kontrol et.
-    let usb_status_register_address = USB_BASE_ADDRESS.wrapping_add(USB_STATUS_REGISTER_OFFSET); // Güvenli adres hesaplama
-    let usb_status = ptr::read_volatile(usb_status_register_address as *const u32); // Örnek okuma (32-bit status)
-
-    // Örnek USB durum bitleri (usb_interrupt_handler içinde kullanılmıştı, burada tanımlanmalı)
-    // Bu bitler, durum register'ında, Cause.IP bitleri gibi değil.
-    const USB_STATUS_DATA_RECEIVED_BIT: u32 = 1 << 0; // ÖRNEK DEĞER: Durum kaydındaki Veri Alındı biti
-    const USB_STATUS_DATA_SENT_BIT: u32 = 1 << 1;    // ÖRNEK DEĞER: Durum kaydındaki Veri Gönderildi biti
-
-
-    if (usb_status & USB_STATUS_DATA_RECEIVED_BIT) != 0 {
-        // Veri geldi kesmesi oluştu (USB kontrolcüsüne göre)
-        // TODO: Veriyi USB kontrolcüsünden oku (hardware-specific).
-        // TODO: Okunan veriyi çekirdekteki USB sürücüsü tamponuna yaz.
-        // TODO: Resource'u (USB console kaynağı) bekleyen görevleri uyandır (örn. resource::read yapan görev).
-         // Debug çıktıları için Sahne64 konsol makrolarını kullan
-         #[cfg(feature = "std")] std::println!("USB Veri Alındı (işleyici içinde).");
-         #[cfg(not(feature = "std"))] println!("USB Veri Alındı (işleyici içinde).");
-    }
-
-    if (usb_status & USB_STATUS_DATA_SENT_BIT) != 0 {
-         // Veri gönderildi kesmesi oluştu (USB kontrolcüsüne göre)
-         // TODO: Çekirdek tamponundan bir sonraki veriyi USB kontrolcüsüne yaz (eğer gönderilecek veri varsa).
-         // TODO: Resource'u (USB console kaynağı) bekleyen görevleri uyandır (örn. resource::write'ın tamamlanmasını bekleyen görev).
-         // Debug çıktıları için Sahne64 konsol makrolarını kullan
-         #[cfg(feature = "std")] std::println!("USB Veri Gönderildi (işleyici içinde).");
-         #[cfg(not(feature = "std"))] println!("USB Veri Gönderildi (işleyici içinde).");
-    }
-
-    // TODO: Diğer kesme nedenleri (hata kesmeleri, bağlantı durum değişiklikleri vb.)
-
-    // 2. Kesme Bayrağını Temizleme (ÇOK ÖNEMLİ! - DONANIMA ÖZGÜ)**
-    // Kesme işlendikten sonra, kesme bayrağının TEMİZLENMESİ ZORUNLUDUR.
-    // Aksi takdirde, aynı kesme sürekli olarak tekrar tetiklenir ve sistem kilitlenir.
-    // MIPS'te bu genellikle çevre birimi kontrolcüsünün kendi register'ındaki bir biti
-    // yazarak/temizleyerek yapılır. Cause register IP bitleri genellikle donanım tarafından temizlenir
-    // veya EOI (End of Interrupt) mekanizması varsa onunla etkileşime girilir.
-    // **DİKKAT:** Kesme bayrağını temizleme yöntemi DONANIMA ÖZGÜDÜR! Kılavuza bakın!
-    unsafe {
-         let usb_irq_clear_register_address = USB_BASE_ADDRESS.wrapping_add(USB_IRQ_CLEAR_REGISTER_OFFSET); // Güvenli adres hesaplama
-         let mut usb_irq_clear_register = Volatile::new(usb_irq_clear_register_address as *mut u32); // Örnek: 32-bit register
-         usb_irq_clear_register.write(USB_IRQ_CLEAR_VALUE); // Örnek: Temizleme değerini yaz
-         // **UYARI:** USB_IRQ_CLEAR_REGISTER_OFFSET ve USB_IRQ_CLEAR_VALUE DONANIMA GÖRE DEĞİŞİR.
-         // Doğru yöntem için çipinizin ve USB kontrolcünüzün REFERANS KILAVUZUNA BAKIN.
-    }
-
-    // 3. (Opsiyonel) EOI (End of Interrupt) İşlemi
-    // MIPS'te harici bir Interrupt Controller (örn. PIC veya GIC benzeri) varsa,
-    // işleyicinin sonunda o kontrolcüye EOI sinyali göndermek gerekebilir.
-    // Bu da donanıma özgüdür.
-     write_eoi_register(...); // Donanıma özel
-
-    // NOTE: Kesme işleyiciden çıkış, MIPS exception mekanizması tarafından yönetilir.
-    // Genellikle exception vector noktasında durum geri yüklenir ve EPC + 4 ile ERET yönergesi kullanılır.
-    // Bu işleyici fonksiyonunun kendisi normal bir fonksiyon gibi geri döner (çekirdek exception vector noktasına).
 }
