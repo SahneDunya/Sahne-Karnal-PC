@@ -1,683 +1,485 @@
-#![no_std] // Standart kütüphaneye ihtiyacımız yok
-#![crate_type = "staticlib"] // Bu dosya bir statik kütüphane olarak derlenecek
-#![allow(dead_code)] // Geliştirme sırasında kullanılmayan kodlara izin ver
+#![no_std] // Kernel alanında çalışıyoruz, standart kütüphaneye ihtiyacımız yok.
 
-// Core kütüphanesinden gerekli öğeler
-use core::ptr::{read_volatile, write_volatile}; // Volatile okuma/yazma için
-use core::fmt::Write; // Yazma trait'i için (debug çıktısı için)
-use core::slice; // Slice işlemleri için
-use core::mem; // Bellek işlemleri için (örneğin size_of)
+// Karnal64 crate'inden/modülünden gerekli tipleri ve trait'leri içeri aktarın.
+// Gerçek bir projede bu, çekirdeğin build yapısına bağlı olacaktır.
+// Burada, daha önce incelediğimiz karnal64.rs dosyasındaki tanımların public olduğunu varsayıyoruz.
+// Kullanılan dummy 'karnal64' modülü dosyanın sonunda tanımlanmıştır, gerçek projede bu kaldırılır.
+use karnal64::{KError, KHandle, ResourceProvider};
+use karnal64::kresource::{KseekFrom, KResourceStatus, MODE_READ, MODE_WRITE};
+use karnal64::spin::Mutex; // Çekirdek içindeki spinlock mutex'i kullanacağız.
 
+// --- Kaynağa Özel Tipler ve Durum ---
 
-// 'volatile' krateri, bellek eşlemeli (memory-mapped) I/O için yapılandırılmış erişim sağlar.
-// Doğrudan ham pointer kullanmak yerine, kayıtları struct olarak tanımlamak için tercih edilebilir.
-use volatile::Volatile; // <-- Imported volatile crate
-
-
-// Panik durumunda ne yapılacağını tanımlayın (kernelde standart kütüphane yok).
-use core::panic::PanicInfo;
-
-
-// Sahne64 konsol makrolarını kullanabilmek için (çıktı/loglama amaçlı)
-// Bu makrolar Sahne64 crate'i tarafından sağlanır ve resource API'sini kullanır.
-// Bu crate'te kullanılabilir olmaları için uygun kurulum (örn. #[macro_use]) gereklidir.
-// Bu örnekte, #[cfg] ile std/no_std çıktısını ayarlayarak makroların
-// uygun ortamda kullanılabilir olduğunu varsayıyoruz.
- use sahne64::{println, eprintln}; // Örnek import eğer macro publicse
-
-// Çıktı makroları (Sahne64 console makrolarını kullanacak şekilde ayarlandı)
-// Eğer 'std' feature etkinse std::println! kullanılır.
-// Eğer 'std' feature etkin değilse (no_std), Sahne64 crate'inden gelen println! kullanılır.
-#[cfg(feature = "std")]
-macro_rules! kprintln {
-    () => (std::println!());
-    ($($arg:tt)*) => (std::println!($($arg)*));
-}
-#[cfg(not(feature = "std"))]
-macro_rules! kprintln {
-    () => (println!()); // Varsayım: Sahne64 println! makrosu
-    ($($arg:tt)*) => (println!($($arg)*)); // Varsayım: Sahne64 println! makrosu
+/// Yönettiğimiz 'srcio_risc' kaynağının bir örneğinin dahili durumu.
+/// Bu, kaynağın bellekteki temsili veya donanımına bir işaretçi olabilir.
+#[derive(Debug)]
+struct SrcioRiscInternalData {
+    buffer: [u8; 256], // Basit bir 256 byte'lık dahili tampon simülasyonu.
+    offset: u64,       // Bu kaynak örneği için mevcut okuma/yazma ofseti.
+    // Gerçek bir cihaz sürücüsü burada donanım register'larına veya daha karmaşık
+    // verilere erişim için alanlar tutabilir.
 }
 
-#[cfg(feature = "std")]
-macro_rules! kprint {
-    ($($arg:tt)*) => (std::print!($($arg)*));
-}
-#[cfg(not(feature = "std"))]
-macro_rules! kprint {
-    ($($arg:tt)*) => (print!($($arg)*)); // Varsayım: Sahne64 print! makrosu
-}
-
-
-// --- Sabitler ve Yapılandırmalar ---
-
-// USB Ana Makine Denetleyici (Host Controller) Temel Adresi
-// Bu adres, hedef donanımınıza (kendi çekirdeğinizin çalıştığı OpenRISC platformu) göre AYARLANMALIDIR.
-// OpenRISC'te I/O genellikle belirli bellek aralıklarına maplenir.
-// Örnek olarak, yaygın bir EHCI (Enhanced Host Controller Interface) denetleyicisi için varsayımsal bir adres:
-const USB_CONTROLLER_BASE_ADDRESS: usize = 0xFEDC_0000; // ÖRNEK DEĞER! OpenRISC Donanımınıza göre DEĞİŞTİRİLMELİ!
-
-// USB Denetleyici Kayıt偏移leri (Offset) - Bunlar kullanılan Host Controller tipine (EHCI, OHCI, xHCI vb.) özgüdür ve
-// denetleyicinin veri sayfalarından (datasheet) alınmalıdır. AŞAĞIDAKİLER EHCI ÖRNEĞİDİR.
-const USB_HC_CAPLENGTH_OFFSET: usize = 0x000; // Capability Register Length (offset from CAPLENGTH)
-const USB_HC_VERSION_OFFSET: usize = 0x002; // Host Controller Interface Version (offset from CAPLENGTH)
-
-const USB_HC_STRUCTURAL_PARAMETERS_OFFSET: usize = 0x004; // HCSPARAMS
-const USB_HC_CAPABILITY_PARAMETERS_OFFSET: usize = 0x008; // HCCPARAMS
-
-// Operational Registers (offsets relative to Base Address + CAPLENGTH)
-const USB_HC_COMMAND_OFFSET: usize = 0x040;  // USBCMD
-const USB_HC_STATUS_OFFSET: usize = 0x044;  // USBSTS
-const USB_HC_INTERRUPT_ENABLE_OFFSET: usize = 0x048; // USBINTREN
-const USB_HC_PORT_STATUS_AND_CONTROL_OFFSET: usize = 0x04C; // PORTSC1 (for first port) - Subsequent ports are at +0x4 offset
-const USB_HC_CONFIG_FLAG_OFFSET: usize = 0x050; // CONFIGFLAG
-const USB_HC_PERIODIC_FRAME_LIST_BASE_OFFSET: usize = 0x054; // PRRDICLISTBASE
-const USB_HC_ASYNC_LIST_BASE_OFFSET: usize = 0x058; // ASYNCLISTADDR
-
-// EHCI USBCMD Register Bitleri (Örnek)
-mod usb_cmd_bits {
-    pub const RUN_STOP: u32 = 1 << 0; // 1: HC Çalışıyor, 0: HC Durdu
-    pub const HC_RESET: u32 = 1 << 1; // 1: HC Resetle
-    pub const FRAME_LIST_SIZE: u32 = 3 << 2; // Frame List Size Mask (00=1024, 01=512, 10=256)
-    pub const PERIODIC_ENABLE: u32 = 1 << 4; // Periyodik Liste Etkinleştir
-    pub const ASYNC_ENABLE: u32 = 1 << 5;  // Asenkron Liste Etkinleştir
-    // ... diğer bitler
-}
-use usb_cmd_bits as uhci_cmd; // Kısa isim
-
-// EHCI USBSTS Register Bitleri (Örnek)
-mod usb_sts_bits {
-    pub const HC_HALTED: u32 = 1 << 12; // 1: HC Durdu
-    pub const PORT_CHANGE_DETECT: u32 = 1 << 2; // Port Durum Değişikliği Algılandı
-    pub const USB_INTERRUPT: u32 = 1 << 0; // USB Tamamlama Kesmesi (Transaction Completed Interrupt - PCI)
-    pub const ERROR_INTERRUPT: u32 = 1 << 1; // USB Hata Kesmesi (USB Error Interrupt - PCI)
-    // ... diğer bitler
-}
-use usb_sts_bits as uhci_sts; // Kısa isim
-
-
-// USB Cihaz Tanımlayıcı (Device Descriptor) Uzunluğu (tipik olarak 18 bayt)
-const USB_DEVICE_DESCRIPTOR_SIZE: usize = 18;
-
-// USB İsteği Türleri (bmRequestType baytının bit alanları)
- b7: Data Transfer Direction (0=Host to Device, 1=Device to Host)
- b6..5: Type (0=Standard, 1=Class, 2=Vendor, 3=Reserved)
- b4..0: Recipient (0=Device, 1=Interface, 2=Endpoint, 3=Other)
-const USB_REQ_TYPE_STANDARD_DEVICE_IN: u8 = 0x80; // 1000 0000
-const USB_REQ_TYPE_STANDARD_DEVICE_OUT: u8 = 0x00; // 0000 0000
-const USB_REQ_TYPE_STANDARD_INTERFACE_IN: u8 = 0x81; // 1000 0001
-const USB_REQ_TYPE_STANDARD_INTERFACE_OUT: u8 = 0x01; // 0000 0001
-const USB_REQ_TYPE_STANDARD_ENDPOINT_IN: u8 = 0x82; // 1000 0010
-const USB_REQ_TYPE_STANDARD_ENDPOINT_OUT: u8 = 0x02; // 0000 0010
-// ... diğer tipler ...
-
-
-// USB Standart İstek Kodları (bRequest için)
-const USB_REQ_GET_STATUS: u8 = 0x00;
-const USB_REQ_CLEAR_FEATURE: u8 = 0x01;
-// const USB_REQ_SET_FEATURE: u8 = 0x03; // Tanımlanmamış - yorum satırı yapıldı
-const USB_REQ_SET_ADDRESS: u8 = 0x05;
-const USB_REQ_GET_DESCRIPTOR: u8 = 0x06;
-const USB_REQ_SET_DESCRIPTOR: u8 = 0x07;
-const USB_REQ_GET_CONFIGURATION: u8 = 0x08;
-const USB_REQ_SET_CONFIGURATION: u8 = 0x09;
-const USB_REQ_GET_INTERFACE: u8 = 0x0A;
-const USB_REQ_SET_INTERFACE: u8 = 0x0B;
-const USB_REQ_SYNCH_FRAME: u8 = 0x0C;
-
-// USB Tanımlayıcı Tipleri (wValue'nun yüksek baytı, GET_DESCRIPTOR isteği için)
-const USB_DESC_TYPE_DEVICE_VAL: u16 = 0x0100;
-const USB_DESC_TYPE_CONFIGURATION_VAL: u16 = 0x0200;
-const USB_DESC_TYPE_STRING_VAL: u16 = 0x0300;
-const USB_DESC_TYPE_INTERFACE_VAL: u16 = 0x0400;
-const USB_DESC_TYPE_ENDPOINT_VAL: u16 = 0x0500;
-// ... diğer tanımlayıcı tipleri ...
-
-
-// --- Yapılar ---
-
-// USB Cihaz Tanımlayıcı Yapısı (Device Descriptor) - Örnek olarak temel alanlar
-#[repr(C, packed)] // C uyumlu düzen ve paketlenmiş yapı
-#[derive(Debug)] // Debug özelliği eklendi (derleme sırasında --cfg 'feature="debug"')
-pub struct UsbDeviceDescriptor {
-    bLength: u8,         // Tanımlayıcının boyutu (her zaman 18)
-    bDescriptorType: u8,   // Tanımlayıcı tipi (Cihaz Tanımlayıcı için 0x01)
-    bcdUSB: u16,          // USB spesifikasyonunun desteklenen sürümü (BCD formatında) (Little-endian)
-    bDeviceClass: u8,      // Cihaz sınıfı (0x00: arabirim tarafından tanımlanır, diğer sınıflar USB-IF tarafından tanımlanır)
-    bDeviceSubClass: u8,   // Cihaz alt sınıfı
-    bDeviceProtocol: u8,   // Cihaz protokolü
-    bMaxPacketSize0: u8,   // 0 numaralı uç noktanın maksimum paket boyutu
-    idVendor: u16,         // Üretici kimliği (VID) (Little-endian)
-    idProduct: u16,        // Ürün kimliği (PID) (Little-endian)
-    bcdDevice: u16,         // Cihaz sürüm numarası (BCD formatında) (Little-endian)
-    iManufacturer: u8,     // Üretici dizesi tanımlayıcı indeksi
-    iProduct: u8,          // Ürün dizesi tanımlayıcı indeksi
-    iSerialNumber: u8,     // Seri numarası dizesi tanımlayıcı indeksi
-    bNumConfigurations: u8, // Olası konfigürasyon sayısı
-}
-// statik olarak boyut kontrolü (isteğe bağlı, derleme zamanında kontrol sağlar)
-const _: () = assert!(core::mem::size_of::<UsbDeviceDescriptor>() == USB_DEVICE_DESCRIPTOR_SIZE);
-
-
-// --- MMIO Okuma/Yazma Yardımcı Fonksiyonları ---
-
-// Belleğe eşlenmiş G/Ç (MMIO) okuma fonksiyonu
-// `address`: Okunacak bellek adresi
-// `T`: Okunacak veri tipi (örn. u32, u16, u8). T volatile::Volatile<U> olmalıdır.
-/// # Güvenlik
-/// Ham bellek adresinden okuma yaptığı için 'unsafe'dır. Adresin geçerli olması çağırana bağlıdır.
-#[inline(always)] // Genellikle MMIO helper'ları inline yapmak performansı artırır.
-unsafe fn mmio_read<T>(address: usize) -> T {
-     // volatile::Volatile<U> tipindeki bir nesneye dönüşüm ve okuma
-    (address as *const T).read_volatile() // T = Volatile<U> beklenir, read_volatile Volatile'ın içindeki U'yu döndürür.
+/// 'srcio_risc' kaynağının bir örneğini temsil eden yapı.
+/// Bu yapı, Karnal64'ün KHandle aracılığıyla referans verdiği somut nesnedir.
+struct SrcioRiscResource {
+    id: u64, // Kaynak örneğinin benzersiz bir tanımlayıcısı (debugging için faydalı).
+    data: Mutex<SrcioRiscInternalData>, // Dahili durumu korumak için bir Mutex.
+    // Çekirdek kodunda eş zamanlı erişimi yönetmek önemlidir.
 }
 
-// Belleğe eşlenmiş G/Ç (MMIO) yazma fonksiyonu
-// `address`: Yazılacak bellek adresi
-// `value`: Yazılacak değer (U tipinde)
-// `T`: Yazma yapılan Volatile tipi (volatile::Volatile<U>)
-/// # Güvenlik
-/// Ham bellek adresine yazma yaptığı için 'unsafe'dır. Adresin geçerli olması çağırana bağlıdır.
-#[inline(always)] // Genellikle MMIO helper'ları inline yapmak performansı artırır.
-unsafe fn mmio_write<T>(address: usize, value: T) { // value T yerine U olmalıydı, T = Volatile<U> değil, U tipinde olmalı.
-     // volatile::Volatile<U> tipindeki bir nesneye dönüşüm ve yazma
-     // Bu kullanım, T'nin Volatile<U> olduğu durumda T'yi doğrudan yazmaya çalışır.
-     // Doğrusu: value U tipinde olmalı ve write_volatile'a U *mut pointer verilmelidir.
-     (address as *mut T).write_volatile(value); // T = U beklenir, write_volatile U'yu yazar.
-}
+// --- ResourceProvider Trait Implementasyonu ---
 
-// Düzeltilmiş MMIO helper'ları (Volatile crate'i ile uyumlu hale getirildi - Read/Write metodunu kullanmak için Volatile sarmalayıcısı adres pointer'ına uygulanır)
-// veya ham pointerlarla (mmio_read/write) Volatile kullanmadan devam edilebilir.
-// Mevcut kod ham pointer + read_volatile/write_volatile kullanıyor, bu da doğru.
-// mmio_read<T>/mmio_write<T> imzaları biraz yanıltıcı, T read_volatile/write_volatile'ın beklediği tip olmalı (örn. u32, u8).
-// Mevcut kullanımlara uyum sağlamak için imzaları U olarak tutalım ve T'yi Unsafe fn içinde cast edelim.
+// Karnal64'ün beklentilerine uygun olarak ResourceProvider trait'ini implemente ediyoruz.
+impl ResourceProvider for SrcioRiscResource {
+    /// Kaynaktan veri okur. Karnal64 resource_read API fonksiyonu tarafından çağrılır.
+    /// `buffer`: Okunan verinin yazılacağı, kullanıcının sağladığı (ve çekirdekçe doğrulanmış) tampon.
+    /// `_offset`: İstenen okuma ofseti. Basit kaynaklar bu ofseti kullanmayıp kendi iç ofsetini takip edebilir.
+    fn read(&self, buffer: &mut [u8], _offset: u64) -> Result<usize, KError> {
+        // Dahili duruma güvenli erişim için mutex'i kilitler.
+        let mut data = self.data.lock();
+        let internal_buffer = &data.buffer;
+        let internal_offset = data.offset; // Kendi iç ofsetimizi kullanıyoruz.
 
- #[inline(always)]
- unsafe fn mmio_read_u32(address: usize) -> u32 {
-     (address as *const u32).read_volatile()
- }
+        if internal_offset as usize >= internal_buffer.len() {
+            // Okuma ofseti tampon boyutunu aştı, okunacak veri yok.
+              kprintln!("SrcioRiscResource {}: EOF reached at offset {}", self.id, internal_offset);
+            return Ok(0);
+        }
 
- #[inline(always)]
- unsafe fn mmio_write_u32(address: usize, value: u32) {
-     (address as *mut u32).write_volatile(value);
- }
+        // Okunabilecek maksimum byte sayısını hesapla (kullanıcı tamponu ve kalan veri limitleri).
+        let remaining_len = internal_buffer.len().saturating_sub(internal_offset as usize);
+        let read_len = core::cmp::min(buffer.len(), remaining_len);
 
-// Diğer boyutlar için de eklenebilir:
- unsafe fn mmio_read_u8(address: usize) -> u8 { (address as *const u8).read_volatile() }
- unsafe fn mmio_write_u8(address: usize, value: u8) { (address as *mut u8).write_volatile(value) }
- unsafe fn mmio_read_u16(address: usize) -> u16 { (address as *const u16).read_volatile() }
- unsafe fn mmio_write_u16(address: usize, value: u16) { (address as *mut u16).write_volatile(value) }
+        if read_len == 0 {
+            // Kullanıcı tamponu 0 boyutunda veya okunacak 0 byte var.
+              kprintln!("SrcioRiscResource {}: Read request size is 0", self.id);
+            return Ok(0);
+        }
 
+        // Veriyi dahili tampondaki mevcut ofsetten kullanıcı tamponuna kopyala.
+        // Güvenlik notu: Kullanıcı tamponu pointer'ı (burada slice olarak geçiriliyor)
+        // Karnal64 resource_read API fonksiyonu tarafından zaten doğrulanmış olmalıdır.
+        buffer[..read_len].copy_from_slice(&internal_buffer[internal_offset as usize..(internal_offset as usize + read_len)]);
 
-// USB Denetleyici Kayıt Erişim Fonksiyonları (Okuma)
-// Bu fonksiyonlar, belirli EHCI kayıtlarını okumak için MMIO yardımcılarını kullanır.
-// # Güvenlik
-// Alt seviye MMIO helper'ları 'unsafe' olduğu için bu fonksiyonlar da 'unsafe' olmalıdır.
-pub unsafe fn read_hc_version() -> u16 { // Version reg 16 bit (bcd formatında)
-     mmio_read_u32(USB_CONTROLLER_BASE_ADDRESS + USB_HC_CAPLENGTH_OFFSET + USB_HC_VERSION_OFFSET - 2) as u16 // Version EHCI CAPLENGTH + 2 de başlar
-      mmio_read_u16(USB_CONTROLLER_BASE_ADDRESS + USB_HC_CAPLENGTH_OFFSET + 0x02) // Eğer u16 okuyucu varsa
-}
+        // Okunan byte sayısına göre iç ofseti güncelle.
+        data.offset += read_len as u64;
 
-pub unsafe fn read_hc_caplength() -> u8 { // Caplength 8 bit
-     mmio_read_u32(USB_CONTROLLER_BASE_ADDRESS + USB_HC_CAPLENGTH_OFFSET) as u8 // İlk bayt
-     mmio_read_u8(USB_CONTROLLER_BASE_ADDRESS + USB_HC_CAPLENGTH_OFFSET) // Eğer u8 okuyucu varsa
-}
+        // Çekirdek içi loglama (kprintln! gibi bir makro gerektirir)
+         kprintln!("SrcioRiscResource {}: Read {} bytes from offset {}", self.id, read_len, internal_offset);
 
-// Hesaplanan Operational Register Base Adresi (Base + Caplength)
-unsafe fn get_operational_registers_base() -> usize {
-    let caplength = read_hc_caplength() as usize; // Okunan Capability Register Length
-    USB_CONTROLLER_BASE_ADDRESS.wrapping_add(caplength) // Base + Caplength = Operational Registers Base
-}
-
-
-// Operational Register Erişim Fonksiyonları (Okuma)
-// # Güvenlik
-// Alt seviye MMIO helper'ları ve Operational Register Base hesaplama 'unsafe' olduğu için bu fonksiyonlar da 'unsafe' olmalıdır.
-pub unsafe fn read_hc_command() -> u32 {
-     let op_reg_base = get_operational_registers_base();
-     mmio_read_u32(op_reg_base + USB_HC_COMMAND_OFFSET)
-}
-
-pub unsafe fn read_hc_status() -> u32 {
-     let op_reg_base = get_operational_registers_base();
-     mmio_read_u32(op_reg_base + USB_HC_STATUS_OFFSET)
-}
-
-pub unsafe fn read_hc_interrupt_enable() -> u32 {
-     let op_reg_base = get_operational_registers_base();
-     mmio_read_u32(op_reg_base + USB_HC_INTERRUPT_ENABLE_OFFSET)
-}
-
-// Port 1 Durum ve Kontrol Kaydı (EHCI'da PORTSC1)
-pub unsafe fn read_hc_port_status_and_control(port_num: u8) -> u32 {
-     let op_reg_base = get_operational_registers_base();
-     // PORTSC registerları ardışık memory adreslerindedir. Port N için offset = PORTSC1_OFFSET + (N-1) * 4 (32-bit register)
-     let port_offset = USB_HC_PORT_STATUS_AND_CONTROL_OFFSET.wrapping_add(((port_num - 1) as usize) * mem::size_of::<u32>());
-     mmio_read_u32(op_reg_base + port_offset)
-}
-
-
-// USB Denetleyici Kayıt Erişim Fonksiyonları (Yazma)
-// # Güvenlik
-// Alt seviye MMIO helper'ları ve Operational Register Base hesaplama 'unsafe' olduğu için bu fonksiyonlar da 'unsafe' olmalıdır.
-pub unsafe fn write_hc_command(value: u32) {
-     let op_reg_base = get_operational_registers_base();
-     mmio_write_u32(op_reg_base + USB_HC_COMMAND_OFFSET, value);
-}
-
-pub unsafe fn write_hc_status(value: u32) { // STS kaydı yazarak bayrakları temizler (W1C)
-     let op_reg_base = get_operational_registers_base();
-     mmio_write_u32(op_reg_base + USB_HC_STATUS_OFFSET, value);
-}
-
-pub unsafe fn write_hc_interrupt_enable(value: u32) {
-     let op_reg_base = get_operational_registers_base();
-     mmio_write_u32(op_reg_base + USB_HC_INTERRUPT_ENABLE_OFFSET, value);
-}
-
-pub unsafe fn write_hc_interrupt_disable(value: u32) {
-     // EHCI'da INTREN'e yazmak EN, INTRDISE kaydına yazmak DIS'tir.
-     // Bu fonksiyon INTREN'e yazarak kesme etkinleştirir, disable için başka fonksiyon gerekir.
-     // Fonksiyon adı yanlış, enable olmalıydı veya disable kaydı farklı olmalıydı.
-     // EHCI'da ayrı bir Disable register'ı yoktur, sadece Enable register'ına 0 yazarak disable edilir.
-     // Bu fonksiyon adı tutarsız, adını değiştirelim veya kaldıralım.
-      write_hc_interrupt_enable(read_hc_interrupt_enable() & !value); // Disable için bu mantık kullanılabilir
-     kprintln!("UYARI: write_hc_interrupt_disable fonksiyonu EHCI spesifikasyonuyla uyumlu değil.");
-     // EHCI'da interrupt_enable registerına 0 yazarak disable edilir.
-     // Bu fonksiyonu kullanmak yerine write_hc_interrupt_enable(0) veya maskeleme kullanılmalı.
-     // Şimdilik kaldırıyoruz, yerine write_hc_interrupt_enable kullanılsın.
-      let op_reg_base = get_operational_registers_base();
-      mmio_write_u32(op_reg_base + USB_HC_INTERRUPT_DISABLE_OFFSET, value); // Bu offset EHCI'da yok!
-}
-
-// Port Durum ve Kontrol Kaydına Yazma (EHCI'da PORTSC1)
-pub unsafe fn write_hc_port_status_and_control(port_num: u8, value: u32) {
-     let op_reg_base = get_operational_registers_base();
-     let port_offset = USB_HC_PORT_STATUS_AND_CONTROL_OFFSET.wrapping_add(((port_num - 1) as usize) * mem::size_of::<u32>());
-     mmio_write_u32(op_reg_base + port_offset, value);
-}
-
-// USB Denetleyici Yapılandırma Kaydına Yazma (EHCI CONFIGFLAG)
-pub unsafe fn write_hc_config_flag(value: u32) { // İsim düzeltildi: CONFIGFLAG
-     let op_reg_base = get_operational_registers_base();
-     mmio_write_u32(op_reg_base + USB_HC_CONFIG_OFFSET, value);
-}
-
-
-// --- Yüksek Seviye Fonksiyonlar (Örnek olarak Cihaz Tanımlayıcı Okuma) ---
-
-// USB Cihaz Tanımlayıcısını Okuma (Örnek Fonksiyon)
-// Endpoint 0 (kontrol endpoint) üzerinden aygıt tanımlayıcısını okumayı dener.
-/// # Güvenlik
-/// Alt seviye kontrol transfer fonksiyonu 'unsafe' olduğu için bu fonksiyon da 'unsafe' olmalıdır.
-pub unsafe fn get_usb_device_descriptor() -> Option<UsbDeviceDescriptor> { // endpoint_address parametresi kaldırıldı, EP0 kullanılır
-    kprintln!("USB Cihaz Tanımlayıcısı Okunuyor...");
-    // descriptor için static veya heap'ten tahsis edilmiş bir arabellek gerekli.
-    // Örnekte, control_transfer_in doğrudan descriptor struct'ına yazıyor (eğer buffer_size yeterliyse).
-    // Bu yaklaşım, descriptor boyutunun sabit olması durumunda pratiktir.
-
-    let mut descriptor_buffer: [u8; USB_DEVICE_DESCRIPTOR_SIZE] = [0u8; USB_DEVICE_DESCRIPTOR_SIZE]; // Stack'te arabellek
-    let descriptor_ptr = descriptor_buffer.as_mut_ptr();
-
-    let transfer_result = control_transfer_in(
-         0, // Uç nokta adresi 0 (kontrol uç noktası)
-         USB_REQ_TYPE_STANDARD_DEVICE_IN, // bmRequestType: Standart cihaz isteği, IN yönü
-         USB_REQ_GET_DESCRIPTOR, // bRequest: GET_DESCRIPTOR isteği (0x06)
-         USB_DESC_TYPE_DEVICE_VAL,   // wValue: Tanımlayıcı tipi (Device Descriptor 0x0100)
-         0,                      // wIndex: Genellikle 0 (Language ID veya Interface/Endpoint Index olabilir)
-         USB_DEVICE_DESCRIPTOR_SIZE as u16, // wLength: Okunacak boyut (18 bayt)
-         descriptor_ptr, // Veri tamponu pointer'ı
-         USB_DEVICE_DESCRIPTOR_SIZE, // Tampon boyutu
-    );
-
-    if transfer_result.is_ok() {
-         // Başarılı transfer sonrası, arabellekteki baytları struct'a kopyalayabilir veya arabelleği doğrudan struct pointer olarak kullanabiliriz.
-         // #[repr(C, packed)] sayesinde direct cast genellikle çalışır, ancak memcpy daha güvenlidir.
-         let mut descriptor = UsbDeviceDescriptor { // Sıfır değerleri ile başlatma
-             bLength: 0, bDescriptorType: 0, bcdUSB: 0, bDeviceClass: 0,
-             bDeviceSubClass: 0, bDeviceProtocol: 0, bMaxPacketSize0: 0,
-             idVendor: 0, idProduct: 0, bcdDevice: 0, iManufacturer: 0,
-             iProduct: 0, iSerialNumber: 0, bNumConfigurations: 0,
-         };
-         // Descriptor bytes'ı struct'a kopyala
-         ptr::copy_nonoverlapping(descriptor_ptr, &mut descriptor as *mut UsbDeviceDescriptor as *mut u8, USB_DEVICE_DESCRIPTOR_SIZE);
-
-         // Descriptor'ın ilk iki baytını kontrol et (uzunluk ve tip)
-         if descriptor.bLength == USB_DEVICE_DESCRIPTOR_SIZE as u8 && descriptor.bDescriptorType == 0x01 {
-             kprintln!("USB Cihaz Tanımlayıcısı Başarıyla Okundu.");
-             #[cfg(feature = "debug")]
-             kprintln!("Descriptor Detayları: {:?}", descriptor);
-             Some(descriptor)
-         } else {
-             kprintln!("HATA: USB Cihaz Tanımlayıcısı Boyut/Tip Uyuşmuyor (Uzunluk: {}, Tip: {:02x})", descriptor.bLength, descriptor.bDescriptorType);
-             None // Boyut veya tip yanlışsa None
-         }
-    } else {
-        kprintln!("USB Cihaz Tanımlayıcı Okuma Transfer Hatası!");
-        None // Hata durumunda None döndür
+        Ok(read_len) // Başarıyla okunan byte sayısını döndür.
     }
-}
 
+    /// Kaynağa veri yazar. Karnal64 resource_write API fonksiyonu tarafından çağrılır.
+    /// `buffer`: Yazılacak veriyi içeren, kullanıcının sağladığı (ve çekirdekçe doğrulanmış) tampon.
+    /// `_offset`: İstenen yazma ofseti. Basit kaynaklar bu ofseti kullanmayıp kendi iç ofsetini takip edebilir.
+    fn write(&self, buffer: &[u8], _offset: u64) -> Result<usize, KError> {
+        let mut data = self.data.lock(); // Dahili duruma güvenli erişim.
+        let internal_buffer = &mut data.buffer;
+        let internal_offset = data.offset; // Kendi iç ofsetimizi kullanıyoruz.
 
-// --- Alt Seviye USB Kontrol Transfer Fonksiyonu (ÖRNEK - Gerçek Donanıma Göre Uyum Sağlanmalı) ---
+         if internal_offset as usize >= internal_buffer.len() {
+             // Yazma ofseti tampon boyutunu aştı, yazma yapamayız (bu basit tampon için).
+              kprintln!("SrcioRiscResource {}: Buffer full, cannot write at offset {}", self.id, internal_offset);
+             return Err(KError::OutOfMemory); // Veya KError::InvalidArgument, NotSupported.
+         }
 
-// USB Kontrol 'IN' Transferi (Cihazdan veri okuma)
-// **DİKKAT**: Bu fonksiyon ÇOK BASİT bir örnek iskelettir.
-// Gerçek bir donanım sürücüsünde, USB ana makine denetleyicinizin
-// (örn. EHCI, OHCI, xHCI) spesifikasyonlarına GÖRE UYARLANMALIDIR.
-// Hata yönetimi, zaman aşımları, kesmeler vb. gibi birçok detay eksiktir.
-// EHCI için Queue Head (QH) ve Transfer Descriptor (TD) veri yapıları hazırlanır,
-// DMA kullanılır ve Denetleyici Asenkron Listesi (Async List) veya Periyodik Listeye (Periodic List) eklenir.
-/// # Güvenlik
-/// Donanım registerlarına doğrudan erişim, ham pointer (data_buffer) kullanımı ve
-/// donanıma özgü bekleme/durum kontrolü içerdiğinden 'unsafe'dır. data_buffer geçerli olmalıdır.
-unsafe fn control_transfer_in(
-    endpoint_address: u8,
-    request_type: u8,
-    request: u8,
-    value: u16,
-    index: u16,
-    length: u16,
-    data_buffer: *mut u8,
-    buffer_size: usize, // Sağlanan tamponun gerçek boyutu
-) -> Result<(), &'static str> {
+        // Yazılabilecek maksimum byte sayısını hesapla.
+        let remaining_len = internal_buffer.len().saturating_sub(internal_offset as usize);
+        let write_len = core::cmp::min(buffer.len(), remaining_len);
 
-    kprintln!("Kontrol Transferi (IN) Başlatılıyor (EP: {}, ReqType: {:02x}, Req: {:02x}, Len: {})",
-        endpoint_address, request_type, request, length);
+         if write_len == 0 {
+             // Kullanıcı tamponu 0 boyutunda veya yazılabilecek 0 byte var.
+               kprintln!("SrcioRiscResource {}: Write request size is 0", self.id);
+             return Ok(0);
+         }
 
-    // **DİKKAT: AŞAĞIDAKİ KOD GERÇEK BİR EHCI/USB KONTROLCÜ SÜRÜCÜSÜ DEĞİLDİR.**
-    // **BU SADECE KAVRAMLARI TEMSİL ETMEK İÇİN YAZILMIŞ HAYALİ KODDUR.**
-    // **GERÇEK DONANIMINIZIN DATASHEET'İNE GÖRE TAMAMEN YENİDEN YAZILMASI GEREKİR.**
+        // Veriyi kullanıcı tamponundan dahili tampondaki mevcut ofsete kopyala.
+        // Güvenlik notu: Kullanıcı tamponu pointer'ı (burada slice olarak geçiriliyor)
+        // Karnal64 resource_write API fonksiyonu tarafından zaten doğrulanmış olmalıdır.
+        internal_buffer[internal_offset as usize..(internal_offset as usize + write_len)].copy_from_slice(&buffer[..write_len]);
 
-    // 1. Komut Hazırlama (USB isteği kurulumu - SETUP Paketi)
-    //    Bu bölüm, USB isteğini (setup paketini) oluşturmayı ve
-    //    ana makine denetleyicinin komut kuyruğuna (command queue) eklemeyi içerir.
-    //    **DENETLEYİCİYE ÖZGÜ KOMUT FORMATI VE VERİ YAPILARI (QH, TD) KULLANILMALIDIR.**
+        // Yazılan byte sayısına göre iç ofseti güncelle.
+        data.offset += write_len as u64;
 
-    let setup_packet: [u8; 8] = [ // USB Kontrol Transfer Setup Paketi (8 bayt)
-        request_type,
-        request,
-        value as u8,        // wValue (low byte)
-        (value >> 8) as u8, // wValue (high byte)
-        index as u8,        // wIndex (low byte)
-        (index >> 8) as u8, // wIndex (high byte)
-        length as u8,       // wLength (low byte)
-        (length >> 8) as u8, // wLength (high byte)
-    ];
+        // Çekirdek içi loglama
+         kprintln!("SrcioRiscResource {}: Written {} bytes at offset {}", self.id, write_len, internal_offset);
 
-    // **HAYALİ EHCI İŞLEM AKIŞI TEMSİLİ:**
-    // - Bellekte bir Queue Head (QH) ve bir veya daha fazla Transfer Descriptor (TD) yapısı hazırla.
-    // - SETUP TD'sini oluştur (setup_packet adresini ve uzunluğunu içerir).
-    // - DATA TD(ler)ini oluştur (data_buffer adresini, uzunluğunu ve yönünü içerir).
-    // - STATUS TD'sini oluştur (0 uzunluklu, karşı yönü gösterir).
-    // - Bu TD'leri QH'ye bağla.
-    // - QH'yi HC'nin Asenkron Listesine ekle (veya varsa Komut Kuyruğuna).
-    // - HC'ye listeyi işlemesini bildir (USBCMD registerındaki ilgili biti set ederek).
+        Ok(write_len) // Başarıyla yazılan byte sayısını döndür.
+    }
 
-    // **ÖRNEK: Kontrolcü Komut/Kontrol Kaydına yazarak transferi başlatma sinyali (ÇOK BASİT TEMSİLİ)**
-    unsafe {
-        let op_reg_base = get_operational_registers_base();
-        let command_reg_addr = op_reg_base.wrapping_add(USB_HC_COMMAND_OFFSET);
-        let status_reg_addr = op_reg_base.wrapping_add(USB_HC_STATUS_OFFSET);
+    /// Kaynağa özel kontrol komutlarını işler (ioctl benzeri).
+    /// `request`: Komut numarası veya kodu.
+    /// `arg`: Komuta eşlik eden argüman.
+    /// Komuta özel bir sonuç değeri veya hata döndürür.
+    fn control(&self, request: u64, arg: u64) -> Result<i64, KError> {
+        let mut data = self.data.lock(); // Dahili duruma güvenli erişim.
 
-        // **DİKKAT: AŞAĞIDAKİ MMIO YAZMA İŞLEMİ HAYALİDİR VE GERÇEK DENETLEYİCİ MEKANİZMASINI TEMSİL ETMEZ.**
-        // Gerçekte, USBCMD registerındaki Async Schedule Enable (ASE) gibi bitler ve
-        // ASYNCLISTADDR registerı kullanılır.
-         mmio_write_u32(command_reg_addr, 0x12345678); // ÖRNEK DEĞER! Denetleyici Komut Kaydına Hayali Yazma
-
-        // TODO: Transferin tamamlanmasını bekle (Polling veya Kesme)
-        // EHCI'da bu, TD'deki durum bitlerini kontrol etmek veya USBCMD'deki 'Run/Stop' bitini kontrol etmek olabilir.
-        // Veya bir Transfer Tamamlama Kesmesi (PCI) beklemek.
-        let mut timeout = 100000; // Basit zaman aşımı sayacı (Örnek)
-        let transfer_done_bit: u32 = 1 << 0; // Örnek Transfer Tamamlama Biti (PCI)
-        let error_bit: u32 = 1 << 1; // Örnek Hata Biti (UEI)
-
-        let mut status = mmio_read_u32(status_reg_addr);
-        while (status & (transfer_done_bit | error_bit)) == 0 && timeout > 0 {
-             core::hint::spin_loop(); // Basit polleme
-             status = mmio_read_u32(status_reg_addr);
-             timeout -= 1;
+        match request {
+            1 => { // Örnek: Dahili ofseti sıfırlama komutu.
+                data.offset = 0;
+                 kprintln!("SrcioRiscResource {}: Control command 1 (Reset Offset) executed.", self.id);
+                Ok(0) // Başarı, genellikle 0 döndürülür.
+            },
+            2 => { // Örnek: Mevcut ofseti döndürme komutu.
+                let current_offset = data.offset;
+                 kprintln!("SrcioRiscResource {}: Control command 2 (Get Offset) returned {}", self.id, current_offset);
+                Ok(current_offset as i64) // Ofseti i64 olarak döndür.
+            },
+            3 => { // Örnek: Tamponu belirli bir byte ile doldurma komutu.
+                let fill_byte = arg as u8;
+                for byte in data.buffer.iter_mut() {
+                    *byte = fill_byte;
+                }
+                  kprintln!("SrcioRiscResource {}: Control command 3 (Fill Buffer) with byte {}", self.id, fill_byte);
+                Ok(data.buffer.len() as i64) // Tampon boyutunu döndür.
+            }
+            _ => {
+                // Bilinmeyen veya desteklenmeyen kontrol komutu.
+                  kprintln!("SrcioRiscResource {}: Unsupported control request {}", self.id, request);
+                Err(KError::NotSupported)
+            }
         }
+    }
 
-        if timeout == 0 {
-             kprintln!("HATA: Kontrol Transferi Zaman Aşımı!");
-             // TODO: Zaman aşımı durumunda kurtarma (HC reset, port reset vb.)
-             return Err("Zaman Aşımı");
-        }
+    /// Kaynağın okuma/yazma ofsetini değiştirir.
+    /// `position`: Seek işleminin başlangıç noktası ve ofseti (`KseekFrom::Start`, `Current`, `End`).
+    /// Başarılı olursa yeni ofseti, hata durumunda KError döndürür.
+    fn seek(&self, position: KseekFrom) -> Result<u64, KError> {
+         let mut data = self.data.lock(); // Dahili duruma güvenli erişim.
+         let current_offset = data.offset;
+         let buffer_len = data.buffer.len() as u64; // Tamponun toplam boyutu.
 
-         // Kesme durumunu temizle (W1C)
-         mmio_write_u32(status_reg_addr, status & (transfer_done_bit | error_bit)); // Sadece ilgili bitleri temizle
-
-        // TODO: TD/QH yapılarından transfer durumunu ve hata kodlarını oku.
-        // Başarı durumunu ve kaç bayt transfer edildiğini belirle.
-        // Eğer hata oluştuysa, hangi hata olduğunu belirle (STALL, NAK, CRC hatası vb.).
-
-        // **TEMSİLİ: Durum kontrolü**
-        if (status & error_bit) != 0 {
-             kprintln!("HATA: Kontrol Transferinde Hata Biti Set Oldu!");
-             // TODO: Hata detaylarını oku ve uygun kurtarma yap (Endpoint STALL temizleme vb.)
-             return Err("Donanım Hatası");
-        }
-
-        // 2. Veri Transferi (Simüle Edilmiş)
-        //    Denetleyici, USB cihazından gelen veriyi belirli bir bellek bölgesine (DMA tamponu) yazar.
-        //    Bu bölgeden veriyi sağlanan 'data_buffer'a kopyalamamız gerekir.
-        //    **VERİ OKUMA MEKANİZMASI DENETLEYİCİYE GÖRE DEĞİŞİR.**
-        //    EHCI'da DMA yaygın kullanılır.
-
-        // **TEMSİLİ KOD BAŞLANGICI**
-        //    Burada, verinin HAYALİ bir DMA tamponunda (buffer_address - HAYALİ) olduğunu varsayıyoruz.
-        //    Gerçekte, bu adres önceden tahsis edilmiş bir DMA-safe arabelleğin adresi olur.
-        let buffer_address: usize = 0xABCDEF00; // **TAMAMEN HAYALİ DMA TAMPON ADRESİ**
-        let transferred_bytes = length as usize; // Örnek: Beklenen kadar transfer edildiğini varsayalım
-
-        // **TEMSİLİ: Veriyi HAYALİ DMA tamponundan al ve sağlanan 'data_buffer'a kopyala**
-        //    Gerçekte, denetleyici DMA ile veriyi 'data_buffer'a (eğer DMA-safe ise) veya
-        //    ayrı bir DMA tamponuna yazmıştır.
-        //    Aşağıdaki döngü TEMSİLİDİR ve gerçek DMA veya veri alma mekanizmasını YANSITMAZ.
-        if !data_buffer.is_null() && transferred_bytes > 0 && transferred_bytes <= buffer_size {
-             // HAYALİ DMA tamponundan oku ve hedef arabelleğe yaz
-             let src_ptr = buffer_address as *const u8; // HAYALİ KAYNAK ADRES
-             let dest_ptr = data_buffer; // Hedef arabellek pointer'ı
-
-             // Bellekten belleğe kopyalama (örnek)
-             for i in 0..transferred_bytes {
-                  // Kaynak adresten volatile okuma ve hedef adrese volatile yazma (veya memcpy kullanma)
-                  let byte = (src_ptr.add(i) as *const u8).read_volatile(); // HAYALİ KAYNAKTAN VOLATILE OKU
-                  (dest_ptr.add(i) as *mut u8).write_volatile(byte); // HEDEFE VOLATILE YAZ
+         let new_offset: u64 = match position {
+             KseekFrom::Start(offset) => {
+                 // Başlangıca göre seek. Ofset doğrudan yeni ofsettir.
+                 offset
              }
-        } else if transferred_bytes > buffer_size {
-             kprintln!("HATA: Kontrol Transferi Okunan Boyut Tampondan Büyük! (Okunan: {}, Tampon: {})", transferred_bytes, buffer_size);
-             // Bu bir faz hatası (Phase Error) veya yazılım hatası olabilir.
-             return Err("Tampon Yetersiz");
-        }
-        // TODO: Eğer data_buffer NULL ise ve length > 0 ise (SETUP veya STATUS aşaması), veri transferi yapılmamalıdır.
+             KseekFrom::Current(offset) => {
+                 // Mevcut ofsete göre seek. Signed offset'i doğru şekilde işle.
+                 if offset >= 0 {
+                     current_offset.saturating_add(offset as u64) // Taşmayı önlemek için saturating_add kullan.
+                 } else {
+                      current_offset.saturating_sub((-offset) as u64) // Signed negatif ofseti u64'e çevirerek çıkar.
+                 }
+             }
+             KseekFrom::End(offset) => {
+                  // Sona göre seek. Signed offset'i son konuma göre işle.
+                  // Bu basit kaynakta, tampon sonunu kullanıyoruz.
+                  // Gerçek bir dosyada, dosyanın mevcut boyutunu kullanırsınız.
+                  if offset >= 0 {
+                     buffer_len.saturating_add(offset as u64) // Sonun ötesine seek (kaynak destekliyorsa).
+                  } else {
+                     buffer_len.saturating_sub((-offset) as u64) // Sondan geri seek.
+                  }
+             }
+         };
 
-        // 3. STATUS Aşaması (Otomatik veya Manuel - Kontrolcüye Bağlı)
-        // EHCI genellikle STATUS aşamasını otomatik yönetir.
+         // Yeni ofsetin geçerli olup olmadığını kontrol et.
+         // Bu basit tampon kaynağında, tampon boyutunu aşan seek'lere izin vermeyelim.
+         if new_offset > buffer_len {
+              kprintln!("SrcioRiscResource {}: Seek out of bounds: attempted {} > {}", self.id, new_offset, buffer_len);
+             return Err(KError::InvalidArgument); // Geçersiz ofset hatası.
+         }
 
-        // Kontrol Transferinin Başarılı Tamamlandığını Varsayalım (Yukarıdaki hata kontrolü başarılıysa)
-        Ok(())
-
-        // **DİKKAT**: Bu fonksiyonun hata yönetimi, kesme işleme, zaman aşımları,
-        //       DMA yönetimi, PID senkronizasyonu, paket bölme gibi
-        //       kritik kısımları ÇOK BASİTTİR ve GERÇEK BİR UYGULAMA İÇİN YETERSİZDİR.
-        //       Gerçek bir sürücüde bu bölümler çok daha detaylı ve sağlam olmalıdır.
+         // Ofseti güncelle.
+         data.offset = new_offset;
+          kprintln!("SrcioRiscResource {}: Seeked to new offset {}", self.id, new_offset);
+         Ok(new_offset) // Yeni ofseti döndür.
     }
 
-
-// --- Çekirdek Giriş Noktası (Örnek - Kendi Çekirdeğinize Uygun Hale Getirin) ---
-
-// Çekirdek modülü giriş fonksiyonu (OpenRISC çekirdeğinize göre düzenleyin)
-// Bu fonksiyon, çekirdek yüklendiğinde veya başlatıldığında çağrılır.
-#[no_mangle] // İsim bozmayı engelle (linker için)
-pub extern "C" fn init_module() -> i32 {
-     kprintln!("srcio_openrisc.rs: USB Sürücü Modülü Başlatılıyor (OpenRISC)...");
-
-     // Sahne64 konsol makrolarının std dışı ortamda çalışması için gerekli
-     // ilk ayarlar burada veya platform başlangıcında yapılmalıdır.
-     // Örnekte kprintln! Sahne64 makrolarını kullanıyor (varsayım).
-
-
-    // 1. USB Ana Makine Denetleyiciyi Başlatma
-    // Denetleyici adresinin geçerli olduğu unsafe block içinde çalış.
-    unsafe {
-         // a. Denetleyiciyi Sıfırlama (varsa, denetleyiciye özgü sıfırlama prosedürü)
-         //    Örneğin, EHCI için USBCMD registerındaki HC Reset bitini set et ve bitin temizlenmesini bekle.
-          let op_reg_base = get_operational_registers_base();
-          let command_reg_addr = op_reg_base.wrapping_add(USB_HC_COMMAND_OFFSET);
-          let status_reg_addr = op_reg_base.wrapping_add(USB_HC_STATUS_OFFSET);
-          let halted_bit = uhci_sts::HC_HALTED; // HC Halted biti
-
-          kprintln!("HC Resetleniyor...");
-          mmio_write_u32(command_reg_addr, uhci_cmd::HC_RESET); // Reset Bitini Set Et
-          // Reset bitinin temizlenmesini ve HC'nin durmasını bekle
-          while (mmio_read_u32(command_reg_addr) & uhci_cmd::HC_RESET) != 0 || (mmio_read_u32(status_reg_addr) & halted_bit) == 0 {
-               core::hint::spin_loop();
-          }
-          kprintln!("HC Resetlendi.");
-
-         // b. Denetleyiciyi Çalıştırma (Run) Moduna Alma
-         //    USBCMD registerındaki Run/Stop bitini set et.
-         kprintln!("HC Çalıştırma Moduna Alınıyor...");
-         let mut command_reg = mmio_read_u32(command_reg_addr);
-         command_reg |= uhci_cmd::RUN_STOP;
-         mmio_write_u32(command_reg_addr, command_reg);
-         // HC'nin çalışmaya başlamasını bekle (HCHalted bitinin temizlenmesini bekle)
-          while (mmio_read_u32(status_reg_addr) & halted_bit) != 0 {
-               core::hint::spin_loop();
-          }
-          kprintln!("HC Çalışıyor.");
-
-         // c. Root Hub Yapılandırması (Portları Etkinleştirme, Resetleme)
-         //    PORTSC registerları üzerinden yapılır.
-         // TODO: Bağlı portları algıla ve resetle.
-         kprintln!("Root Hub Portları Yapılandırılıyor (Örnek)...");
-         let num_ports = (mmio_read_u32(USB_CONTROLLER_BASE_ADDRESS + USB_HC_STRUCTURAL_PARAMETERS_OFFSET) >> 0) & 0b1111; // EHCI HCSPARAMS bit 3:0
-         kprintln!("Algılanan Port Sayısı: {}", num_ports);
-
-         for i in 1..=num_ports {
-              kprintln!("Port {} Resetleniyor...", i);
-              let mut portsc = read_hc_port_status_and_control(i as u8);
-              // Port Reset bitini set et (PR) ve bitin temizlenmesini bekle (otomatik temizlenir)
-              portsc |= (1 << 4); // EHCI PORTSC PR bit (Port Reset)
-              write_hc_port_status_and_control(i as u8, portsc);
-              // Port Reset bitinin otomatik temizlenmesini bekle
-              while (read_hc_port_status_and_control(i as u8) & (1 << 4)) != 0 { // PR biti hala set mi?
-                   core::hint::spin_loop();
-              }
-              kprintln!("Port {} Resetlendi.", i);
-              // Reset sonrası biraz bekleme (EHCI spec 20ms)
-              // TODO: Gecikme ekle
-               core::hint::spin_loop(); // Simülasyon gecikmesi
-
-              // Portu Etkinleştir (PE) - Genellikle port reset sonrası otomatik olur veya gerekirse set edilir.
-              // Hata bayraklarını temizle (CSC, PEC, OCC, WCC) - W1C (yazarak temizlenir)
-               portsc = read_hc_port_status_and_control(i as u8);
-               let status_bits_to_clear = (1 << 1) | (1 << 3) | (1 << 8) | (1 << 13); // CSC, PEC, OCC, WCC
-               write_hc_port_status_and_control(i as u8, portsc | status_bits_to_clear);
-         }
-         kprintln!("Root Hub Portları Yapılandırması Tamamlandı (Örnek).");
-
-
-         // d. Gerekli Kesmeleri Etkinleştirme (Host Controller Interface'in kesmelerini)
-         //    USBCMD registerındaki interrupt_enable bitleri ve/veya INTREN registerı üzerinden yapılır.
-         //    Periyodik ve Asenkron listeler için de kesme etkinleştirilebilir.
-          let interrupts_to_enable = uhci_sts::PORT_CHANGE_DETECT | uhci_sts::USB_INTERRUPT | uhci_sts::ERROR_INTERRUPT; // Örnek: Port değişimi, transfer tamamlanma, hata
-          write_hc_interrupt_enable(interrupts_to_enable); // USBCMD INTREN bit alanı veya ayrı register (Denetleyiciye bağlı)
-          kprintln!("Host Controller Kesmeleri Etkinleştirildi (Örnek).");
-
-         // TODO: DMA için bellek alanlarını ayarla (QH, TD listeleri, veri tamponları) ve bu adresleri denetleyiciye bildir (MMIO registerları).
-         // Örneğin: ASYNCLISTADDR, PERIODICLISTBASE registerlarına DMA alanlarının fiziksel adresleri yazılmalıdır.
-         // EHCI 32-bit fiziksel adresler kullanır.
-
-
-    } // unsafe block sonu (Denetleyici init)
-
-
-    // 2. USB Cihazlarını Tarama ve Numaralandırma (Asenkron veya Eşitleme ile)
-    // Genellikle bir Port Bağlantı Değişikliği Kesmesi (Port Change Detect - PCD) beklenerek başlar.
-    // Kesme geldiğinde, hangi portun durumunun değiştiği kontrol edilir ve yeni bağlanan cihaz varsa numaralandırma başlatılır.
-    // Numaralandırma (Enumeration) = Bus reset, adres atama, descriptor okuma (Device, Configuration, Interface, Endpoint), sınıf belirleme, endpoint yapılandırma.
-    // Bu işlemler kontrol transferleri (Endpoint 0 üzerinden) ve Host Controller API'si kullanılarak yapılır.
-
-    // Örnek: Cihaz Tanımlayıcısını okuma (Sadece TEST AMAÇLI - Başarılı olması için cihazın Root Hub'a bağlı ve basitçe resetlenmiş olması gerekir)
-    // get_usb_device_descriptor unsafe olduğu için unsafe block içinde çağrılmalı.
-     unsafe {
-         if let Some(descriptor) = get_usb_device_descriptor() { // 0 numaralı uç noktadan oku (kontrol)
-             // Başarılı şekilde tanımlayıcı okundu
-             kprintln!("USB Cihaz Tanımlayıcı Okundu: Vendor ID: {:04x}, Product ID: {:04x}",
-                         descriptor.idVendor.swap_bytes(), descriptor.idProduct.swap_bytes()); // Descriptor alanları Little-endian, MIPS/OpenRISC big-endian olabilir, swap gerekebilir.
-             #[cfg(feature = "debug")] // Debug derlemelerde detaylı çıktı
-             kprintln!("Descriptor Detayları (Tamamı): {:?}", descriptor);
-         } else {
-             kprintln!("USB Cihaz Tanımlayıcı Okuma HATASI veya Aygıt Algılanamadı!");
-         }
+    /// Kaynağın durumunu (hazır olup olmadığını, boyutunu vb.) sorgular.
+    /// Durum bilgisi içeren KResourceStatus yapısını veya hata döndürür.
+     fn get_status(&self) -> Result<KResourceStatus, KError> {
+         // Kaynağın mevcut durumunu döndür.
+         let data = self.data.lock();
+         let status = KResourceStatus {
+             is_ready: true, // Bu dummy kaynak her zaman hazır.
+             size: Some(data.buffer.len() as u64), // Kaynağın toplam boyutunu bildir (tampon boyutu).
+             // Gerçek bir sürücü donanım durumunu veya dosya boyutunu kontrol eder.
+         };
+          kprintln!("SrcioRiscResource {}: Get status called.", self.id);
+         Ok(status)
      }
 
-
-    kprintln!("srcio_openrisc.rs: USB Sürücü Modülü Başlatma Tamamlandı.");
-    0 // Başarılı dönüş kodu
+     // Kaynak serbest bırakıldığında çağrılabilecek bir metod eklemek faydalı olabilir,
+     // ancak bu, ResourceProvider trait'inde tanımlı değil. Handle serbest bırakma
+     // mantığı genellikle kresource yöneticisi tarafından KHandle serbest bırakıldığında
+     // sağlanır ve alttaki Provider nesnesinin Drop implementasyonunu tetikleyebilir.
 }
 
-// Çekirdek modülü çıkış fonksiyonu (isteğe bağlı, kendi çekirdeğinize göre düzenleyin)
-// Modül kaldırıldığında veya sistem kapatıldığında çağrılır (eğer çekirdek destekliyorsa).
-#[no_mangle]
-pub extern "C" fn exit_module() {
-    kprintln!("srcio_openrisc.rs: USB Sürücü Modülü Çıkartılıyor...");
-    // USB denetleyiciyi durdurma, kesmeleri devre dışı bırakma, DMA alanlarını temizleme vb. (temizlik işlemleri)
-    unsafe { // Donanım registerlarına erişim unsafe
-         let op_reg_base = get_operational_registers_base();
-         let command_reg_addr = op_reg_base.wrapping_add(USB_HC_COMMAND_OFFSET);
+// --- Kaynak Fabrikası (Resource Factory) Deseni ---
 
-         // Denetleyiciyi Durdur (USBCMD Run/Stop bitini 0 yap)
-         let mut command_reg = mmio_read_u32(command_reg_addr);
-         command_reg &= !uhci_cmd::RUN_STOP;
-         mmio_write_u32(command_reg_addr, command_reg);
-         // HC'nin durmasını bekle (HCHalted bitinin set olmasını bekle)
-          let status_reg_addr = op_reg_base.wrapping_add(USB_HC_STATUS_OFFSET);
-          let halted_bit = uhci_sts::HC_HALTED;
-          while (mmio_read_u32(status_reg_addr) & halted_bit) == 0 {
-               core::hint::spin_loop();
-          }
-         kprintln!("Host Controller Durduruldu.");
+// Karnal64'ün kresource modülü, bir kaynak adı talep edildiğinde
+// o kaynağın yeni bir örneğini (instance) oluşturmak için bir "factory" veya "driver" yapısı kullanabilir.
+// Bu desen, aynı kaynaktan birden fazla kez handle almanızı sağlar (örn. bir dosyayı birden çok kez açmak gibi).
 
-         // Tüm Host Controller kesmelerini devre dışı bırak
-         write_hc_interrupt_enable(0); // Tüm bitleri 0 yaparak disable et
-         kprintln!("Host Controller Kesmeleri Devre Dışı Bırakıldı.");
+/// 'srcio_risc' kaynağının örneklerini oluşturacak fabrika yapısı.
+/// Bu yapı, Karnal64'ün dahili ResourceProviderFactory trait'ini (kavramsal) implemente etmelidir.
+struct SrcioRiscResourceFactory;
 
-         // TODO: DMA alanlarını serbest bırak (eğer tahsis edildiyse).
-    } // unsafe block sonu (Temizlik)
+// Kavramsal ResourceProviderFactory trait'inin implementasyonu.
+// Bu trait'in Karnal64::kresource içinde tanımlı olduğunu varsayıyoruz.
+impl karnal64::kresource::ResourceProviderFactory for SrcioRiscResourceFactory {
+    /// Karnal64 yöneticisi yeni bir handle talep edildiğinde bu metodu çağırır.
+    /// Kaynağın yeni bir örneğini oluşturur ve bir Box<dyn ResourceProvider> olarak döndürür.
+    fn create_instance(&self) -> Result<Box<dyn ResourceProvider>, KError> {
+        // Yeni bir kaynak örneği oluştururken ona benzersiz bir ID atayalım.
+        // static mut kullanmak no_std ortamında dikkatli senkronizasyon gerektirir.
+        // Gerçek bir kernelde atomik işlemler veya bir kilit kullanılmalıdır.
+        static mut INSTANCE_COUNTER: u64 = 0; // 0'dan başlayan örnek ID sayacı.
+        // MutexGuard Drop edildiğinde kilit serbest bırakılır, bu static mut erişimini senkronize eder.
+        let instance_id = unsafe {
+             let id = INSTANCE_COUNTER;
+             INSTANCE_COUNTER += 1; // Güvenli olmayan artış, gerçek kodda atomic add kullanın.
+             id
+        };
 
-    kprintln!("srcio_openrisc.rs: USB Sürücü Modülü Çıkartıldı.");
+        // Yeni bir SrcioRiscResource örneği oluştur.
+        let new_resource = SrcioRiscResource {
+            id: instance_id,
+            data: Mutex::new(SrcioRiscInternalData {
+                buffer: [0u8; 256], // Her yeni örnek için tamponu sıfırlarla başlat.
+                offset: 0,
+            }),
+        };
+
+         kprintln!("SrcioRiscResourceFactory: Created new instance with ID {}", instance_id);
+
+        // Oluşturulan kaynağı bir trait nesne kutusu içinde döndür.
+        Ok(Box::new(new_resource))
+    }
+
+    /// Fabrikanın oluşturduğu kaynak türünün desteklediği erişim modlarını kontrol eder.
+    /// Karnal64 resource_acquire API fonksiyonu tarafından talep edilen modları doğrulamak için kullanılır.
+    fn supports_mode(&self, mode: u32) -> bool {
+        // Bu örnek kaynak sadece okuma ve yazmayı destekliyor.
+        let supported_modes = MODE_READ | MODE_WRITE;
+
+        // Talep edilen modların (mode) desteklenen modlar kümesinin dışında bir bit içerip içermediğini kontrol et.
+        (mode & !supported_modes) == 0
+        // Eğer talep edilen modlar sadece MODE_READ ve/veya MODE_WRITE içeriyorsa bu ifade true döner.
+    }
 }
 
 
-// --- Panik İşleyici (Zorunlu - no_std ortamda) ---
-// Sistemde bir panic! olduğunda bu fonksiyon çağrılır.
+// --- Karnal64'e Kaydı Yapacak Fonksiyon ---
 
- use core::panic::PanicInfo; // Zaten yukarıda import edildi
-#[panic_handler]
-fn panic(info: &PanicInfo) -> ! {
-    // Panik bilgisini Sahne64 konsol makrolarını kullanarak yazdır
-    #[cfg(feature = "std")] std::eprintln!("KERNEL PANIC: {}", info);
-    #[cfg(not(feature = "std"))] eprintln!("KERNEL PANIC: {}", info); // Varsayım: Sahne64 eprintln! makrosu
+// Bu fonksiyon, çekirdek başlatılırken (örn. karnal64::init veya kresource::init_manager içinde)
+// çağrılarak 'srcio_risc' kaynağının sisteme tanıtılmasını sağlar.
+// Bu fonksiyon, SourceioRiscFactory'i belirli bir isimle (örn. "karnal://device/srcio_risc")
+// kresource yöneticisine kaydeder.
+pub fn register_srcio_risc_resource(resource_name: &str) -> Result<(), KError> {
+    // kresource modülünün register_provider_factory fonksiyonunu çağırarak fabrikamızı kaydet.
+    // Bu fonksiyonun, isim ve fabrika nesnesini dahili kayıt mekanizmasına eklediğini varsayıyoruz.
+    karnal64::kresource::register_provider_factory(
+        resource_name,
+        Box::new(SrcioRiscResourceFactory) // Fabrikamızın bir örneğini kutu içinde gönderiyoruz.
+    )?;
 
-     // Eğer panik bilgisinde location ve message varsa onları da yazdır.
-     if let Some(location) = info.location() {
-         #[cfg(feature = "std")] std::eprintln!("at {}", location);
-         #[cfg(not(feature = "std"))] eprintln!("at {}", location);
-     }
-     if let Some(message) = info.message() {
-         #[cfg(feature = "std")] std::eprintln!(": {}", message);
-         #[cfg(not(feature = "std"))] eprintln!(": {}", message);
-     }
-     #[cfg(feature = "std")] std::eprintln!("\n");
-     #[cfg(not(feature = "std"))] eprintln!("\n");
+     kprintln!("SrcioRiscResource: Successfully registered factory for '{}'", resource_name);
+
+    Ok(()) // Başarı
+}
 
 
-    // **BURAYA PANİK ANINDA YAPILACAK DİĞER ÖNEMLİ İŞLEMLERİ EKLEYİN.**
-    // Örneğin: Donanımı güvenli bir duruma getir, CPU'yu durdur, hata kodunu kaydet, watchdog timer'ı devre dışı bırak, yeniden başlatma vb.
-    // Donanıma özgü durdurma işlemleri burada yapılabilir (MMIO yazma vb.).
-    loop {} // Sonsuz döngüde kal
+// --- DUMMY/PLACEHOLDER KARNAL64 MODÜLÜ ---
+// BU KOD BLOĞU SADECE BU `srcio_openrısc.rs` DOSYASININ KENDİ BAŞINA
+// KAVRAMSAL OLARAK DERLENEBİLMESİ İÇİN BURADADIR.
+// GERÇEK BİR KARNEL PROJESİNDE BU BLOK KALDIRILMALI VE
+// GERÇEK KARNAL64 CRATE/MODÜLÜ KULLANILMALIDIR.
+mod karnal64 {
+    // Bu dummy modül, srcio_openrısc'in ihtiyaç duyduğu Karnal64 öğelerini sağlar.
+    // Gerçek Karnal64 implementasyonu çok daha karmaşıktır.
+
+    // Ana karnal64 scope'undan re-export yapılıyor (dummy tanımlar).
+    pub use super::KError;
+    pub use super::KHandle;
+    pub use super::ResourceProvider;
+    pub use super::KseekFrom;
+    pub use super::KResourceStatus;
+
+    // Dummy spin modülü (gerçek çekirdek util modülünden gelmeli).
+    pub mod spin {
+        // Çok basitleştirilmiş dummy Mutex. Gerçek bir kernel spinlock implementasyonu gerektirir.
+        pub struct Mutex<T> { data: core::cell::UnsafeCell<T>, /* real: atomic flag */ }
+        unsafe impl<T: Send> Send for Mutex<T> {} // Güvenli olmayabilir, gerçek impl'e bağlı.
+        unsafe impl<T: Send + Sync> Sync for Mutex<T> {} // Güvenli olmayabilir.
+        impl<T> Mutex<T> {
+            pub const fn new(data: T) -> Self { Mutex { data: core::cell::UnsafeCell::new(data) } }
+            pub fn lock(&self) -> MutexGuard<'_, T> {
+                // Real: Spin until lock acquired.
+                MutexGuard { mutex: self }
+            }
+        }
+        pub struct MutexGuard<'a, T> { mutex: &'a Mutex<T>, }
+        impl<'a, T> core::ops::Deref for MutexGuard<'a, T> {
+            type Target = T;
+            fn deref(&self) -> &Self::Target { unsafe { &*self.mutex.data.get() } }
+        }
+        impl<'a, T> core::ops::DerefMut for MutexGuard<'a, T> {
+            fn deref_mut(&mut self) -> &mut Self::Target { unsafe { &mut *self.mutex.data.get() } }
+        }
+        // Real: Drop impl releases the lock.
+         impl<'a, T> Drop for MutexGuard<'a, T> { fn drop(&mut self) { /* release lock */ } }
+    }
+
+    // Dummy kresource modülü. Gerçek kresource yöneticisi handle'ları ve provider'ları yönetir.
+    pub mod kresource {
+        use super::*; // Dış scope'taki dummy tipleri kullan.
+
+        // Karnal64'ün resource modları (gerçek yerde tanımlı olmalı).
+        pub const MODE_READ: u32 = 1 << 0;
+        pub const MODE_WRITE: u32 = 1 << 1;
+        // Diğer modlar...
+
+        // Kaynak Fabrikası Trait'i (gerçek kresource içinde tanımlı olmalı).
+        pub trait ResourceProviderFactory {
+            fn create_instance(&self) -> Result<Box<dyn ResourceProvider>, KError>;
+            fn supports_mode(&self, mode: u32) -> bool;
+        }
+
+        // Kayıtlı fabrikaları ve aktif handle'ları tutan dummy yönetici durumu.
+        // Gerçek implementasyon no_std uyumlu koleksiyonlar gerektirir.
+        struct ResourceManager {
+            name -> ResourceProviderFactory
+            handles -> ResourceProvider instance + mode + offset
+        }
+         static RESOURCE_MANAGER: spin::Mutex<ResourceManager> = spin::Mutex::new(...);
+
+        // Fabrika kaydı dummy fonksiyonu.
+        pub fn register_provider_factory(
+            name: &str,
+            factory: Box<dyn ResourceProviderFactory>
+        ) -> Result<(), KError> {
+            println!("DUMMY kresource: Factory '{}' registered.", name); // Gerçek kernelde kprintln!
+            // Gerçekte: Kaynak yöneticisinin map'ine eklenir.
+            Ok(()) // Dummy başarı.
+        }
+
+        // Handle verme dummy fonksiyonu.
+        pub fn issue_handle(provider: Box<dyn ResourceProvider>, mode: u32) -> KHandle {
+            println!("DUMMY kresource: Handle issued (mode: {})", mode); // Gerçek kernelde kprintln!
+            // Gerçekte: Provider instance'ı handle tablosuna eklenir, yeni bir handle değeri üretilir ve döndürülür.
+            static mut DUMMY_HANDLE_COUNTER: u64 = 1;
+            let handle_val = unsafe {
+                let val = DUMMY_HANDLE_COUNTER;
+                DUMMY_HANDLE_COUNTER += 1;
+                val
+            };
+            KHandle(handle_val) // Dummy handle.
+        }
+
+        // Handle'dan provider'a erişim dummy fonksiyonu.
+        // BU DUMMY IMPLEMENTASYON GERÇEKÇİ DEĞİLDİR ve GÜVENLİ DEĞİLDİR.
+        // Gerçekte, handle tablosundan ilgili provider instance'ına referans dönmelidir.
+        pub fn get_provider_by_handle(handle: &KHandle) -> Result<&'static dyn ResourceProvider, KError> {
+             //println!("DUMMY kresource: Provider lookup for handle {}", handle.0); // Gerçek kernelde kprintln!
+             if handle.0 != 0 {
+                  // WARNING: This dummy implementation is UNSAFE and incorrect.
+                  // It does NOT return the specific instance linked to the handle.
+                  // A real implementation requires a complex internal handle management system.
+                   static mut DUMMY_SINGLETON_PROVIDER: Option<Box<dyn ResourceProvider>> = None;
+                   if unsafe { DUMMY_SINGLETON_PROVIDER.is_none() } {
+                       // Çok basit bir dummy instance oluştur, tek kullanımlık gibi davranıyor.
+                       // Gerçekte, issue_handle tarafından oluşturulan instance'a erişilmelidir.
+                       let dummy_instance = super::super::SrcioRiscResource { // Use super::super to reach the actual struct
+                            id: 9999,
+                            data: super::spin::Mutex::new(super::super::SrcioRiscInternalData { buffer: [b'X'; 256], offset: 0 }),
+                        };
+                       unsafe { DUMMY_SINGLETON_PROVIDER = Some(Box::new(dummy_instance)); }
+                   }
+                   let instance_ref = unsafe { DUMMY_SINGLETON_PROVIDER.as_ref().unwrap().as_ref() };
+                   // 'static lifetime castı, gerçek implementasyonda handle yöneticisinin ömrüne bağlı olabilir.
+                   unsafe { Ok(core::mem::transmute::<&dyn ResourceProvider, &'static dyn ResourceProvider>(instance_ref)) }
+             } else {
+                 Err(KError::BadHandle) // Dummy BadHandle
+             }
+        }
+
+        // İzin kontrol dummy fonksiyonu.
+        pub fn handle_has_permission(handle: &KHandle, mode: u32) -> bool {
+             println!("DUMMY kresource: Permission check for handle {} mode {}", handle.0, mode); // Gerçek kernelde kprintln!
+             // Gerçekte: Handle'ın oluşturulurken kaydedilen mode bayraklarını kontrol eder.
+            true // Dummy her zaman izin verir.
+        }
+
+        // Offset güncelleme dummy fonksiyonu.
+        // NOT: Eğer ofset provider içinde yönetiliyorsa (SrcioRiscResource örneği gibi),
+        // bu fonksiyon kullanılmayabilir. Karnal64 API fonksiyonları get_provider_by_handle'dan
+        // provider'ı alıp doğrudan provider'ın read/write/seek metodlarını çağırarak ofseti güncelleyebilir.
+        pub fn update_handle_offset(handle: &KHandle, delta: u64) {
+            println!("DUMMY kresource: Offset update request for handle {} delta {}", handle.0, delta); // Gerçek kernelde kprintln!
+            // Dummy: Hiçbir şey yapmaz.
+        }
+
+        // Handle serbest bırakma dummy fonksiyonu.
+        pub fn release_handle(handle_value: u64) -> Result<(), KError> {
+             //println!("DUMMY kresource: Handle {} released", handle_value); // Gerçek kernelde kprintln!
+             // Gerçekte: Handle tablosundan kaldırılır, provider instance'ı Drop edilir.
+             if handle_value != 0 { Ok(()) } else { Err(KError::BadHandle) } // Dummy başarı/hata.
+        }
+    }
+
+    // Diğer dummy kernel modülleri (srcio_openrısc tarafından kullanılmıyorlar ama karnal64 içinde varlar).
+    pub mod ktask {}
+    pub mod kmemory {}
+    pub mod ksync {}
+    pub mod kmessaging {}
+    pub mod kkernel {}
+}
+
+// --- KAVRAMSAL KULLANIM ÖRNEĞİ ---
+// Aşağıdaki kod blokları bu dosyaya ait değildir. Sadece bu SrcioRisc kaynağının
+// Karnal64 framework'ünde nasıl kullanılacağını göstermek içindir.
+
+// Karnal64'ün ana başlatma (init) fonksiyonu içinde:
+fn karnal64::init() {
+    // ... diğer yöneticileri başlat ...
+    karnal64::kresource::init_manager(); // Kaynak yöneticisini başlat.
+
+    // srcio_openrısc modülümüzdeki kayıt fonksiyonunu çağır.
+    // Bu, "karnal://device/srcio_risc" adını SrcioRiscResourceFactory'ye bağlar.
+    srcio_openrısc::register_srcio_risc_resource("karnal://device/srcio_risc")
+        .expect("Failed to register srcio_risc resource");
+
+    // ... diğer kaynakları kaydet (konsol, disk sürücüleri vb.) ...
+}
+
+// Kullanıcı alanından gelen SYSCALL_RESOURCE_ACQUIRE sistem çağrısını işleyen koda örnek:
+fn karnal64::handle_syscall(number: u64, arg1: u64, arg2: u64, arg3: u64, ...) -> i64 {
+    match number {
+        // ... diğer syscall'lar ...
+        SYSCALL_RESOURCE_ACQUIRE => {
+            let resource_id_ptr = arg1 as *const u8;
+            let resource_id_len = arg2 as usize;
+            let mode = arg3 as u32;
+
+            // Güvenlik: resource_id_ptr/len'in geçerli kullanıcı pointer'ları olduğunu doğrula!
+            // ... doğrulama mantığı ...
+
+            // Karnal64 API fonksiyonunu çağır.
+            match karnal64::resource_acquire(resource_id_ptr, resource_id_len, mode) {
+                Ok(k_handle) => k_handle.0 as i64, // Başarı: Handle değerini döndür.
+                Err(err) => err as i64,         // Hata: KError kodunu döndür.
+            }
+        },
+        // SYSCALL_RESOURCE_READ işlenirken:
+        SYSCALL_RESOURCE_READ => {
+            let handle_value = arg1;
+            let user_buffer_ptr = arg2 as *mut u8;
+            let user_buffer_len = arg3 as usize;
+
+             // Güvenlik: user_buffer_ptr/len'in geçerli kullanıcı pointer'ları ve yazılabilir olduğunu doğrula!
+             // ... doğrulama mantığı ...
+
+            match karnal64::resource_read(handle_value, user_buffer_ptr, user_buffer_len) {
+                Ok(bytes_read) => bytes_read as i64, // Başarı: Okunan byte sayısını döndür.
+                Err(err) => err as i64,            // Hata: KError kodunu döndür.
+            }
+        },
+        // ... diğer syscall'lar ...
+        _ => KError::NotSupported as i64, // Bilinmeyen syscall.
+    }
 }
