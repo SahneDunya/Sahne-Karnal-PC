@@ -1,287 +1,250 @@
-#![no_std] // Standart kütüphaneye ihtiyaç duymuyoruz
+#![no_std] // Standart kütüphaneye ihtiyaç yok
 
-// Gerekli core modüllerini içeri aktar
-use core::{arch::asm, ptr, mem}; // Added mem for size_of
+use core::arch::asm; // Gerekirse düşük seviye assembly için
+use core::fmt; // Hata ayıklama/loglama için format kullanabiliriz
 
-// `volatile` crate'inden Volatile sarmalayıcıyı içeri aktar (cargo.toml'da tanımlı olmalı)
-use volatile::Volatile; // <-- Added import
+// Karnal64 API'sından ihtiyacımız olanlar
+// src/lib.rs veya karnal64.rs yoluna göre ayarlanmalı
+use super::karnal64::{handle_syscall, KError, KHandle, KTaskId}; // veya crate::karnal64::...
 
-// Konsol çıktı makrolarını kullanabilmek için (hata durumlarında loglama veya debug çıktısı için)
-// Bu makrolar Sahne64 crate'i tarafından sağlanır ve resource API'sini kullanır.
-// Bu crate'te kullanılabilir olmaları için uygun kurulum (örn. #[macro_use]) gereklidir.
-// Bu örnekte, #[cfg] ile std/no_std çıktısını ayarlayarak makroların
-// uygun ortamda kullanılabilir olduğunu varsayıyoruz.
-// use sahne64::eprintln; // Örnek import eğer macro publicse
+// SPARC V9 mimarisine özel temel tuzak türleri (TT - Trap Type)
+// Bunlar genellikle SPARC mimarisi spesifikasyonundan veya bir BSP'den (Board Support Package) gelir.
+// Tam liste için SPARC V9 kılavuzuna bakılmalı.
+const TT_RESERVED: u8 = 0x00;
+const TT_POWER_ON_RESET: u8 = 0x01;
+// ... diğer donanım resetleri, hatalar
+const TT_INSTRUCTION_ACCESS_EXCEPTION: u8 = 0x08; // Talimat erişim hatası (örn. sayfa hatası)
+const TT_INSTRUCTION_ACCESS_ERROR: u8 = 0x09;
+const TT_DATA_ACCESS_EXCEPTION: u8 = 0x10; // Veri erişim hatası (örn. sayfa hatası)
+const TT_DATA_ACCESS_ERROR: u8 = 0x11;
+const TT_ALIGNMENT_EXCEPTION: u8 = 0x12;
+const TT_PRIVILEGED_OPCODE: u8 = 0x13;
+const TT_UNIMPLEMENTED_INSTRUCTION: u8 = 0x18;
+const TT_FP_DISABLED: u8 = 0x20;
+const TT_FP_EXCEPTION: u8 = 0x21;
+// ... daha birçok donanım tuzağı
 
+// Yazılım tuzakları (ST - Software Traps)
+// Bunlar genellikle uygulama tarafından `ta` (trap always) talimatı ile tetiklenir.
+// Sistem çağrıları için özel bir yazılım tuzağı kullanılır.
+const TT_TAG_OVERFLOW: u8 = 0x03;
+const TT_DIVISION_BY_ZERO: u8 = 0x2a;
+// ... diğer yazılım tuzakları
 
-// SPARC mimarisine özgü ve donanıma bağımlı sabitler
-// ** GERÇEK DEĞERLERİ İŞLEMCİ VE ÇEVRE BİRİMİ REFERANS KILAVUZLARINDAN ALIN! **
-// Bu değerler çip modeline, çevre birimi instancelarına ve kesme kontrolcüsüne göre değişir.
+// Sistem Çağrısı için kullanılan özel tuzak türü.
+// Bu değer, kullanıcı alanındaki sistem çağrısı talimatının (örn. `ta n`) `n` değeri ile eşleşmelidir.
+// Genellikle belirli bir değer atanır, örneğin 0x80 veya 0x10. SPARC V9'da `ta 0x10` yaygındır.
+const TT_SYSCALL: u8 = 0x10; // Örnek değer, projenin ABI'sine göre değişir!
 
-// **Örnek: SPARC Kontrol Registerları (SPR'ler)**
-// PSR (Processor State Register): Genel durum ve kesme etkinleştirme bitleri (örn. ET, PS, S, EF, EC)
-// WIM (Window Invalid Mask): Geçerli olmayan register pencerelerini maskeleme
-// TBR (Trap Base Register): Kesme/İstisna Vektör Tablosu (IVT) başlangıç adresi
-// **Bu SPR'lere erişim genellikle `rd` ve `wr` yönergeleri ile veya memory-mapped erişimle yapılır. Kılavuza bakın!**
+// --- Tuzak Çerçevesi (Trap Frame) ---
+// Assembly giriş noktası tarafından çekirdek yığınına kaydedilen CPU durumu.
+// Bu yapı, tuzağın hangi bağlamda (register değerleri, PC, nPC, TSTATE vb.) oluştuğunu tutar.
+// SPARC V9 register pencerelerini ve önemli devlet registerlarını yansıtmalıdır.
+// Bu sadece basitleştirilmiş bir örnektir. Tam bir implementasyon daha fazla detaya ihtiyaç duyar.
+#[repr(C)] // C uyumlu düzen
+#[derive(Debug)] // Hata ayıklama için yazdırılabilir yap
+pub struct TrapFrame {
+    // Global Registerlar (%g0 - %g7)
+    // %g0 her zaman sıfırdır ve genellikle kaydedilmez/kullanılmaz ama burada dahil edelim
+    pub reg_g: [u64; 8],
 
-// Kesme vektör tablosu (IVT) için adres ve boyut tanımları
-// Bu, donanımın exception/interrupt oluştuğunda zıpladığı bellekteki tablodur.
-// Adres ve format işlemci modeline (Book E, Book S vb.) ve konfigürasyona bağlıdır.
-// TBR register'ı bu adresin başlangıcını işaret eder.
-const IVT_BASE: usize = 0x1000; // Örnek adres: Gerçek donanıma göre ayarlanmalı (Genellikle 0x0, 0x1000, 0xFFF00000 vb.)
-const IVT_SIZE: usize = 256 * mem::size_of::<usize>(); // Kesme vektör tablosu boyutu (Örnek: 256 vektör girişi * pointer boyutu)
-// Her girişin boyutu ve anlamı PowerPC modeli ve IVT formatına bağlıdır (komut veya işleyici adresi).
-// Bu örnekte her girişin bir işleyici adresini tutan 'usize' olduğunu varsayıyoruz.
+    // Pencere Registerları: In (%i0 - %i7) ve Local (%l0 - %l7) registerları
+    // Bunlar, tuzak sırasında aktif olan pencerenin registerlarıdır.
+    // Assembly giriş noktası, pencereyi kaydetmeli (SAVE talimatı gibi) ve bu yapıya kopyalamalıdır.
+    pub reg_in: [u64; 8],
+    pub reg_local: [u64; 8],
 
-
-// Kesme numaraları (IRQ numaraları)
-// Bu numaralar, genellikle harici bir Interrupt Controller (örn. PIC/VIC benzeri) tarafından atanır.
-// Bu numaralar, IVT_BASE'e göre ofset olarak kullanılır (IRQ_NUMBER * entry_size).
-const TIMER_IRQ: usize = 0; // Örnek zamanlayıcı kesme numarası (Offset = 0 * size_of<usize>)
-const USB_IRQ: usize = 1; // Örnek USB kesme numarası (Offset = 1 * size_of<usize>)
-// Diğer vektörler (System Call, Alignment, Data/Instruction Access vb.) farklı ofsetlerde bulunur. Trap Base Register (TBR) offsetleri SPARC'ta standarttır.
-
-
-// SPARC Processor State Register (PSR) Bitleri (Örnek)
-const PSR_ET_BIT: usize = 1 << 4; // Enable Traps (Dahili/Harici kesmeleri/istisnaları etkinleştirir)
-const PSR_PS_BIT: usize = 1 << 2; // Previous Supervisor (Önceki privilege seviyesi)
-const PSR_S_BIT: usize = 1 << 1; // Supervisor (Current privilege seviyesi)
-// Diğer PSR bitleri (EC, EF, CWP vb.)
-
-
-// Zamanlayıcı ile ilgili donanım adresleri ve register offset'leri (DONANIMA ÖZGÜ!)
-// TIMER_BASE_ADDRESS: Zamanlayıcı kontrolcüsünün temel adresi.
-// TIMER_CONTROL_REGISTER_OFFSET: Zamanlayıcı kontrol register'ının temel adrese göre offset'i.
-// TIMER_IRQ_CLEAR_VALUE: Zamanlayıcı kesme bayrağını temizlemek için yazılacak değer.
-// **DİKKAT:** Bu değerler ve adresler, kullandığınız SPARC çipine ve zamanlayıcı donanımına göre DEĞİŞİR.
-// Doğru değerler için çipinizin REFERANS KILAVUZUNA bakmanız ŞARTTIR.
-const TIMER_BASE_ADDRESS: usize = 0xD000_0000; // ÖRNEK ADRES! Kılavuza bakınız!
-const TIMER_CONTROL_REGISTER_OFFSET: usize = 0x00; // ÖRNEK OFFSET! Kılavuza bakınız!
-const TIMER_IRQ_CLEAR_VALUE: u32 = 1; // ÖRNEK DEĞER! Kılavuza bakınız! (32-bit yazma varsayımı)
-
-
-// USB ile ilgili donanım adresleri ve register offset'leri (DONANIMA ÖZGÜ!)
-// USB_BASE_ADDRESS: USB kontrolcüsünün bellek eşlemeli (memory-mapped) temel adresi.
-// USB_IRQ_CLEAR_REGISTER_OFFSET: USB kesme bayrağını temizlemek için yazılacak register ofseti.
-// USB_IRQ_CLEAR_VALUE: USB kesme bayrağını temizlemek için bu register'a yazılacak değer.
-// **DİKKAT:** Bu değerler ve adresler, kullandığınız SPARC çipine ve USB kontrolcüsüne göre DEĞİŞİR.
-// Doğru değerler için çipinizin REFERANS KILAVUZUNA bakmanız ŞARTTIR.
-const USB_BASE_ADDRESS: usize = 0xD000_1000; // ÖRNEK ADRES! Kılavuza bakınız!
-const USB_IRQ_CLEAR_REGISTER_OFFSET: usize = 0x14; // ÖRNEK OFFSET! Kılavuza bakınız!
-const USB_IRQ_CLEAR_VALUE: u32 = 1; // ÖRNEK DEĞER! Kılavuza bakınız!
-
-
-// Kesme İşleyici Fonksiyonları (Prototip tanımları gereksiz, fonksiyonlar aşağıda)
- extern "C" { fn timer_interrupt_handler(); fn usb_interrupt_handler(); } // <-- Kaldırıldı
-
-// Boş Kesme İşleyicisi (Varsayılan)
-// IVT'de boş bırakılan girişlere atanan varsayılan işleyici.
-// Güvenli olmayan (unsafe) extern "C" fn olarak tanımlanmalıdır.
-unsafe extern "C" fn empty_handler() {
-    // ** Güvenlik: Bu işleyici unsafe'dir çünkü kesme bağlamında çalışır **
-    // ve muhtemelen donanım veya paylaşılan bellekle etkileşime girecektir.
-
-    // Beklenmeyen bir kesme/istisna durumu. Sahne64 konsol makrolarını kullanarak logla.
-    // Kesme işleyicileri hassas bir bağlamda çalışır, loglama dikkatli yapılmalıdır.
-    // Loglama fonksiyonu interrupt-safe olmalıdır.
-    #[cfg(feature = "std")] std::eprintln!("UYARI: SPARC Beklenmeyen kesme/istisna!");
-    #[cfg(not(feature = "std"))] eprintln!("UYARI: SPARC Beklenmeyen kesme/istisna!"); // Sahne64 macro varsayımı
-
-    // TODO: Hata durumunu logla veya sistemi güvenli bir duruma getir.
-    // Panik, debug amaçlı kullanılabilir ancak kesme bağlamında güvenliği düşünülmelidir.
-     panic!("Beklenmeyen kesme/istisna!"); // Eğer panik güvenliyse
-
-    // TODO: Bu işleyici exception entry noktasından çağrılıyorsa, buradan exception entry'ye dönmesi gerekebilir.
-    // Eğer doğrudan IVT'den çağrılıyorsa, registerları kurtarıp rfe ile dönmelidir (bu karmaşıktır).
-    // Basitlik adına şimdilik boş bırakılıyor, trap entry noktasının burayı çağırdığı varsayımıyla.
+    // Önemli Kontrol Registerları
+    pub tstate: u64, // Trap State Register - Çekirdek/Kullanıcı modu, tuzak türü (TT) vb. bilgileri içerir
+    pub tpc: u64,    // Trap Program Counter - Tuzağa neden olan talimatın adresi
+    pub tnpc: u64,   // Trap Next Program Counter - TPC'den sonra çalışacak talimatın adresi
+    // Daha fazla SPARC kontrol registerı (PSR, WSTATE, CWP, FSR, FAR vb.) eklenebilir.
+     pub psr: u64,
+     pub wstate: u64,
+     pub cwp: u8, // Current Window Pointer
+     pub fsr: u64, // Fault Status Register (Bellek hataları için)
+     pub far: u64, // Fault Address Register (Bellek hataları için)
 }
 
+// TSTATE registerından TT (Trap Type) alan fonksiyon (SPARC V9)
+// TSTATE'in yapısı için SPARC V9 kılavuzuna bakılmalı. Genellikle en düşük 8 bit TT'dir.
+#[inline]
+fn get_trap_type(tstate: u64) -> u8 {
+    (tstate & 0xFF) as u8
+}
 
-/// SPARC mimarisi için kesme ve trap altyapısını başlatır.
-/// TBR ve PSR gibi ilgili SPR'ları ayarlar, IVT'yi kurar ve kesmeleri etkinleştirir.
-/// Bu fonksiyon, sistem başlangıcında (kernel init sürecinde) Supervisor mode'da çağrılmalıdır.
-pub fn init() {
-    // Bu fonksiyon, Supervisor mode (S mode) privilege seviyesinde çalışmalıdır.
-    unsafe {
-        // 1. Kesme Vektör Tablosunu (IVT) Başlatma ve İşleyici Adreslerini Yazma
-        // IVT, `static mut IVT` dizisi olarak bellekte tanımlanmıştır.
-        // TBR register'ı bu dizinin adresini işaret etmelidir.
-        let ivt_ptr = IVT.as_mut_ptr(); // statik mutable dizinin pointer'ı
+// TSTATE registerından çekirdek/kullanıcı modu bilgisini alan fonksiyon (SPARC V9)
+// TSTATE'in yapısı için SPARC V9 kılavuzuna bakılmalı. Supervisor (Çekirdek) bitini kontrol ederiz.
+const TSTATE_SUPERVISOR_BIT: u64 = 1 << 7; // Örnek bit konumu, mimariye göre değişir!
+#[inline]
+fn is_from_user_mode(tstate: u64) -> bool {
+    (tstate & TSTATE_SUPERVISOR_BIT) == 0 // Supervisor biti 0 ise kullanıcı modudur
+}
 
-        // Başlangıçta tüm IVT girişlerini `empty_handler` olarak başlat
-        let num_entries = IVT.len(); // IVT_SIZE / mem::size_of::<usize>(); // static mut dizinin boyutu doğrudan alınabilir
-        for i in 0..num_entries {
-             // Volatile yazma kullanarak derleyicinin optimizasyon yapmasını engelle
-            ptr::write_volatile(ivt_ptr.add(i), empty_handler); // Varsayılan handler'ı yaz
+// --- Ana Tuzak İşleyici (Rust tarafı) ---
+// Assembly giriş noktasından çağrılan fonksiyon.
+// Assembly kısmı:
+// 1. Mevcut pencereyi kaydeder (SAVE veya el ile).
+// 2. Yeni bir pencereye geçer (CWP'yi ayarlar).
+// 3. Tuzak çerçevesini (CPU durumu) mevcut pencerenin 'out' registerlarına (bunlar çağıranın 'in' registerları olur) veya yığına kopyalar.
+// 4. Bu Rust fonksiyonunu çağırır, genellikle tuzak çerçevesine bir pointer ve tuzak türünü argüman olarak geçirir.
+// 5. Rust fonksiyonu geri döndüğünde, tuzak çerçevesinden durumu geri yükler.
+// 6. Kaydedilen pencereyi geri yükler (RESTORE veya el ile).
+// 7. Tuzaktan döner (RETT talimatı).
+#[no_mangle] // Assembly tarafından çağrılabilmesi için isim bozulmasını engelle
+pub extern "C" fn sparc_trap_handler(trap_frame: *mut TrapFrame) {
+    // Güvenlik Notu: trap_frame pointer'ının geçerli ve güvenli bir adres
+    // (çekirdek yığını üzerinde) olduğunu varsayıyoruz. Bu, assembly giriş
+    // noktası tarafından garanti edilmelidir.
+    let frame = unsafe { &mut *trap_frame };
+
+    let tt = get_trap_type(frame.tstate);
+    let from_user = is_from_user_mode(frame.tstate);
+
+    // TODO: Burada bir bağlam yöneticisi (Context Manager) kullanılmalı
+    // Kesintinin hangi görev/iş parçacığı bağlamında gerçekleştiği belirlenir.
+    // Bağlamlar arası geçiş (context switch) gerekirse burada yapılır.
+     current_task_context = TaskManager::get_current_context();
+     TaskManager::save_context(current_task_context, frame);
+
+    match tt {
+        // --- Sistem Çağrısı ---
+        TT_SYSCALL => {
+            // SPARC V9'da sistem çağrısı argümanları genellikle %g1-%g5 registerlarındadır.
+            // Dönüş değeri ise %g0 veya %o0'a konur (çağırma konvansiyonuna bağlı).
+            // Burada, assembly giriş noktasının bu registerları TrapFrame'e kaydettiğini varsayıyoruz.
+            // Kullanıcı alanındaki kod (Sahne64) SYSCALL_* numaralarını belirler
+            // ve bunları ve argümanlarını uygun registerlara yerleştirir.
+
+            // Varsayım:
+            // Syscall Numarası: frame.reg_g[1] (%g1)
+            // Argüman 1: frame.reg_g[2] (%g2)
+            // Argüman 2: frame.reg_g[3] (%g3)
+            // Argüman 3: frame.reg_g[4] (%g4)
+            // Argüman 4: frame.reg_g[5] (%g5)
+            // Argüman 5: frame.reg_g[6] (%g6) - Karnal64 5 argüman alıyor
+
+            let syscall_number = frame.reg_g[1];
+            let arg1 = frame.reg_g[2];
+            let arg2 = frame.reg_g[3];
+            let arg3 = frame.reg_g[4];
+            let arg4 = frame.reg_g[5];
+            let arg5 = frame.reg_g[6]; // Karnal64 5 argüman bekliyor
+
+            // GÜVENLİK KRİTİK: Kullanıcı alanından gelen pointer argümanlarını DOĞRULA!
+            // Eğer arg1, arg2,... kullanıcı alanındaki bir pointer ise (örn. read/write tamponu, string pointer'ı),
+            // bu pointer'ın kullanıcının adres alanında geçerli, izin verilen (okunabilir/yazılabilir)
+            // ve sınırları aşmayan bir adresi gösterdiğini burada veya handle_syscall içinde (ama ondan önce!)
+            // MMU/bellek yönetim alt sistemi yardımıyla doğrulamak ZORUNLUDUR.
+            // handle_syscall yorumu, bu doğrulamayı çağrının *yapıldığı yerden önce* yapılmasını öneriyor,
+            // yani ideal olarak burada veya handle_syscall girişinde.
+            // Basitlik için burada atlıyoruz ama gerçek bir OS'ta bu HAYATİdir.
+            // Örnek: resource_read arg2 user_buffer_ptr. Bu ptr'nin kullanıcı alanı
+            // adres haritasında geçerli ve yazılabilir olduğunu doğrulamalısın.
+
+            let result = handle_syscall(syscall_number, arg1, arg2, arg3, arg4, arg5);
+
+            // Sistem çağrısı sonucunu (i64) kullanıcı alanının beklediği return register'ına yaz.
+            // Varsayım: Dönüş değeri frame.reg_g[0] (%g0) veya frame.reg_in[0] (%o0) içine konulur.
+            // Genellikle %o0 kullanılır, çünkü bu kaydedilen pencerenin 'in' registerıdır (%i0).
+            // Assembly giriş noktası, 'out' -> 'in' kaydırmayı (SAVE) veya manüel kaydetmeyi yapar.
+            // frame.reg_in[0] = result as u64; // Başarı durumunda pozitif/sıfır, hata durumunda negatif
+            frame.reg_g[0] = result as u64; // Veya %g0'a koyalım, daha basit bir örnek.
+
+            // TODO: Sistem çağrısı sonrası zamanlayıcıyı kontrol et (preemption).
+            // Eğer zaman dilimi dolduysa veya yüksek öncelikli görev uyandıysa,
+            // burada context switch kararı alınabilir.
+
+            // Tuzağa neden olan talimat `ta n` olduğu için, tuzağın hemen
+            // ardından gelen talimata dönmek için tpc ve tnpc'yi ayarlamak gerekmez,
+            // RETT talimatı tpc ve tnpc'yi kullanarak doğru yere dönecektir.
+            // Ancak bazı durumlarda tnpc'yi `tnpc + 4` gibi ayarlamak gerekebilir
+            // eğer `ta` talimatının kendisi atlanacaksa. Bu SPARC ABI'sine bağlıdır.
         }
 
-        // Zamanlayıcı kesme işleyicisinin adresini IVT'deki yerine yaz
-        let timer_handler_fn_ptr = timer_interrupt_handler as unsafe extern "C" fn(); // İşleyici fonksiyon pointer'ı
-        // Güvenli olmayan (unsafe) volatile yazma ile adresi IVT_BASE + (TIMER_IRQ * entry_size)'ye yaz.
-        // Eğer IVT'nin her girişi bir pointer ise, ofset TIMER_IRQ'dur.
-         if TIMER_IRQ < num_entries {
-            ptr::write_volatile(ivt_ptr.add(TIMER_IRQ), timer_handler_fn_ptr);
-         } else {
-             #[cfg(feature = "std")] std::eprintln!("KRİTİK HATA: SPARC Timer IRQ numarası ({}) IVT boyutundan ({}) büyük!", TIMER_IRQ, num_entries);
-             #[cfg(not(feature = "std"))] eprintln!("KRİTİK HATA: SPARC Timer IRQ numarası ({}) IVT boyutundan ({}) büyük!", TIMER_IRQ, num_entries);
-              loop { core::hint::spin_loop(); } // Veya halt_system();
+        // --- Bellek Erişim Hataları (Page Faults) ---
+        TT_INSTRUCTION_ACCESS_EXCEPTION | TT_DATA_ACCESS_EXCEPTION => {
+            // MMU tarafından tetiklenir (TLB miss, izin ihlali, olmayan sayfa vb.)
+            // Hata adresini (FAR) ve hata durumunu (FSR) oku. SPARC mimarisine özel register okuma gerekebilir.
+             let far = read_sparc_far(); // Örnek placeholder
+             let fsr = read_sparc_fsr(); // Örnek placeholder
+
+            // TODO: Bellek Yönetim Biriminin (kmemory) ilgili hatayı işleyecek fonksiyonunu çağır.
+            // Örn: super::kmemory::handle_page_fault(frame, far, fsr, tt);
+            let fault_address = 0; // Yer Tutucu
+            let fault_status = 0; // Yer Tutucu
+
+            match super::kmemory::handle_page_fault(frame, fault_address, fault_status, tt) {
+                Ok(_) => {
+                    // Hata başarıyla çözüldü (sayfa yüklendi, izin verildi vb.).
+                    // RETT ile tuzağa neden olan talimata geri dönecek, yeniden deneyecek.
+                }
+                Err(err) => {
+                    // Hata çözülemedi (geçersiz adres, yığın taşması vb.).
+                    // Bu görevin sonlandırılması gerekir.
+                    println!("Görev #{} için İşlenemeyen Bellek Hatası: {:?} - Tuş Tipi: {}",
+                             // TODO: ktask::get_current_task_id() gibi bir şey kullanılmalı
+                             0, // Yer Tutucu Görev ID
+                             err, tt);
+                    // TODO: Görevi sonlandır (TaskManager::terminate_task(current_task_id, exit_code)).
+                    // Bu genellikle `ktask::task_exit` gibi bir fonksiyonu çağırmayı içerir.
+                    // Bu fonksiyondan geri dönülmez.
+                     super::ktask::task_exit(-1); // Hata koduyla çıkış
+                }
+            }
+        }
+
+        // --- Zamanlayıcı Kesintisi ---
+        // Belirli bir TT değeri zamanlayıcı donanımı tarafından tetiklenecektir.
+        // Bu TT değeri donanıma/BSP'ye bağlıdır.
+         const TT_TIMER_INTERRUPT: u8 = 0xsomething; // Örnek
+         TT_TIMER_INTERRUPT => {
+        //     // TODO: Zamanlayıcı donanımını sıfırla/onayla.
+        //     // TODO: Zamanlayıcı yöneticisini veya zamanlayıcıyı tetikle (ktask).
+             super::ktask::handle_timer_interrupt(frame);
          }
 
-
-        // USB kesme işleyicisinin adresini IVT'deki yerine yaz
-        let usb_handler_fn_ptr = usb_interrupt_handler as unsafe extern "C" fn(); // İşleyici fonksiyon pointer'ı
-         if USB_IRQ < num_entries {
-            ptr::write_volatile(ivt_ptr.add(USB_IRQ), usb_handler_fn_ptr);
-         } else {
-             #[cfg(feature = "std")] std::eprintln!("KRİTİK HATA: SPARC USB IRQ numarası ({}) IVT boyutundan ({}) büyük!", USB_IRQ, num_entries);
-             #[cfg(not(feature = "std"))] eprintln!("KRİTİK HATA: SPARC USB IRQ numarası ({}) IVT boyutundan ({}) büyük!", USB_IRQ, num_entries);
-              loop { core::hint::spin_loop(); } // Veya halt_system();
-         }
-
-        // Diğer exception handler adresleri (System Call, Alignment, vs.) de buraya yazılmalıdır.
-        // TBR offsetleri SPARC'ta sabittir (örn. Syscall = TBR + 0x80, TLB Miss = TBR + 0x40 vb.).
-
-
-        // 2. TBR (Trap Base Register) Register'ını Ayarlama
-        // TBR register'ına IVT dizisinin adresini yaz.
-        // SPARC'ta TBR'ye yazmak için özel bir yönerge kullanılır (örn. `wr %psr, %g0, TBR_value` veya özel bir SPR yazma).
-        // TBR'ye yazma genellikle `wr TBR, %g0, ivt_address` gibi görünür.
-        // TBR adresi/numarası SPARC modeline bağlıdır.
-        const SPR_TBR: usize = 0x00; // Örnek TBR SPR adresi (Kılavuza bakın!)
-
-        asm!(
-            "wr {0}, %g0, {1}", // wr spr, %g0, value (value'yi spr'ye yaz)
-            const SPR_TBR,      // Hedef SPR (TBR)
-            in(reg) ivt_ptr,  // Yazılacak değer (IVT adresi)
-            options(nostack)      // Stack manipulation olmadığını belirtir
-        );
-        // ** AÇIKLAMA: TBR adresini sisteme bildirme işlemi DONANIMA ÖZGÜDÜR! **
-        // Doğru SPR adresi, yazma yönergesi ve %g0 kullanımı için SPARC ISA ve çip kılavuzuna bakın.
-
-
-        // 3. Genel Kesmeleri Etkinleştirme (PSR - Processor State Register)
-        // PSR register'ındaki ET (Enable Traps) bitini set edin.
-        // PSR'ı okuyun (`rd %psr, register`), ET bitini set edin, geri yazın (`wr register, %g0, %psr`).
-        const SPR_PSR: usize = 0x10; // Örnek PSR SPR adresi (Kılavuza bakın!)
-
-        // PSR'ı oku: rd rd, spr (rd: dest reg, spr: spr num)
-        let mut psr_value: usize;
-        asm!("rd {0}, {1}", out(reg) psr_value, const SPR_PSR, options(nostack));
-
-        // Okunan PSR değerine ET bitini OR'la
-        psr_value |= PSR_ET_BIT;
-
-        // Yeni PSR değerini geri yaz: wr spr, %g0, rs (spr: spr num, %g0: zero, rs: source reg)
-        asm!("wr {0}, %g0, {1}", const SPR_PSR, in(reg) psr_value, options(nostack));
-
-        // **DİKKAT:** SPR_PSR, PSR_ET_BIT ve etkinleştirme yöntemi DONANIMA GÖRE DEĞİŞİR.
-        // Doğru değerler için SPARC ISA ve çip kılavuzuna bakın.
-
-
-        // TODO: Belirli Kesme Kaynaklarını Etkinleştirme (Eğer PSR.ET yeterli değilse)
-        // Bazı SPARC sistemlerinde, PSR.ET sadece genel trap işleme mekanizmasını etkinleştirir.
-        // Bireysel IRQ kaynaklarını (zamanlayıcı, USB) etkinleştirmek için
-        // harici bir kesme denetleyicisinin registerlarını (örn. PIC/VIC benzeri)
-        // ayarlamanız gerekebilir.
-        // Bu kısım DONANIMA ÖZGÜDÜR.
-
-
-        // Diğer platforma özgü başlatma adımları buraya eklenebilir.
+        // --- Diğer Donanım/Yazılım Tuzakları ---
+        _ => {
+            // İşlenmeyen veya beklenmeyen tuzaklar. Genellikle fatal hatadır.
+            println!("İşlenemeyen Tuzak! Tuş Tipi: {} (0x{:x})", tt, tt);
+            println!("Tuzak Frame Bilgisi: {:?}", frame);
+            // TODO: Sistem durumunu kaydet (varsa debug logları).
+            // TODO: Çekirdeği panik durumuna sok veya hatayı bildir.
+            // Panik, genellikle hata ayıklama sırasında tercih edilir.
+            panic!("İşlenemeyen SPARC Tuzağı: TT={}", tt);
+        }
     }
 
-    // İstisna işleyicisini başlat. exception::init() SPARC'a özgü
-    // istisna işleme mekanizmalarını kurmalıdır (örneğin, register penceresi yönetimi).
-     exception::init(); // Çekirdek exception init'ini çağır
+    // TODO: Tuzak işleme tamamlandıktan sonra context switch kararı alınmışsa
+     TaskManager::restore_context(next_task_context, frame);
 
-     // init fonksiyonu başarıyla tamamlanırsa geri döner.
+    // sparc_trap_handler fonksiyonundan dönüş, assembly giriş noktasının
+    // Tuzak Çerçevesini kullanarak CPU durumunu geri yüklemesine ve RETT talimatını
+    // yürütmesine yol açar.
+}
+
+// TODO: Başlangıçta tuzak tablosunu ayarlamak için fonksiyonlar.
+// SPARC'ta, TTR (Trap Table Register) kullanılarak tuzak tablosunun başlangıç adresi belirtilir.
+// Bu genellikle çekirdek başlatma (boot) sırasında yapılır.
+pub fn init_trap_handling() {
+    // TODO: Tuzak tablosunu oluştur (bellekte uygun bir yere yerleştir).
+    // Bu tablo, her tuzak türü (TT) için assembly giriş noktasının adresini içerir.
+    // TODO: TTR registerını oluşturulan tablonun adresi ile yükle.
+     unsafe {
+         asm!("wr {0}, 0, %ttr", in(reg) trap_table_address); // Örnek sözde kod
+     }
+    // TODO: MMU'yu tuzak tablosu için ayarlayın (okuma/yürütme izinleri).
+
+     println!("Karnal64: SPARC Tuzak İşleme Başlatıldı (Yer Tutucu)"); // Çekirdek içi print! gerektirir
 }
 
 
-// Zamanlayıcı kesme işleyicisi (DONANIMA ÖZGÜ UYGULAMA GEREKLİ! - ÖRNEK YAPI)
-// Bu fonksiyon, IVT'den veya bir merkezi trap dispatcher'ından çağrılır.
-#[no_mangle] // Linker script veya IVT/dispatcher tarafından çağrılabilir
-// Kesme işleyici fonksiyonları genellikle 'unsafe extern "C"' olarak tanımlanır.
-pub unsafe extern "C" fn timer_interrupt_handler() {
-    // ** Güvenlik: Bu işleyici unsafe'dir çünkü kesme bağlamında çalışır **
-    // ve donanımla doğrudan etkileşime girer. Yarış durumları ve side effect'lere dikkat!
-    // ** ÖNEMLİ: SPARC'ta trap işleyicileri register pencerelerini kaydetmelidir! **
-    // save/restore veya trap entry noktasında otomatik kaydetme (tstate.cwp) yapılmalıdır.
-
-    // ** DİKKAT: Bu bölüm DONANIMA ÖZGÜDÜR ve ZAMANLAYICI KILAVUZUNA GÖRE KODLANMALIDIR! **
-    // Bu işleyici çekirdek içinde çalışır, kullanıcı alanındaki Sahne64 API'sini doğrudan çağırmaz.
-    // Periyodik zamanlayıcı olayını çekirdek zamanlayıcıya bildirir.
-
-    // 1. Zamanlayıcı ile ilgili işlemleri gerçekleştir
-    // Örnek: Zamanlayıcı sayacını resetleme veya bir sonraki kesme zamanını ayarlama
-    // Bu genellikle donanım registerlarına yazarak yapılır (volatile kullanarak).
-     let timer_control_register_address = TIMER_BASE_ADDRESS.wrapping_add(TIMER_CONTROL_REGISTER_OFFSET); // Güvenli adres hesaplama
-     let mut timer_control_register = Volatile::new(timer_control_register_address as *mut u32); // Örnek: 32-bit register
-      timer_control_register.write(...); // Sayacı resetleme veya ayar değeri yazma
-
-     // Sahne64 çekirdek zamanlayıcısını güncelle (çekirdek içindeki bir fonksiyona çağrı)
-      kernel_timer_tick(); // Varsayımsal çekirdek fonksiyonu
-
-     // Debug çıktıları için Sahne64 konsol makrolarını kullan
-     #[cfg(feature = "std")] std::println!("SPARC Zamanlayıcı kesmesi işleniyor.");
-     #[cfg(not(feature = "std"))] println!("SPARC Zamanlayıcı kesmesi işleniyor."); // Sahne64 macro varsayımı
-
-
-    // 2. Kesme bayrağını temizle (donanıma özgü). BU ÇOK ÖNEMLİDİR!
-    // Kesme işlendikten sonra, kesme bayrağının TEMİZLENMESİ ZORUNLUDUR.
-    // Bu genellikle zamanlayıcı kontrol register'ındaki bir biti yazarak/temizleyerek yapılır.
-    unsafe {
-         let timer_irq_clear_register_address = TIMER_BASE_ADDRESS.wrapping_add(TIMER_CONTROL_REGISTER_OFFSET); // Genellikle aynı register veya farklı bir offset
-         let mut timer_irq_clear_register = Volatile::new(timer_irq_clear_register_address as *mut u32);
-         timer_irq_clear_register.write(TIMER_IRQ_CLEAR_VALUE as u32); // Temizleme değerini yaz (u32 varsayımı)
-         // **UYARI:** Temizleme register adresi/ofseti ve temizleme değeri DONANIMA GÖRE DEĞİŞİR.
-    }
-
-    // TODO: Kesme işleyiciden çıkış. Kaydedilen registerları geri yükle.
-    // TODO: rfe (return from exception) yönergesini kullan. Bu, PSR'nin PS/S bitlerini günceller ve CWP'yi önceki pencereye ayarlar.
-     asm!("rfe"); // Dönüş yönergesi (unsafe asm)
-    // NOT: Eğer exception entry noktası register kaydı ve rfe'yi yapıyorsa,
-    // bu handler sadece işini yapıp normal geri dönebilir.
-}
-
-// USB kesme işleyicisi (DONANIMA ÖZGÜ UYGULAMA GEREKLİ! - ÖRNEK YAPI)
-// Bu fonksiyon, IVT'den veya bir merkezi trap dispatcher'ından çağrılır.
-#[no_mangle] // Linker script veya IVT/dispatcher tarafından çağrılabilir
-// Kesme işleyicisi fonksiyonları genellikle 'unsafe extern "C"' olarak tanımlanır.
-pub unsafe extern "C" fn usb_interrupt_handler() {
-    // ** Güvenlik: Bu işleyici unsafe'dir çünkü kesme bağlamında çalışır **
-    // ve donanımla doğrudan etkileşime girer. Yarış durumları ve side effect'lere dikkat!
-    // ** ÖNEMLİ: SPARC'ta trap işleyicileri register pencerelerini kaydetmelidir! **
-
-    // ** DİKKAT: Bu bölüm DONANIMA ÖZGÜDÜR ve USB KONTROLCÜSÜ KILAVUZUNA GÖRE KODLANMALIDIR! **
-    // Bu işleyici çekirdek içinde çalışır, kullanıcı alanındaki Sahne64 API'sini doğrudan çağırmaz.
-    // Gelen USB verisini alır ve çekirdekteki USB sürücüsü koduna iletir.
-    // Ardından, bu veriyi bekleyen kullanıcı görevini Sahne64 çekirdek zamanlama mekanizması
-    // aracılığıyla uyandırır (örn. resource::read için bekleyen görev).
-
-    // 1. USB ile ilgili işlemleri gerçekleştir
-    // Örnek: Veri okuma, veri gönderme, durum kontrolü vb.
-    // Bu genellikle donanım registerlarına volatile okuma/yazma ile yapılır.
-     // TODO: USB durum register'ını oku, nedeni belirle (veri geldi mi, TX bitti mi vb.)
-     // TODO: Veriyi USB kontrolcüsünden oku veya gönderilecek veriyi kontrolcüye yaz.
-
-     // Debug çıktıları için Sahne64 konsol makrolarını kullan
-     #[cfg(feature = "std")] std::println!("SPARC USB kesmesi işleniyor.");
-     #[cfg(not(feature = "std"))] println!("SPARC USB kesmesi işleniyor."); // Sahne64 macro varsayımı
-
-
-    // 2. Kesme bayrağını temizle (donanıma özgü). BU ÇOK ÖNEMLİDİR!
-    // Kesme işlendikten sonra, kesme bayrağının TEMİZLENMESİ ZORUNLUDUR.
-    // Bu genellikle USB kontrolcüsünün kendi register'ındaki bir biti yazarak/temizleyerek yapılır.
-    unsafe {
-         let usb_irq_clear_register_address = USB_BASE_ADDRESS.wrapping_add(USB_IRQ_CLEAR_REGISTER_OFFSET); // Güvenli adres hesaplama
-         let mut usb_irq_clear_register = Volatile::new(usb_irq_clear_register_address as *mut u32); // Örnek: 32-bit register
-         usb_irq_clear_register.write(USB_IRQ_CLEAR_VALUE as u32); // Temizleme değerini yaz (u32 varsayımı)
-         // **UYARI:** Temizleme register adresi/ofseti ve temizleme değeri DONANIMA GÖRE DEĞİŞİR.
-    }
-
-    // TODO: Kesme işleyiciden çıkış. Kaydedilen registerları geri yükle.
-    // TODO: rfe (return from exception) yönergesini kullan.
-     asm!("rfe"); // Dönüş yönergesi (unsafe asm)
-    // NOT: Eğer exception entry noktası register kaydı ve rfe'yi yapıyorsa,
-    // bu handler sadece işini yapıp normal geri dönebilir.
-}
+// SPARC mimarisine özgü kontrol registerlarını okuma/yazma için yardımcı fonksiyonlar.
+// Bunlar genellikle inline assembly gerektirir.
+ #[inline]
+ fn read_sparc_far() -> u64 { unsafe { /* SPARC FAR okuma assembly */ } }
+ #[inline]
+ fn read_sparc_fsr() -> u64 { unsafe { /* SPARC FSR okuma assembly */ } }
+ #[inline]
+ fn write_sparc_ttr(addr: u64) { unsafe { /* SPARC TTR yazma assembly */ } }
