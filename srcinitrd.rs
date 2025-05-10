@@ -1,189 +1,142 @@
-#![no_std] // Standart kütüphaneye ihtiyaç duymuyoruz
+#![no_std] // Standart kütüphaneye ihtiyaç duymuyoruz, ilk kullanıcı süreci için tipik
+#![no_main] // Kendi giriş noktamızı tanımlıyoruz (main fonksiyonu)
 
-// Sahne64 API'sine erişim için gerekli modülleri içeri aktar
-// Bu, 'sahne64' crate'ine bağımlılık anlamına gelir.
-use sahne64::{
-    resource,  // Kaynak yönetimi
-    SahneError, // Hata türü
-    Handle,    // Kaynak tanıtıcısı
-};
-use core::slice; // initrd belleğine slice olarak erişmek için (örnek)
-use core::ptr; // Pointer işlemleri için
+// Bu initrd süreci, Karnal64 çekirdeği tarafından sağlanan sistem çağrılarını kullanır.
+// Aşağıdaki sabitler, Karnal64'ün handle_syscall fonksiyonunda tanımlanan
+// sistem çağrısı numaralarıyla EŞLEŞMELİDİR.
+// ÖNEMLİ: Karnal64 kodundaki syscall numaralarını kontrol edin ve gerekirse burayı güncelleyin.
+const SYSCALL_TASK_EXIT: u64 = 4; // Karnal64::handle_syscall'daki 4'e karşılık gelir
+const SYSCALL_RESOURCE_ACQUIRE: u64 = 5; // Karnal64::handle_syscall'daki 5'e karşılık gelir
+const SYSCALL_RESOURCE_WRITE: u64 = 7; // Karnal64::handle_syscall'daki 7'ye karşılık gelir
+const SYSCALL_TASK_SPAWN: u64 = 3; // Karnal64::handle_syscall'daki 3'e karşılık gelir
 
-// Çıktı makrolarını kullanabilmek için (Sahne64 tarafından sağlanan)
-// #[cfg] kullanımı önceki dosyalara paralel.
+// Kaynak edinme (acquire) modları için basit bit bayrakları.
+// Bunlar da Karnal64::kresource modülündeki tanımlarla eşleşmeli.
+const MODE_READ: u32 = 1 << 0; // Genellikle 1
+const MODE_WRITE: u32 = 1 << 1; // Genellikle 2
+const MODE_EXECUTE: u32 = 1 << 2; // Genellikle 4 (Varsayım)
 
-/// Initrd işlemleri sırasında oluşabilecek hataları tanımlar.
-#[derive(Debug)]
-pub enum InitrdError {
-    /// Sahne64 API çağrısı sırasında hata oluştu.
-    SahneApiError(SahneError),
-    /// Geçersiz initrd adresi veya boyutu.
-    InvalidAddressOrSize,
-    /// Initrd'yi kaydetmekten sorumlu kaynak yöneticisi edinilemedi.
-    ResourceManagerAcquisitionFailed(SahneError),
-    // Diğer initrd formatı parsing hataları vb. eklenebilir.
+// Çekirdek tarafından sağlanan ham sistem çağrısı fonksiyonlarının dış bildirimleri.
+// Bu fonksiyonlar doğrudan işlemci seviyesindeki 'syscall' komutunu tetikler
+// ve kontrolü çekirdekteki handle_syscall fonksiyonuna devreder.
+extern "C" {
+    // arg1: id_ptr (*const u8), arg2: id_len (usize), arg3: mode (u32)
+    // Başarı: handle (u64 pozitif), Hata: KError (-i64 negatif)
+    fn sys_resource_acquire(id_ptr: *const u8, id_len: usize, mode: u32) -> i64;
+
+    // arg1: handle (u64), arg2: buf_ptr (*const u8), arg3: buf_len (usize)
+    // Başarı: yazılan_byte_sayısı (usize pozitif), Hata: KError (-i64 negatif)
+    fn sys_resource_write(handle: u64, buf_ptr: *const u8, buf_len: usize) -> i64;
+
+    // arg1: code_handle (u64), arg2: args_ptr (*const u8), arg3: args_len (usize)
+    // Başarı: task_id (u64 pozitif), Hata: KError (-i64 negatif)
+    fn sys_task_spawn(code_handle: u64, args_ptr: *const u8, args_len: usize) -> i64;
+
+     arg1: exit_code (i32)
+    // Bu fonksiyon geri dönmez (!), doğrudan görevi sonlandırır.
+    fn sys_task_exit(code: i32) -> !;
+
+    // TODO: İhtiyaç duyuldukça diğer sistem çağrıları buraya eklenecek (memory, messaging vb.)
 }
 
-// From<SahneError> implementasyonu, Sahne64 hatalarını InitrdError'a çevirir.
-impl From<SahneError> for InitrdError {
-    fn from(error: SahneError) -> Self {
-        InitrdError::SahneApiError(error)
-    }
+// Panic durumunda çağrılacak fonksiyon.
+// initrd paniklerse genellikle yapılabilecek pek bir şey yoktur,
+// sistemi durdurmak en güvenli eylemdir.
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    // Eğer panik noktasına konsol handle'ı edinebildiysek, panik bilgisini yazabiliriz.
+    // Ancak bu basit implementasyonda, panik anında konsolun kullanılabilir olduğunu
+    // garanti etmek zordur. En basit yaklaşım süresiz döngüye girmektir.
+    loop {}
 }
 
-
-/// Başlangıç RAM diskini (initrd) Sahne64 sistemine kaydeder.
-///
-/// Bu fonksiyon, bellekte yüklü olan initrd bloğunun adresini ve boyutunu alır
-/// ve Sahne64 Kaynak Yöneticisi'ne bu initrd'yi kullanarak
-/// `sahne://initrd/` gibi bir isim altında kaynaklar sunmasını bildirir.
-///
-/// # Parametreler
-/// * `address`: Initrd'nin bellekteki başlangıç adresi.
-/// * `size`: Initrd bloğunun boyutu (bayt cinsinden).
-///
-/// # Geri Dönüş Değeri
-/// Başarılı olursa `Ok(())`, hata oluşursa `Err(InitrdError)`.
-///
-/// # Güvenlik
-/// `address` ve `size` parametrelerinin geçerli bir bellek bölgesini işaret ettiği
-/// çağırıcı tarafından garanti edilmelidir.
-pub fn init(address: usize, size: usize) -> Result<(), InitrdError> { // <-- Return Result
-    // Temel geçerlilik kontrolü
-    if address == 0 || size == 0 {
-        #[cfg(feature = "std")] std::eprintln!("Initrd::init: Geçersiz adres (0) veya boyut (0) sağlandı.");
-        #[cfg(not(feature = "std"))] eprintln!("Initrd::init: Geçersiz adres (0) veya boyut (0) sağlandı.");
-        return Err(InitrdError::InvalidAddressOrSize);
-    }
-    // Adres ve boyutun geçerli bir bellek bölgesine işaret ettiğini daha detaylı kontrol etmek
-    // platforma ve bootloader'a bağlıdır. Sahne64 çekirdeği bu kontrolü yapmalıdır.
-
-    #[cfg(feature = "std")] std::println!("Initrd::init: Initrd bellekte 0x{:X} adresinde, {} bayt boyutta.", address, size);
-    #[cfg(not(feature = "std"))] println!("Initrd::init: Initrd bellekte 0x{:X} adresinde, {} bayt boyutta.", address, size);
-
-
-    // ** Önemli: Initrd'yi Sahne64 Kaynak Yöneticisi'ne kaydetmek için API kullanımı **
-    // Sahne64 API'sinin initrd'yi kaydetmek için özel bir syscall veya resource::control isteği
-    // sağladığını varsayıyoruz. Bu, API'nin kullanıcı alanından çekirdeğe Initrd bilgisini aktarma yoludur.
-
-    // Initrd'yi kaydetmekten sorumlu özel bir kaynak (veya genel kaynak yöneticisi) edinelim.
-    // Varsayımsal resource ID: "sahne://resource/initrd_manager" veya "sahne://resource/"
-    let initrd_manager_resource_id = "sahne://resource/initrd_manager"; // Örnek ID
-
-    #[cfg(feature = "std")] std::println!("Initrd yöneticisi kaynağı '{}' ediniliyor...", initrd_manager_resource_id);
-    #[cfg(not(feature = "std"))] println!("Initrd yöneticisi kaynağı '{}' ediniliyor...", initrd_manager_resource_id);
-
-
-    // Kaynağı edin
-    match resource::acquire(initrd_manager_resource_id, resource::MODE_WRITE) { // Yazma izni isteyelim
-        Ok(manager_handle) => {
-            #[cfg(feature = "std")] std::println!("Initrd yöneticisi kaynağı edinildi. Handle: {:?}", manager_handle);
-            #[cfg(not(feature = "std"))] println!("Initrd yö yöneticisi kaynağı edinildi. Handle: {:?}", manager_handle);
-
-
-            // Varsayımsal resource::control isteği: INITRD_REGISTER
-            // Bu isteğin adres ve boyutu 64-bit argüman olarak aldığını varsayalım.
-            const INITRD_REGISTER_REQUEST: u64 = 1; // Örnek kontrol isteği kodu
-
-            #[cfg(feature = "std")] std::println!("Initrd kaydı için control isteği gönderiliyor...");
-            #[cfg(not(feature = "std"))] println!("Initrd kaydı için control isteği gönderiliyor...");
-
-
-            // control çağrısı Result<i64, SahneError> döner. Başarılı dönüş değeri yoruma bağlıdır.
-            match resource::control(manager_handle, INITRD_REGISTER_REQUEST, address as u64) { // Argüman 1: adres
-                 Ok(raw_result) => {
-                     // Başarılı dönüş değerini (raw_result) yorumla. Genellikle 0 başarılıdır.
-                     if raw_result >= 0 { // Negatif değerler resource::control tarafından hata olarak döndürülür
-                         #[cfg(feature = "std")] std::println!("Initrd kaydı başarılı. Kontrol sonucu: {}", raw_result);
-                         #[cfg(not(feature = "std"))] println!("Initrd kaydı başarılı. Kontrol sonucu: {}", raw_result);
-
-                         // Not: resource::control fonksiyonu sadece 3 argüman alır (handle, request, arg).
-                         // Initrd kaydı için hem adres hem boyut gerekiyorsa, API'nin
-                         // ya adres+boyutu paketleyen bir struct'ın pointer'ını 3. argüman olarak alması
-                         // ya da resource::control API'sinin daha fazla argümanı desteklemesi gerekir.
-                         // Mevcut API tanımına göre (sadece 1 arg), bu basit bir simülasyondur
-                         // veya API'nin genişletilmesi gereklidir.
-                         // Eğer API genişletilemezse, Shared Memory + IPC mesajlaşması ile bilgi göndermek gerekebilir.
-
-                         // Basitlik adına, boyut bilgisinin başka bir kontrol isteğiyle veya
-                         // adres argümanının bir parçası olarak (örn. struct pointer) gittiğini varsayalım.
-                         // Mevcut API ile tam uyum için, belki adres ve boyut ayrı control çağrılarıyla gider?
-                         // Veya adres argümanı, bir SharedMemory handle'ı + offset'i temsil eder?
-                         // En basit varsayım: resource::control(handle, INITRD_REGISTER_REQUEST, (adres << 32 | boyut)) gibi bir paketleme (eğer boyut küçükse).
-                         // Veya adres argümanı olarak struct pointer: resource::control(handle, INITRD_REGISTER_REQUEST, initrd_info_struct_ptr as u64)
-                         // Mevcut API'ye en uygun olan, tek bir u64 argümanı kullanmaktır. İkinci argüman olarak boyutu gönderebilsek ideal olurdu.
-                         // API'yi temel alarak, adres ve boyutun tek argümanla veya birden çok control çağrısıyla gittiğini varsayalım.
-                         // Şimdilik tek control çağrısı ve adres argümanını kullanalım, boyutun başka yolla iletildiğini varsayarak.
-
-                         Ok(()) // Başarıyı bildir
-                     } else {
-                         // resource::control'ün negatif değer döndürmesi zaten hata olmalıydı.
-                         // Buraya düşmek, API veya çekirdekte beklenmedik bir durum olduğunu gösterebilir.
-                         #[cfg(feature = "std")] std::eprintln!("Initrd kaydı başarısız: control çağrısı negatif değer döndürdü {}", raw_result);
-                         #[cfg(not(feature = "std"))] eprintln!("Initrd kaydı başarısız: control çağrısı negatif değer döndürdü {}", raw_result);
-                         // Hata zaten Err(SahneError) olarak map edilmiş olmalıydı.
-                         // Eğer bu Err'den gelen bir dönüş değilse, UnknownSystemCall veya benzeri bir hata dönebiliriz.
-                         Err(InitrdError::SahneApiError(SahneError::UnknownSystemCall)) // Simülasyon hatası
-                     }
-                 }
-                 Err(e) => {
-                     // resource::control çağrısı sırasında Sahne64 API hatası oluştu
-                     #[cfg(feature = "std")] std::eprintln!("Initrd kaydı için control çağrısı hatası: {:?}", e);
-                     #[cfg(not(feature = "std"))] eprintln!("Initrd kaydı için control çağrısı hatası: {:?}", e);
-                     Err(InitrdError::from(e)) // SahneError'ı InitrdError'a çevir
-                 }
-            }
-
-            // Not: manager_handle artık kullanılmayacaksa burada serbest bırakılabilir.
-            // Eğer manager kalıcı ise veya başka işlemler için gerekliyse tutulur.
-             resource::release(manager_handle); // Eğer handle geçici ise
-        }
-        Err(e) => {
-            // Initrd yöneticisi kaynağı edinilemedi hatası
-            #[cfg(feature = "std")] std::eprintln!("Initrd yöneticisi kaynağı '{}' edinilemedi: {:?}", initrd_manager_resource_id, e);
-            #[cfg(not(feature = "std"))] eprintln!("Initrd yö yöneticisi kaynağı '{}' edinilemedi: {:?}", initrd_manager_resource_id, e);
-            Err(InitrdError::ResourceManagerAcquisitionFailed(e)) // Özel hata varyantı kullan
-        }
-    }
+// Temel konsol yazma fonksiyonu.
+// Güvenlik notu: Çekirdek sistem çağrısı `sys_resource_write` zaten kullanıcı buffer'ını doğrulamalıdır.
+fn write_to_console(console_handle: u64, message: &str) {
+    let bytes = message.as_bytes();
+    // sys_resource_write hata dönebilir, ancak initrd için temel yazdırmada
+    // hataları ele almak genelde karmaşıktır. Şimdilik sonucu yoksayıyoruz.
+    let _ = unsafe { sys_resource_write(console_handle, bytes.as_ptr(), bytes.len()) };
 }
 
-// --- Örnek Kullanım (Platform başlangıç kodundan çağrılır) ---
-// Bu fonksiyon normal bir main değildir, platformun _start fonksiyonu tarafından çağrılır.
-// Test amacıyla bir #[cfg(feature = "std")] main eklenebilir, ancak gerçek kullanım _start'tadır.
+// Initrd'nin ana giriş noktası.
+// Çekirdek boot işlemi bittikten sonra ilk bu fonksiyon çalıştırılır.
+#[no_mangle]
+pub extern "C" fn main() -> ! {
+    let mut console_handle: u64 = 0; // Başlangıçta geçersiz handle değeri
 
-#[cfg(feature = "std")]
-fn main() {
-     // Bu örnek std ortamında çalışacak şekilde yapılandırılmıştır.
-     // no_std ortamında Sahne64'ün çıktı makroları veya özel bir çıktı mekanizması gerektirir.
+    // 1. Konsol kaynağını edin. Bu, çıktı alabilmemizi sağlar.
+    let console_path = "karnal://device/console"; // Çekirdeğin konsol kaynağını bu isimle kaydettiğini varsayıyoruz.
+    let path_bytes = console_path.as_bytes();
 
-     #[cfg(feature = "std")] std::println!("Initrd Modülü Test Örneği (std)");
-     #[cfg(not(feature = "std"))] println!("Initrd Modülü Test Örneği (no_std)");
+    // Konsol için yazma izniyle bir handle talep et.
+    let result = unsafe {
+        sys_resource_acquire(path_bytes.as_ptr(), path_bytes.len(), MODE_WRITE)
+    };
+
+    if result < 0 {
+        // Eğer konsol handle'ı edinemezsek, hata mesajı yazdıramayız.
+        // Bu durumda yapılabilecek en iyi şey bir hata koduna dönmek (initrd için geçerli değil, çünkü geri dönmez)
+        // veya basitçe süresiz döngüye girmektir.
+        loop {}
+    }
+
+    console_handle = result as u64;
+    write_to_console(console_handle, "Karnal64 Initrd: Konsol edinildi.\n");
+    write_to_console(console_handle, "Karnal64 Initrd: Basit Dahili Init Sistemi başlatılıyor...\n");
 
 
-     // Varsayımsal initrd belleği
-     let mut initrd_memory: [u8; 4096] = [0; 4096]; // 4KB initrd simülasyonu
-     // Normalde bootloader bu belleği yükler.
-      initrd içeriğini simüle etmek için ilk birkaç byte'a "cpio" signature yazalım
-      initrd_memory[0..4].copy_from_slice(b"cpio"); // Slice kullanmak için core::slice import et
-     unsafe { ptr::copy_nonoverlapping(b"cpio".as_ptr(), initrd_memory.as_mut_ptr(), 4); }
+    // 2. Asıl 'init' programının kaynağını edin.
+    // Bu genellikle initrd imajının içine gömülmüş bir program olacaktır,
+    // veya çekirdeğin basit bir sanal dosya sistemi sağlayıp sağlamadığına bağlıdır.
+    // Yaygın bir yol, initrd içine `/sbin/init` adıyla paketlenmiş bir programın olmasıdır.
+    let main_init_path = "/sbin/init"; // Başlatılacak asıl init programının yolu
+    let init_path_bytes = main_init_path.as_bytes();
+
+    // Programı çalıştırmak için execute izniyle bir handle talep et.
+    let init_handle_result = unsafe {
+        sys_resource_acquire(init_path_bytes.as_ptr(), init_path_bytes.len(), MODE_EXECUTE)
+    };
+
+    if init_handle_result < 0 {
+        write_to_console(console_handle, "Karnal64 Initrd: '/sbin/init' kaynağı edinilemedi! Hata!\n");
+        // Kaynak edinilemezse devam edemeyiz, sistemi durdur.
+        loop {}
+    }
+
+    let init_handle = init_handle_result as u64;
+    write_to_console(console_handle, "Karnal64 Initrd: '/sbin/init' kaynağı edinildi.\n");
 
 
-     let initrd_address = initrd_memory.as_ptr() as usize;
-     let initrd_size = initrd_memory.len();
+    // 3. '/sbin/init' programını yeni bir görev (task) olarak başlat.
+    // Şu an için argüman veya ortam değişkeni geçmiyoruz.
+    let args: [u8; 0] = []; // Argümanlar için boş byte slice
 
-     // Initrd'yi başlat/kaydet
-     match init(initrd_address, initrd_size) {
-         Ok(()) => {
-             #[cfg(feature = "std")] std::println!("Initrd başarıyla kaydedildi!");
-             #[cfg(not(feature = "std"))] println!("Initrd başarıyla kaydedildi!");
+    let spawn_result = unsafe {
+        sys_task_spawn(init_handle, args.as_ptr(), args.len())
+    };
 
-             // Artık Sahne64 Kaynak API'sini kullanarak initrd içindeki dosyalara erişilebilir olmalı:
-              match resource::acquire("sahne://initrd/bin/init", resource::MODE_READ) { ... }
-         }
-         Err(e) => {
-              #[cfg(feature = "std")] std::eprintln!("Initrd kaydı başarısız: {:?}", e);
-              #[cfg(not(feature = "std"))] eprintln!("Initrd kaydı başarısız: {:?}", e);
-         }
-     }
+    if spawn_result < 0 {
+        write_to_console(console_handle, "Karnal64 Initrd: '/sbin/init' görevi başlatılamadı! Hata!\n");
+        // Görev başlatılamazsa devam edemeyiz, sistemi durdur.
+        loop {}
+    }
+
+    let init_task_id = spawn_result as u64; // Başarılı olursa TaskID döner
+    write_to_console(console_handle, "Karnal64 Initrd: '/sbin/init' görevi başlatıldı. (TaskID: ");
+    // TODO: TaskID'yi yazdırmak için sayıdan stringe çevirme fonksiyonu gerekli (şu an yok)
+    // write_to_console(console_handle, &init_task_id.to_string());
+    write_to_console(console_handle, "...)\n");
+
+
+    // 4. Initrd görevi amacına ulaştı (asıl init sürecini başlattı).
+    // Artık initrd görevi sonlanabilir.
+    write_to_console(console_handle, "Karnal64 Initrd: Initrd görevi sonlanıyor.\n");
+    unsafe {
+        sys_task_exit(0); // Başarılı çıkış kodu (0) ile görevi sonlandır.
+    }
+
+    // Bu noktaya asla ulaşılmamalıdır. Eğer ulaşılırsa, bir hata var demektir.
+    write_to_console(console_handle, "Karnal64 Initrd: Hata: Initrd sonlanamadı! Süresiz döngüye giriliyor.\n");
+    loop {}
 }
