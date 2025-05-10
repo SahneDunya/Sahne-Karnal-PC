@@ -1,246 +1,265 @@
-#![no_std]
-#[allow(dead_code)] // Keep if needed
+use super::karnal64::{
+    // Karnal64 API'sından ihtiyaç duyulan tipleri içe aktar
+    KError,
+    ResourceProvider, // Implemente edeceğimiz trait
+    Result,           // Result<T, KError> kısayolu
+    KHandle,          // Sadece kayıt sırasında gerekebilir, provider kendisi handle ile çalışmaz
+};
 
-use core::fmt;
-use core::fmt::Write;
-// Use Sahne64 resource, kernel (for control), SahneError, and Handle
-use sahne64::{resource, kernel, SahneError, Handle}; // <-- Changed imports
-// No need for crate::fs as it's replaced by sahne64::resource
-// No direct need for crate::kernel here, resource::control wraps ioctl-like calls
-// Need access to the custom print/eprintln macros from Sahne64's stdio_impl in no_std
-// Assuming these are made available.
-
-/// USB CDC-ACM seri portunu Sahne64 kaynak API'si üzerinden yöneten yapı.
-pub struct UsbSerial {
-    console_handle: Option<Handle>, // <-- Değişiklik 1: Dosya tanımlayıcısı yerine Handle
-     usb_base_address: usize, // USB denetleyici base adresi - Artık doğrudan erişilmiyor (yorum satırı kalsın)
-     tx_endpoint_address: u8, // İletim endpoint adresi - Artık doğrudan yönetilmiyor (yorum satırı kalsın)
-     rx_endpoint_address: u8, // Alım endpoint adresi - Artık doğrudan yönetilmiyor (yorum satırı kalsın)
-    // ... diğer gerekli donanım kaynakları ve konfigürasyon bilgileri ...
+// Karnal64 kresource modülünden gelmesi gereken tipler ve sabitler
+// Normalde bunlar kresource içinde tanımlanır ve oradan import edilir.
+// Şimdilik burada kendi dummy tanımlarımızı kullanıyoruz.
+// Kernel geliştirdikçe bu tipler kresource modülüne taşınmalıdır.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum KseekFrom {
+    Start(u64),
+    Current(i64),
+    End(i64),
 }
 
-impl UsbSerial {
-    /// Yeni bir `UsbSerial` örneği oluşturur (başlatılmamış).
-    pub const fn new() -> Self {
-        Self {
-            console_handle: None, // Handle başlangıçta yok
-             usb_base_address: 0, // Artık kullanılmıyor
-             tx_endpoint_address: 0, // Artık kullanılmıyor
-             rx_endpoint_address: 0, // Artık kullanılmıyor
-        }
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct KResourceStatus {
+    // Örnek alanlar, kaynağa göre değişir
+    pub readable: bool,
+    pub writable: bool,
+    pub seekable: bool,
+    pub size: Option<u64>, // Dosya boyutu gibi, konsol için None olabilir
+    // Diğer durum bilgileri eklenebilir
+}
+
+// Karnal64 kresource modülünden gelmesi gereken mode sabitleri
+// Normalde kresource içinde tanımlanır.
+pub const MODE_READ: u32 = 1 << 0;
+pub const MODE_WRITE: u32 = 1 << 1;
+// TODO: Diğer modlar...
+
+// İçerideki kaynak yöneticisi fonksiyonları için yer tutucular
+// Gerçek implementasyonlar kresource modülünde olmalı.
+mod kresource_internal_placeholders {
+    use super::*;
+
+    // Dummy Kaynak Kayıt Yöneticisi fonksiyonu
+    // Gerçek versiyon provider'ı bir tabloya kaydeder.
+    pub fn register_provider(id: &str, provider: Box<dyn ResourceProvider>) -> Result<KHandle, KError> {
+        // Bu gerçek bir kayıt yapmaz, sadece simüle eder
+        println!("Karnal64: Dummy olarak Kaynak Sağlayıcı kaydedildi: {}", id);
+        // Gerçek implementasyonda bir handle oluşturup provider ile eşlemeli
+        Ok(KHandle(id.as_bytes()[0] as u64)) // Basit bir dummy handle
     }
 
-    /// USB üzerinden veri gönderme fonksiyonu (Sahne64 resource::write sistem çağrısını kullanır).
-    ///
-    /// # Parametreler
-    /// * `data`: Gönderilecek veri dilimi.
-    ///
-    /// # Not
-    /// Başarısızlık durumunda hata mesajını loglar.
-    fn usb_send(&self, data: &[u8]) {
-        // Değişiklik 2: fd yerine console_handle kullan
-        if let Some(handle) = self.console_handle.filter(|h| h.is_valid()) { // Handle geçerli mi kontrolü eklendi
-            // Değişiklik 2: fs::write yerine resource::write kullan
-            match resource::write(handle, data) {
-                Ok(bytes_written) => {
-                    if bytes_written != data.len() {
-                        // Çıktı makroları için cfg ayarı
-                        #[cfg(feature = "std")] std::println!("Uyarı: Tüm veri yazılamadı. Yazılan: {}, Toplam: {}", bytes_written, data.len());
-                        #[cfg(not(feature = "std"))] println!("Uyarı: Tüm veri yazılamadı. Yazılan: {}, Toplam: {}", bytes_written, data.len());
+     // Handle izin kontrolü için dummy fonksiyon
+     pub fn handle_has_permission(handle: &KHandle, mode: u32) -> bool {
+         // Dummy: Her handle için yazma izni olduğunu varsayalım
+         (mode & MODE_WRITE) != 0
+     }
+
+     // Provider lookup için dummy fonksiyon
+     pub fn lookup_provider_by_name(name: &str) -> Result<&'static dyn ResourceProvider, KError> {
+         // Bu dummy implementasyon sadece "karnal://device/console" için
+         // statik bir dummy provider döndürür. Gerçekte kayıtlı sağlayıcılara bakılır.
+         println!("Karnal64: Dummy olarak provider '{}' arandı.", name);
+         if name == "karnal://device/console" {
+             // Statik bir provider instance'ı döndürmek karmaşıktır.
+             // Genellikle provider'lar dynamic dispatch (Box<dyn>) veya statik kaydedilmiş
+             // referanslar üzerinden yönetilir. Burada basitleştirilmiş bir senaryo.
+             // NOTE: 'static lifetime burada tehlikelidir, gerçek implementasyonda
+             // sağlayıcıların ömrü dikkatlice yönetilmelidir.
+             struct DummyConsoleProvider; // Yerel dummy struct
+             impl ResourceProvider for DummyConsoleProvider {
+                fn read(&self, _buffer: &mut [u8], _offset: u64) -> Result<usize, KError> { Err(KError::NotSupported) }
+                fn write(&self, buffer: &[u8], _offset: u64) -> Result<usize, KError> {
+                    // Gerçekte konsola yazacak kod burada olurdu (örn: VGA buffer, serial port)
+                    // Şimdilik sadece debug çıktısı verelim veya simüle edelim.
+                    // Güvenli kernel çıktı mekanizması kullanılmalı.
+                    #[cfg(feature = "debug_console_print")] // Özellik bayrağı ile kontrol
+                    {
+                        let s = core::str::from_utf8(buffer).unwrap_or("<invalid utf8>");
+                        // Varsayımsal kernel debug print fonksiyonu
+                         kernel_debug::print!("{}", s); // Gerçekte böyle bir şey kullanılabilir
+                        println!("(Konsol Çıktısı Simülasyonu) {}", s);
                     }
+                    Ok(buffer.len())
                 }
-                Err(e) => {
-                    // Çıktı makroları için cfg ayarı
-                     #[cfg(feature = "std")] std::eprintln!("USB yazma hatası: {:?}", e);
-                     #[cfg(not(feature = "std"))] eprintln!("USB yazma hatası: {:?}", e);
+                fn control(&self, request: u64, arg: u64) -> Result<i64, KError> { Err(KError::NotSupported) }
+                fn seek(&self, position: KseekFrom) -> Result<u64, KError> { Err(KError::NotSupported) }
+                fn get_status(&self) -> Result<KResourceStatus, KError> {
+                    Ok(KResourceStatus { readable: false, writable: true, seekable: false, size: None })
                 }
+             }
+             // Bu unsafe veya static bir referans döndürmeyi gerektirir.
+             // Gerçek Resource Manager, bu nesnelerin yaşam döngüsünü yönetir.
+             // Burada sadece kavramsal olarak provider'a erişildiği gösteriliyor.
+             Err(KError::NotFound) // Dummy lookup başarısız
+         } else {
+             Err(KError::NotFound)
+         }
+     }
+
+    // Handle yönetimi için dummy fonksiyon
+    pub fn issue_handle(_provider: &dyn ResourceProvider, mode: u32) -> KHandle {
+        // Gerçek Handle Manager yeni bir handle değeri üretir ve durumu kaydeder.
+        println!("Karnal64: Dummy handle üretildi.");
+        KHandle(1001) // Rastgele dummy handle
+    }
+
+     pub fn release_handle(handle: u64) -> Result<(), KError> {
+         // Gerçek Handle Manager handle'ı geçersiz kılar ve kaynağa bilgi verebilir.
+         println!("Karnal64: Dummy handle {} serbest bırakıldı.", handle);
+         if handle == 0 { Err(KError::BadHandle) } else { Ok(()) }
+     }
+}
+
+// Karnal64 tarafından kullanılan iç resource fonksiyonlarını taklit et
+use kresource_internal_placeholders::{
+    register_provider,
+     lookup_provider_by_name, // Bu fonksiyon Karnal64 API'sı (karnal64.rs) tarafından kullanılır, burada değil
+     issue_handle, // Bu fonksiyon Karnal64 API'sı (karnal64.rs) tarafından kullanılır, burada değil
+     release_handle, // Bu fonksiyon Karnal64 API'sı (karnal64.rs) tarafından kullanılır, burada değil
+};
+
+
+/// Sistem konsolu için Karnal64 Kaynak Sağlayıcısı (ResourceProvider) implementasyonu.
+pub struct KernelConsole;
+
+// TODO: Konsola yazmak için donanıma özgü veya simüle edilmiş düşük seviyeli fonksiyon
+ #[cfg(feature = "vga_text_mode")]
+ fn write_to_vga(byte: u8);
+ #[cfg(feature = "serial_port")]
+ fn write_to_serial(byte: u8);
+
+// Basit bir placeholder/simülasyon fonksiyonu
+fn kernel_console_write_byte(byte: u8) {
+    // Gerçekte burası VGA metin moduna veya seri porta yazardı.
+    // Şimdilik bir debug çıktı mekanizması (varsa) veya basit bir simülasyon yapabiliriz.
+    // Örneğin, QEMU veya başka bir emülatörün debug portuna yazmak.
+    #[cfg(feature = "debug_console_sim")]
+    {
+       // Varsayımsal bir debug çıktı fonksiyonu
+       extern "C" { fn debug_print_byte(byte: u8); }
+       unsafe { debug_print_byte(byte); }
+    }
+    // Veya çok basit bir derleme zamanı uyarısı/mesajı
+     const _ : () = {
+         core::panic!("KernelConsole::write_byte called with {}", byte as char);
+     };
+}
+
+
+impl ResourceProvider for KernelConsole {
+    /// Konsoldan okuma işlemi (çoğunlukla desteklenmez veya farklı bir mekanizma kullanır).
+    /// Temel implementasyonda okunamaz olduğunu belirtiyoruz.
+    fn read(&self, buffer: &mut [u8], offset: u64) -> Result<usize, KError> {
+        // Konsol okumaları genellikle satır tamponlama, kesmeler ve senkronizasyon gerektirir.
+        // Bu temel implementasyonda desteklenmiyor olarak işaretleniyor.
+        Err(KError::NotSupported)
+        // Alternatif: Eğer non-blocking ise 0 döndür, blocking ise blokla veya hata ver.
+         Err(KError::Busy) // Kaynak meşgul (şimdilik okunacak veri yok gibi)
+    }
+
+    /// Konsola yazma işlemi.
+    /// buffer: Yazılacak veriyi içeren çekirdek alanı tamponu (kernel tarafından kullanıcı tamponundan kopyalanmış/doğrulanmış olmalı).
+    /// offset: Konsol gibi akış tabanlı cihazlarda genellikle göz ardı edilir.
+    fn write(&self, buffer: &[u8], offset: u64) -> Result<usize, KError> {
+        // Offset'i konsolda genellikle görmezden geliriz.
+        let mut bytes_written = 0;
+        for &byte in buffer {
+            // Çoğu terminal \n aldığında sadece satır atlar, \r\n bekler.
+            // Donanım katmanımız bunu otomatik yapmıyorsa biz ekleyebiliriz.
+            if byte == b'\n' {
+                kernel_console_write_byte(b'\r');
             }
-        } else {
-            // Çıktı makroları için cfg ayarı
-             #[cfg(feature = "std")] std::eprintln!("Hata: USB seri portu henüz başlatılmadı veya Handle geçersiz.");
-             #[cfg(not(feature = "std"))] eprintln!("Hata: USB seri portu henüz başlatılmadı veya Handle geçersiz.");
+            kernel_console_write_byte(byte);
+            bytes_written += 1;
+        }
+        Ok(bytes_written)
+    }
+
+    /// Konsola özel kontrol komutları gönderir.
+    /// request: Komut kodu (örn: ekranı temizle, imleci ayarla - eğer destekleniyorsa)
+    /// arg: Komut argümanı
+    fn control(&self, request: u64, arg: u64) -> Result<i64, KError> {
+        // TODO: Konsola özgü kontrol komutları tanımla ve burada işle.
+        // Örnek dummy komutlar:
+        match request {
+             1 => // CLEAR_SCREEN
+             2 => // SET_CURSOR_POS (arg = y << 32 | x)
+            _ => {
+                println!("Karnal64::KernelConsole: Desteklenmeyen kontrol isteği: {}", request);
+                Err(KError::NotSupported)
+            }
         }
     }
 
-    /// USB Denetleyici ve CDC-ACM Sürücüsü Başlatma (Sahne64 resource::acquire sistem çağrısını kullanır).
-    ///
-    /// # Parametreler
-    /// * `device_resource_id`: USB CDC-ACM aygıtını temsil eden Sahne64 kaynak ID'si.
-    ///
-    /// # Not
-    /// Başarısızlık durumunda hata mesajlarını loglar.
-    pub fn init_usb_hardware(&mut self, device_resource_id: resource::ResourceId) { // <-- Add resource ID parameter
-        // Çıktı makroları için cfg ayarı
-         #[cfg(feature = "std")] std::println!("USB Konsolu '{}' Açılıyor...", device_resource_id);
-         #[cfg(not(feature = "std"))] println!("USB Konsolu '{}' Açılıyor...", device_resource_id);
-
-
-        // Değişiklik 3: fs::open yerine resource::acquire kullan
-        // resource::acquire Result<Handle, SahneError> döner
-        match resource::acquire(device_resource_id, resource::MODE_READ | resource::MODE_WRITE) {
-            Ok(handle) => {
-                self.console_handle = Some(handle);
-                 // Çıktı makroları için cfg ayarı
-                #[cfg(feature = "std")] std::println!("USB Konsolu Açıldı! Handle: {:?}", handle);
-                #[cfg(not(feature = "std"))] println!("USB Konsolu Açıldı! Handle: {:?}", handle);
-
-
-                // Değişiklik 4: Baud hızı gibi ayarları yapılandırmak için resource::control kullanılabilir
-                // Bu kısım simüle ediliyor, gerçek istek kodları GPU sürücüsü gibi cihaza özgüdür.
-                // Varsayımsal bir CONTROL_SET_BAUD_RATE isteği ve 115200 argümanı kullanalım.
-                const CONTROL_SET_BAUD_RATE: u64 = 1; // Örnek kontrol isteği kodu
-                let baud_rate: u64 = 115200; // Örnek baud hızı
-
-                match resource::control(handle, CONTROL_SET_BAUD_RATE, baud_rate) {
-                     Ok(result_val) => {
-                         // Çıktı makroları için cfg ayarı
-                         #[cfg(feature = "std")] std::println!("USB ayarları yapılandırıldı ({} baud). Kontrol sonucu: {}", baud_rate, result_val);
-                         #[cfg(not(feature = "std"))] println!("USB ayarları yapılandırıldı ({} baud). Kontrol sonucu: {}", baud_rate, result_val);
-                     }
-                     Err(e) => {
-                         // Çıktı makroları için cfg ayarı
-                         #[cfg(feature = "std")] std::eprintln!("USB ayarları yapılandırılırken hata: {:?}", e);
-                         #[cfg(not(feature = "std"))] eprintln!("USB ayarları yapılandırılırken hata: {:?}", e);
-                     }
-                }
-            }
-            Err(e) => {
-                 // Çıktı makroları için cfg ayarı
-                 #[cfg(feature = "std")] std::eprintln!("USB Konsolu '{}' açılırken hata: {:?}", device_resource_id, e);
-                 #[cfg(not(feature = "std"))] eprintln!("USB Konsolu '{}' açılırken hata: {:?}", device_resource_id, e);
-                 // Hata detayını ayrıca yazdırmaya gerek yok, {:?} SahneError'ı zaten detaylı gösterir.
-                  #[cfg(feature = "std")] std::println!("Hata Detayı: {:?}", e); // Kaldırıldı
-                  #[cfg(not(feature = "std"))] println!("Hata Detayı: {:?}", e); // Kaldırıldı
-            }
-        }
+    /// Konsol seekable bir kaynak değildir.
+    fn seek(&self, position: KseekFrom) -> Result<u64, KError> {
+        Err(KError::NotSupported)
     }
 
-    // Kaynak Handle'ını serbest bırakmak için bir deinitialization fonksiyonu (isteğe bağlı ancak önerilir)
-    // Singleton statik durumunda Drop tam olarak kontrol edilemeyebilir, bu yüzden explicit deinit faydalı olabilir.
-    pub fn deinit_usb_hardware(&mut self) -> Result<(), SahneError> {
-        if let Some(handle) = self.console_handle.take() { // Handle'ı al ve None yap
-            if handle.is_valid() {
-                // Çıktı makroları için cfg ayarı
-                #[cfg(feature = "std")] std::println!("USB Konsolu Kaynak Handle'ı serbest bırakılıyor: {:?}", handle);
-                #[cfg(not(feature = "std"))] println!("USB Konsolu Kaynak Handle'ı serbest bırakılıyor: {:?}", handle);
-
-                // resource::release Result<(), SahneError> döner
-                resource::release(handle)
-            } else {
-                // Çıktı makroları için cfg ayarı
-                #[cfg(feature = "std")] std::println!("USB Konsolu Handle zaten geçersizdi.");
-                #[cfg(not(feature = "std"))] println!("USB Konsolu Handle zaten geçersizdi.");
-                Ok(())
-            }
-        } else {
-            // Çıktı makroları için cfg ayarı
-            #[cfg(feature = "std")] std::println!("USB Konsolu Handle zaten None idi.");
-            #[cfg(not(feature = "std"))] println!("USB Konsolu Handle zaten None idi.");
-            Ok(()) // Zaten serbest bırakılmış gibi kabul et
-        }
+    /// Konsolun durumunu (okunabilir/yazılabilir vb.) döndürür.
+    fn get_status(&self) -> Result<KResourceStatus, KError> {
+        Ok(KResourceStatus {
+            readable: false, // Temel konsol okumayı desteklemez
+            writable: true,  // Yazılabilir
+            seekable: false, // Seekable değil
+            size: None,      // Boyutu yok
+        })
     }
 }
 
-// Console yapısı (değişiklik yok, sadece başvurduğu UsbSerial değişti)
-/// Konsol çıktı arayüzünü sağlar.
-/// İçsel olarak bir `UsbSerial` örneğini kullanarak çıktı verir.
-pub struct Console {
-    // Statik mutable referans yerine belki UnsafeCell içinde UsbSerial tutulabilir?
-    // Ancak global static singleton deseni için &'static mut yaygın bir no_std hilesidir.
-    usb_serial: &'static mut UsbSerial, // Mutable referans
-}
-
-impl Console {
-    /// Yeni bir `Console` örneği oluşturur.
-    /// # Güvenlik
-    /// Sağlanan `usb_serial` referansının 'static ömürlü ve tekil mutable erişime sahip olduğundan emin olunmalıdır.
-    pub const fn new(usb_serial: &'static mut UsbSerial) -> Self {
-        Self { usb_serial }
-    }
-}
-
-// Formatlı çıktı için Write trait uygulaması (değişiklik yok, altındaki usb_send değişti)
-impl fmt::Write for Console {
-    /// String dilimini konsola yazar.
-    /// Dahili olarak `usb_serial.usb_send` fonksiyonunu kullanır.
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-         // console_print fonksiyonunu çağırmak yerine doğrudan usb_serial kullanabiliriz
-          console_print(self, s); // Kaldırıldı
-         self.usb_serial.usb_send(s.as_bytes());
-         Ok(()) // usb_send hatalarını loglar, Write trait'i Result dönmez
-    }
-}
-
-// Makrolar (Değişiklik yok, CONSOLE global static'ini kullanıyorlar)
-// Bu makroların kullanıldığı crate'te (bu dosya gibi) Sahne64 macro_use ayarının yapıldığı varsayılır.
-#[macro_export]
-macro_rules! print {
-    ($($arg:tt)*) => ({
-         core::fmt::Write trait'ine gerek yok, write! macro'su otomatik getirir
-         use core::fmt::Write; // Kaldırıldı
-        // crate::console::CONSOLE global static'ine yaz
-        let _ = write!(crate::console::CONSOLE, $($arg)*);
-    });
-}
-
-#[macro_export]
-macro_rules! println {
-    () => (print!("\r\n"));
-    ($($arg:tt)*) => ({
-          core::fmt::Write trait'ine gerek yok
-         use core::fmt::Write; // Kaldırıldı
-        // crate::console::CONSOLE global static'ine yaz
-        let _ = write!(crate::console::CONSOLE, $($arg)*);
-        print!("\r\n"); // Satır sonu ekle
-    })
-}
-
-// Örnek kullanım ve başlatma
-// Global static mutable örnekler. Sahne64 çalışma zamanı başlangıcında
-// yalnızca bir kez başlatılmaları gerekmektedir.
-// Güvenli olmayan (unsafe) kullanıma dikkat edilmelidir.
-// console modülü genellikle bir kez init fonksiyonu ile başlatılır ve
-// makrolar global statik üzerinden kullanılır.
-pub static mut USB_SERIAL: UsbSerial = UsbSerial::new(); // Mutable static USB seri port örneği
-pub static mut CONSOLE: Console = Console::new(unsafe { &mut USB_SERIAL }); // Mutable static Konsol örneği
-
-/// Konsol sistemini başlatır.
-/// USB seri donanımını Sahne64 kaynak API'sini kullanarak açar.
-/// Bu fonksiyon sistem başlangıcında bir kez çağrılmalıdır.
+/// Konsol kaynağını başlatan ve Karnal64'e kaydeden fonksiyon.
+/// Kernel başlangıcında Karnal64'ün init fonksiyonu tarafından çağrılmalıdır.
 pub fn init() {
-    // Çıktı makroları henüz tam çalışmayabilir, ancak init_usb_hardware içinde loglama var.
-    // Burada Sahne64'ün kendi çekirdek başlangıç çıktı mekanizması varsa kullanılabilir.
-    // Şimdilik çıktı makrolarını kullanıyoruz, resource::acquire'dan sonra çalışacaktır.
+    // KarnalConsole instance'ını oluştur.
+    let console_provider = KernelConsole;
 
-     #[cfg(feature = "std")] std::println!("Sahne64 USB Konsolu Başlatılıyor...");
-     #[cfg(not(feature = "std"))] println!("Sahne64 USB Konsolu Başlatılıyor...");
+    // ResourceProvider trait object'e çevirmek için Box kullan
+    // Box kullanabilmek için 'alloc' crate'inin kullanılabilir ve başlatılmış olması gerekir.
+    let boxed_provider: Box<dyn ResourceProvider> = Box::new(console_provider);
 
-
-    unsafe {
-        // Değişiklik 3: init_usb_hardware fonksiyonu artık resource ID parametresi alıyor
-        // USB CDC-ACM aygıtının Sahne64 kaynak ID'si (örnek)
-        let usb_cdc_resource_id = "sahne://device/ttyUSB0";
-        USB_SERIAL.init_usb_hardware(usb_cdc_resource_id); // Donanım başlatma fonksiyonunu çağır
+    // Kaynak sağlayıcıyı Karnal64 kaynak yöneticisine kaydet.
+    // Çekirdek içindeki bilinen bir isimle ("karnal://device/console") kaydediyoruz.
+    // Kullanıcı alanı bu isimle resource_acquire çağrısı yapacak.
+    match register_provider("karnal://device/console", boxed_provider) {
+        Ok(_handle) => {
+            // Başarıyla kaydedildi. Döndürülen handle burada doğrudan kullanılmayabilir,
+            // handle Karnal64'ün iç yönetimindedir.
+            println!("Karnal64::KernelConsole: Konsol kaynağı başarıyla kaydedildi.");
+        }
+        Err(err) => {
+            // Kayıt başarısız olursa çekirdek başlangıcında kritik bir hata olabilir.
+            println!("Karnal64::KernelConsole: Konsol kaynağı kaydı başarısız oldu: {:?}", err);
+            // TODO: Hata yönetimi
+        }
     }
-
-    // init_usb_hardware içindeki çıktı, handle edindikten sonra görünür olacaktır.
-    // Buradaki çıktı, handle edindiyse görünür, edinemediyse init_usb_hardware içindeki hata görünür.
-     #[cfg(feature = "std")] std::println!("Sahne64 USB Konsolu Başlatma İsteği Gönderildi.");
-     #[cfg(not(feature = "std"))] println!("Sahne64 USB Konsolu Başlatma İsteği Gönderildi.");
-
-     // Not: Başlatmanın gerçekten başarılı olup olmadığını kontrol etmek için
-     // init_usb_hardware fonksiyonunun bir Result döndürmesi daha iyi olabilir.
-     // Şu an void döndürüyor ve hatayı içeride logluyor.
 }
 
-// Konsol sistemini kapatır (isteğe bağlı)
-pub fn deinit() -> Result<(), SahneError> {
-    #[cfg(feature = "std")] std::println!("Sahne64 USB Konsolu Kapatılıyor...");
-    #[cfg(not(feature = "std"))] println!("Sahne64 USB Konsolu Kapatılıyor...");
+// --- Kernel Tarafında Kullanım Örneği (Gerçek kod değil, kavramsal) ---
 
-    unsafe {
-        // Deinit fonksiyonunu çağırarak Handle'ı serbest bırak
-        USB_SERIAL.deinit_usb_hardware()
+// Başka bir kernel modülünden (örn: init görevi) konsola yazmak için:
+// Not: Kernel içinden Karnal64 API'sını çağırmak, kullanıcı alanının
+// sistem çağrısı yapmasından farklıdır. Kernel modülleri genellikle
+// ResourceProvider traitini implemente eden struct'ların doğrudan
+// referanslarına (eğer singleton iseler) veya Karnal64'ün iç
+// provider lookup mekanizmalarına erişebilir. Ancak Karnal64'ün
+// kendi iç mimarisine bağlıdır bu. Basitlik için, provider'ın
+// statik bir referansını alıp write metodunu çağırdığımızı varsayalım.
+
+fn kernel_write_to_console(message: &str) {
+    // Bu sadece konsepttir. Gerçekte konsol sağlayıcısına güvenli bir
+    // referans almak karmaşıktır (Global statik Mutex korumalı struct gibi).
+    // let console_provider = kresource::get_console_provider_singleton(); // Varsayımsal fonksiyon
+
+    // Alternatif olarak, eğer konsolun bir KHandle'ı kernel içinde biliniyorsa:
+     let console_handle = kresource::get_known_handle("karnal://device/console"); // Varsayımsal
+     let provider = kresource::get_provider_by_handle(&console_handle).expect("Console not found");
+
+    // En basiti: Provider'ın kendi statik fonksiyonları veya singleton deseni varsa
+     KernelConsole::write_message(message); // Eğer KernelConsole::write gibi statik bir methodu varsa
+
+    // En yakın simülasyon: Dummy provider implementasyonunu doğrudan kullanmak
+    #[cfg(feature = "debug_console_print")]
+    {
+         // Güvenli kernel çıktı mekanizması kullanılmalı.
+         println!("(Kernel İçinden Konsola Yazma Simülasyonu) {}", message);
     }
-    // Result döndürülür, çağıran hata olup olmadığını kontrol edebilir.
 }
