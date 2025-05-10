@@ -1,196 +1,255 @@
-#![no_std] // Standart kütüphaneye ihtiyaç duymuyoruz
+#![no_std] // Standart kütüphaneye ihtiyaç duymuyoruz, çekirdek alanında çalışırız
 
-// Gerekli core modüllerini içeri aktar
-use core::arch::asm; // Inline assembly (CSR erişimi için)
-use core::ptr;      // Pointer işlemleri için
-use core::mem;      // Gerekirse bellek işlemleri için (Örn: size_of, align_of)
+use super::karnal64; // Karnal64 API'sını kullanmak için
 
-// `volatile` crate'inden Volatile sarmalayıcıyı içeri aktar (cargo.toml'da tanımlı olmalı)
-use volatile::Volatile;
+// LoongArch Genel Amaçlı Register Sayısı
+const NUM_GPRS: usize = 32;
+// LoongArch özelinde syscall numarasının ve argümanlarının hangi registerlarda geldiği
+// ABI'ye bağlıdır. Genel olarak a0-a7 argümanlar için kullanılır.
+// Karnal64 handle_syscall (number, arg1, ..., arg5) 6 argüman bekler.
+// Varsayım: Syscall numarası a0'da (r4), arg1-arg5 a1-a5'te (r5-r9) geliyor.
+// Dönüş değeri a0'a (r4) yazılacak.
+const RA: usize = 22; // r22: Return Address
+const SP: usize = 3;  // r3: Stack Pointer (LoongArch specific, some ABIs use r1)
+const A0: usize = 4;  // r4: Argument 0 / Return Value
+const A1: usize = 5;  // r5: Argument 1
+const A2: usize = 6;  // r6: Argument 2
+const A3: usize = 7;  // r7: Argument 3
+const A4: usize = 8;  // r8: Argument 4
+const A5: usize = 9;  // r9: Argument 5
+// Syscall numarasının geldiği register indexi (Yukarıdaki varsayıma göre A0)
+const SYSCALL_NUM_REG: usize = A0;
+// Syscall argümanlarının başladığı register indexi
+const SYSCALL_ARG_START_REG: usize = A1;
+// Syscall dönüş değerinin yazılacağı register indexi
+const SYSCALL_RET_REG: usize = A0;
 
-// Konsol çıktı makrolarını kullanabilmek için (hata durumlarında loglama veya debug çıktısı için)
-// Bu makrolar Sahne64 crate'i tarafından sağlanır ve resource API'sini kullanır.
-// Bu crate'te kullanılabilir olmaları için uygun kurulum (örn. #[macro_use]) gereklidir.
-// Bu örnekte, #[cfg] ile std/no_std çıktısını ayarlayarak makroların
-// uygun ortamda kullanılabilir olduğunu varsayıyoruz.
-// use sahne64::eprintln; // Örnek import eğer macro publicse
 
-// LoongArch mimarisine özgü ve donanıma bağımlı sabitler
-// ** GERÇEK DEĞERLERİ İŞLEMCİ VE ÇEVRE BİRİMİ REFERANS KILAVUZLARINDAN ALIN! **
-// Bu değerler çip modeline, çevre birimi instancelarına ve kesme kontrolcüsüne göre değişir.
+// LoongArch Özel CSR'ler (Kontrol ve Durum Registerları) - Örnekler ve yer tutucular
+// Gerçek isimler ve bit alanları LoongArch ISA Spesifikasyonuna göre kontrol edilmelidir.
+const CSR_ERA: u16 = 0x14; // Exception Return Address
+const CSR_CRMD: u16 = 0x0; // Current Mode
+const CSR_ESTAT: u16 = 0x10; // Exception Status Register (Cause code here)
+const CSR_PRMD: u16 = 0x1; // Previous Mode
 
-// LoongArch Standart CSR'lar (Control and Status Registers) ve Bitleri
-const CSR_MTVEC: usize = 0x7c; // MTVEC CSR adresi (Trap Vector Base Address)
-const CSR_MIE: usize = 0x7e;   // MIE CSR adresi (Machine Interrupt Enable)
-const CSR_MSTATUS: usize = 0x7c0; // MSTATUS CSR adresi (Machine Status)
+// LoongArch İstisna (Exception) Neden Kodları (ESTAT registerından okunur) - Örnekler
+// Gerçek kodlar LoongArch ISA Spesifikasyonuna göre kontrol edilmelidir.
+const LOONGARCH_EXCODE_SYSCALL: u16 = 0x0B; // Sistem çağrısı (genel bir varsayım, MIPS/RISC-V benzeri)
+const LOONGARCH_EXCODE_TLB_MISS_LOAD: u16 = 0x02; // TLB/Page Fault Load
+const LOONGARCH_EXCODE_TLB_MISS_STORE: u16 = 0x03; // TLB/Page Fault Store
+const LOONGARCH_EXCODE_ILLEGAL_INSN: u16 = 0x01; // Illegal Instruction
+const LOONGARCH_EXCODE_BREAKPOINT: u16 = 0x09; // Breakpoint
+// TODO: Diğer exception kodları eklenecek
 
-// MIE (Machine Interrupt Enable): Genel kesme etkinleştirme biti
-// MTIE (Machine Timer Interrupt Enable): Makine zamanlayıcı kesmesi etkinleştirme biti
-const MIE_BIT: usize = 1 << 3; // Örnek: MSTATUS'taki MIE biti pozisyonu (LoongArch'a göre kontrol edilmeli)
-const MTIE_BIT: usize = 1 << 7; // Örnek: MIE'deki Makine Zamanlayıcı Kesmesi biti pozisyonu (LoongArch'a göre kontrol edilmeli)
+// LoongArch Kesme (Interrupt) Neden Kodları (ESTAT registerından okunur veya ayrı bir mekanizma ile)
+// Genellikle Timer, External I/O vb. kesmeler için kullanılır.
+const LOONGARCH_INTCODE_TIMER: u16 = 0x8000 | 0; // Varsayımsal: Interrupt bit + Interrupt ID
+const LOONGARCH_INTCODE_EXTERNAL: u16 = 0x8000 | 1; // Varsayımsal: Interrupt bit + External Interrupt ID
+// TODO: Diğer interrupt kodları eklenecek
 
-// USB ile ilgili kesme biti (DONANIMA ÖZGÜ! Loongson 3A5000 veya başka bir çip ÖRNEĞİ)
-// USB_IRQ_BIT: USB kesmesini temsil eden bit.
-// **DİKKAT:** Bu değer, kullandığınız LoongArch çipine göre DEĞİŞİR.
-// Doğru değer için çipinizin REFERANS KILAVUZUNA bakmanız ZORUNLUDUR.
-const USB_IRQ_BIT: usize = 1 << 12; // ÖRNEK DEĞER! Kılavuza bakınız! Genellikle MIE'deki bir bit veya harici kesme kontrolcüsüne bağlı
 
-extern "C" {
-    // Kesme Vektör Tablosu (Interrupt Vector Table) başlangıç adresi
-    // MTVEC CSR'si bu adresin başlangıcını işaret eder.
-    // Bu sembol, linker script veya trap/exception handling kodunda tanımlanmalıdır.
-   pub static __exception_vector_table: u8; // Linker script veya trap handling'den gelen sembol adı
+/// Kesme/Tuzak (Interrupt/Trap) anında CPU registerlarının kaydedildiği yapı.
+/// Bu yapı, assembly giriş noktasında doldurulur ve Rust handler'ına geçirilir.
+/// Kullanıcı veya çekirdek görevlerinin bağlamını temsil eder.
+#[repr(C)] // C uyumluluğu, assembly'den erişilebilmesi için
+#[derive(Debug, Clone, Copy)]
+pub struct TrapFrame {
+    /// Genel Amaçlı Registerlar (r0 - r31)
+    pub regs: [u64; NUM_GPRS],
+    /// İstisna/Kesme Dönüş Adresi Registerı (ERA)
+    pub csr_era: u64,
+    /// Mevcut Mod Registerı (CRMD)
+    pub csr_crmd: u64,
+    /// İstisna Durum Registerı (ESTAT) - Neden kodu burada bulunur
+    pub csr_estat: u64,
+    /// Önceki Mod Registerı (PRMD)
+    pub csr_prmd: u64,
+    // TODO: Bağlam değiştirme ve hata ayıklama için gerekli olabilecek diğer CSR'ler
 }
 
-// USB ile ilgili donanım adresleri ve register offset'leri (DONANIMA ÖZGÜ! Loongson 3A5000 veya başka bir çip ÖRNEĞİ)
-// USB_BASE_ADDRESS: USB kontrolcüsünün bellek eşlemeli (memory-mapped) temel adresi.
-// USB_STATUS_REGISTER_OFFSET: USB durum register'ının temel adrese göre offset'i.
-// USB_DATA_REGISTER_OFFSET: USB veri register'ının temel adrese göre offset'i.
-// USB_IRQ_CLEAR_BIT: USB kesme bayrağını temizlemek için kullanılacak bit maskesi veya değer.
-// **DİKKAT:** Bu değerler ve adresler, kullandığınız LoongArch çipine göre DEĞİŞİR.
-// Doğru değerler için çipinizin REFERANS KILAVUZUNA bakmanız ŞARTTIR.
-const USB_BASE_ADDRESS: usize = 0x8000_1000; // ÖRNEK ADRES! Kılavuza bakınız!
-const USB_STATUS_REGISTER_OFFSET: usize = 0x04; // ÖRNEK OFFSET! Kılavuza bakınız!
-const USB_DATA_REGISTER_OFFSET: usize = 0x08; // ÖRNEK OFFSET! Kılavuza bakınız! (Orijinalde yoktu, eklenirse gerekir)
-const USB_IRQ_CLEAR_BIT: usize = 1 << 0;    // ÖRNEK BIT! Kılavuza bakınız! (Durum register'ında temizlenecek bit)
+// Assembly giriş noktası (`_trap_entry`) bu fonksiyonu çağırır.
+// `tf` pointer'ı, assembly tarafından kernel stack'ine kaydedilmiş registerları gösterir.
+// `exception_code`, ESTAT registerından okunan neden kodudur.
+#[no_mangle] // Bu fonksiyonun isminin derleme sonrası değişmemesi için
+pub extern "C" fn handle_trap(tf: &mut TrapFrame, exception_code: u64) -> *mut TrapFrame {
+    // TODO: Çekirdek loglama veya hata ayıklama için trapframe'i yazdır.
+     println!("--- TRAP! code: {:#x}, ERA: {:#x} ---", exception_code, tf.csr_era);
+    // TODO: Şu anki görevin/iş parçacığının bağlamını kaydet (Scheduler/Task Manager'a bildir).
 
-// USB Durum Register'ındaki Örnek Bitler (usb_interrupt_handler içinde kullanılmıştı, burada tanımlanmalı)
-const USB_STATUS_DATA_RECEIVED: u32 = 0x01; // ÖRNEK DEĞER: Veri alındı durum biti
-const USB_STATUS_DATA_SENT: u32 = 0x02;    // ÖRNEK DEĞER: Veri gönderildi durum biti
-const USB_STATUS_CLEAR_MASK: u32 = USB_STATUS_DATA_RECEIVED | USB_STATUS_DATA_SENT; // Temizlenecek bit maskesi
+    // İstisna/Kesme nedenine göre uygun handler'a yönlendir
+    match exception_code as u16 {
+        LOONGARCH_EXCODE_SYSCALL => {
+            // Sistem Çağrısı İşleme
+            // Syscall numarasını ve argümanlarını trap frame'den al
+            let syscall_number = tf.regs[SYSCALL_NUM_REG];
+            let arg1 = tf.regs[SYSCALL_ARG_START_REG];
+            let arg2 = tf.regs[SYSCALL_ARG_START_REG + 1];
+            let arg3 = tf.regs[SYSCALL_ARG_START_REG + 2];
+            let arg4 = tf.regs[SYSCALL_ARG_START_REG + 3];
+            let arg5 = tf.regs[SYSCALL_ARG_START_REG + 4];
 
+            // TODO: Kullanıcı alanı pointer'ı olan argümanlar için güvenlik doğrulaması YAPILMALIDIR.
+            // Bu doğrulama handle_syscall içinde veya çağırmadan önce yapılabilir.
+            // Şu an için doğrudan Karnal64 API'sını çağırıyoruz.
 
-/// LoongArch mimarisi için kesme ve trap altyapısını başlatır.
-/// MTVEC, MIE ve MSTATUS gibi ilgili CSR'ları ayarlar.
-/// Bu fonksiyon, sistem başlangıcında (kernel init sürecinde) çağrılmalıdır.
-pub fn init() {
-    // Bu fonksiyon, M mode (Machine mode) gibi yüksek privilege seviyesinde çalışmalıdır.
-    unsafe {
-        // 1. MTVEC (Machine Trap Vector Base Address) Register'ını Ayarlama
-        // MTVEC register'ı, kesme/istisna vektör tablosunun (IVT) başlangıç adresini tutar.
-        // Kesme/istisna oluştuğunda işlemci, MTVEC + ofset adresine dallanır (MODE'a bağlı).
-        // LoongArch'ta MTVEC formatı ve ofset hesaplaması mimariye özgüdür.
-        // Elbrus örneğindeki gibi, burada __exception_vector_table sembolünün adresini kullanıyoruz.
-        let ivt_address = &__exception_vector_table as *const u8 as usize; // IVT'nin adresini al
+            let result = karnal64::handle_syscall(
+                syscall_number,
+                arg1, arg2, arg3, arg4, arg5
+            );
 
-        // CSR_MTVEC register'ına IVT adresini yazmak için 'csrwr' kullanılır.
-        // options(nostack) burada uygun olabilir.
-        asm!(
-            "csrwr {0}, {1}", // csrwr rd, csr, rs (destination register, csr address, source register)
-            in(reg) ivt_address,  // Kaynak register (rS) olarak IVT adresi
-            const CSR_MTVEC,      // Hedef CSR adresi
-            options(nostack)      // Stack manipulation olmadığını belirtir
-        );
-        // ** AÇIKLAMA: MTVEC adresini sisteme bildirme işlemi DONANIMA ÖZGÜDÜR! **
-        // Doğru CSR adresi ve yazma yönergesi için LoongArch ISA ve çip kılavuzuna bakın.
+            // Sistem çağrısı sonucunu trap frame'in dönüş değeri registerına yaz
+            tf.regs[SYSCALL_RET_REG] = result as u64; // Karnal64 i64 döner, u64'e çevir (negatifler hata kodu)
 
+            // Syscall komutundan sonra devam etmek için ERA'yı güncelle.
+            // LoongArch genellikle ERA'yı doğru ayarlar ama kontrol etmek/ayarlamak gerekebilir.
+             tf.csr_era += 4; // Örnek: 4 byte'lık bir syscall komutu sonrası
 
-        // 2. İlgili Çevre Birimi Kesmelerini Etkinleştirme (MIE register - Machine Interrupt Enable)
-        // Zamanlayıcı (MTIE) ve USB (USB_IRQ_BIT) kesmelerini MIE CSR'sinde etkinleştir.
-        // 'csrrs rd, csr, rs': CSR Register Set. CSR'yi okur, rs ile OR'lar ve sonucu hem rd'ye hem csr'ye yazar.
-        // rs=zero (x0) ile kullanıldığında, sadece rd'ye CSR'nin eski değerini okur.
-        // Buradaki kullanım: CSR'yi oku, maske ile OR'la, sonucu CSR'ye yaz. (rd = eski_csr, csr = eski_csr | maske)
-        // Maske = MTIE_BIT | USB_IRQ_BIT şeklinde birden fazla biti aynı anda set edebiliriz.
-        let irqs_to_enable = MTIE_BIT | USB_IRQ_BIT;
+            // TODO: Eğer syscall schedule'a neden olduysa (örn: task_exit, task_sleep, yield)
+            // yeni bir trapframe pointer'ı döndürülmeli.
+        }
+        LOONGARCH_INTCODE_TIMER => {
+            // Zamanlayıcı Kesmesi İşleme
+            // TODO: Zamanlayıcı kesmesi sayacını veya ilgili donanımı resetle/yapılandır.
+            // TODO: Görev zamanlayıcısına (Scheduler) zamanlayıcı kesmesi olduğunu bildir.
+             ktask::handle_timer_interrupt();
+            // TODO: Eğer zamanlayıcı kesmesi bağlam değişimini tetiklediyse,
+            // Scheduler'dan bir sonraki görevin trapframe pointer'ını al.
+        }
+        LOONGARCH_INTCODE_EXTERNAL => {
+            // Harici Donanım Kesmesi İşleme
+            // TODO: Hangi donanımın kesme ürettiğini belirle (IRQ kontrolcüsünden oku).
+            // TODO: İlgili sürücünün kesme işleyicisini çağır.
+             driver_manager::handle_irq(irq_number);
+            // TODO: IRQ kontrolcüsünde kesmeyi onayla (ACK).
+        }
+        LOONGARCH_EXCODE_TLB_MISS_LOAD | LOONGARCH_EXCODE_TLB_MISS_STORE => {
+            // Sayfa Hatası (Page Fault) İşleme
+            // TODO: Hata adresini (BadVAddr veya benzeri CSR'den) oku.
+            // TODO: Sayfa hatası nedenini (okuma/yazma, kullanıcı/çekirdek modu) belirle.
+            // TODO: Bellek yöneticisine (Memory Manager) sayfa hatasını bildir.
+             kmemory::handle_page_fault(fault_address, fault_reason);
+            // TODO: Eğer sayfa yöneticisi hatayı çözebilirse (örn: demand paging), fonksiyondan dön.
+            // TODO: Çözülemezse, hata mesajı yazdır ve görevi sonlandır.
+             println!("PAGE FAULT! Addr: {:#x}, Reason: {:?}", fault_address, fault_reason);
+             ktask::exit_current(karnal64::KError::BadAddress as i32); // Görevi sonlandırır, geri dönmez
+        }
+        LOONGARCH_EXCODE_ILLEGAL_INSN => {
+            // Geçersiz Komut İşleme
+            // TODO: Hata mesajı yazdır ve görevi sonlandır.
+             println!("ILLEGAL INSTRUCTION!");
+             ktask::exit_current(karnal64::KError::InvalidArgument as i32); // Görevi sonlandırır, geri dönmez
+        }
+        LOONGARCH_EXCODE_BREAKPOINT => {
+             // Breakpoint/Hata Ayıklama Tuzak İşleme
+             // TODO: Hata ayıklayıcıya kontrolü ver (varsa).
+             // TODO: Hata mesajı yazdır veya devam et.
+              println!("BREAKPOINT!");
+              tf.csr_era += 4; // Genellikle breakpoint komutundan sonra devam etmek için ERA'yı ilerlet
+        }
+        // TODO: Diğer istisna/kesme nedenleri için case'ler eklenecek.
 
-        asm!(
-            "csrrs {0}, {1}, {2}", // csrrs rd, csr, rs
-            out(reg) _,          // eski MIE değeri (kullanmıyoruz, _ ile ignore et)
-            const CSR_MIE,       // MIE CSR adresi
-            in(reg) irqs_to_enable, // Set edilecek bit maskesi (kaynak register)
-            options(nostack)     // Stack manipulation olmadığını belirtir
-        );
-        // **DİKKAT:** USB kesme bitinin değeri (USB_IRQ_BIT) çipten çipe farklılık gösterir.
-        // MIE register'ı ve bit pozisyonları için LoongArch ISA ve çip kılavuzuna bakın.
-
-
-        // 3. Genel Kesmeleri Etkinleştirme (MSTATUS register - Machine Status, MIE biti)
-        // MSTATUS CSR'sindeki MIE bitini (Machine Interrupt Enable) set et.
-        // Bu bit olmadan, bireysel kesme etkinleştirme bitleri (MIE CSR içindekiler) tek başına yeterli DEĞİLDİR.
-        // 'csrrs rd, csr, rs' yönergesini MSTATUS ve MIE_BIT maskesi ile kullanıyoruz.
-        asm!(
-            "csrrs {0}, {1}, {2}", // csrrs rd, csr, rs
-            out(reg) _,          // eski MSTATUS değeri (kullanmıyoruz)
-            const CSR_MSTATUS,   // MSTATUS CSR adresi
-            in(reg) MIE_BIT,     // Set edilecek MIE biti maskesi (kaynak register)
-            options(nostack)     // Stack manipulation olmadığını belirtir
-        );
-        // **DİKKAT:** MSTATUS register'ı farklı amaçlar için başka bitler de içerebilir.
-        // MSTATUS ve MIE bit pozisyonu için LoongArch ISA kılavuzuna bakın.
-
-        // NOT: Bu noktada, zamanlayıcı ve USB kesmeleri (ve MIE'de etkinleştirilen diğerleri)
-        // gerçekleştiğinde işlemci kontrolü MTVEC tarafından işaret edilen trap entry noktasına devredecektir.
-        // Trap entry kodu mcause CSR'sini okuyup uygun işleyiciye dallanmalıdır.
-
-        // Diğer platforma özgü başlatma adımları buraya eklenebilir (örn. diğer çevre birimleri init)
+        _ => {
+            // Bilinmeyen İstisna/Kesme
+            // TODO: Hata mesajı yazdır, sistem durumunu kaydet (panik için) ve çekirdeği durdur.
+             println!("!!! UNHANDLED TRAP! code: {:#x}, ERA: {:#x} !!!", exception_code, tf.csr_era);
+             kernel_panic("Unhandled trap"); // Çekirdek panik fonksiyonu
+             loop {} // Sistem durduruldu
+        }
     }
-    // init fonksiyonu başarıyla tamamlanırsa geri döner.
+
+    // TODO: Zamanlayıcının (Scheduler) bir bağlam değişimine karar verip vermediğini kontrol et.
+    // Eğer karar verdiyse, bir sonraki görevin trapframe pointer'ını döndür.
+    // Yoksa, mevcut trapframe pointer'ını döndür (aynı göreve geri dönecek).
+    // Örneğin:
+     let next_task_tf = ktask::schedule();
+     if let Some(next_tf_ptr) = next_task_tf {
+         next_tf_ptr
+     } else {
+         tf // Aynı göreve geri dön
+     }
 }
 
-// USB Kesme İşleyicisi (DONANIMA ÖZGÜ UYGULAMA GEREKLİ! - ÖRNEK YAPI)
-// Bu fonksiyon, trap entry noktasından çağrılır.
-// Linker scriptte .trap.interrupt_handlers gibi bir bölüme yerleştirilir.
-#[no_mangle] // Linker script veya trap entry tarafından çağrılabilir
-#[link_section = ".trap.interrupt_handlers"] // Kesme işleyicileri için ayrı bir bölüm (Örnek bölüm adı)
-// Kesme işleyici fonksiyonları genellikle 'unsafe extern "C"' olarak tanımlanır.
-pub unsafe extern "C" fn usb_interrupt_handler() {
-    // ** Güvenlik: Bu işleyici unsafe'dir çünkü kesme bağlamında çalışır **
-    // ve donanımla doğrudan etkileşime girer. Yarış durumları ve side effect'lere dikkat!
+/// Kernel başlatılırken kesme/tuzak vektörünü kuracak fonksiyon (Kavramsal).
+/// Bu fonksiyon, çekirdek boot sürecinde bir kez çağrılmalıdır.
+#[no_mangle]
+pub extern "C" fn init_trap() {
+    // TODO: LoongArch mimarisine özel CSR'leri yapılandır:
+    // - Tuzak giriş noktası adresini (örneğin `_trap_entry` assembly label'ı) ilgili CSR'e yaz (EENTRY?).
+    // - Kesmeleri ve istisnaları etkinleştir (CRMD, ECFG veya ilgili CSR'ler).
+    // - Çekirdek yığınını ayarla (assembly veya ayrı bir fonksiyonda yapılır).
+    // - TLB/MMU ile ilgili başlangıç ayarlarını yap (eğer gerekiyorsa).
 
-    // ** DİKKAT: Bu bölüm DONANIMA ÖZGÜDÜR ve KULLANILAN ÇİPİN VE USB KONTROLCÜSÜNÜN KILAVUZUNA GÖRE KODLANMALIDIR! **
-    // Bu işleyici çekirdek içinde çalışır, kullanıcı alanındaki Sahne64 API'sini doğrudan çağırmaz.
-    // Gelen USB verisini alır ve çekirdekteki USB sürücüsü koduna iletir.
-    // Ardından, bu veriyi bekleyen kullanıcı görevini Sahne64 çekirdek zamanlama mekanizması
-    // aracılığıyla uyandırır (örn. resource::read için bekleyen görev).
+    // Örnek (placeholder):
+    // unsafe {
+    //     // Set EENTRY to the address of our assembly trap handler
+          write_csr!(CSR_EENTRY, _trap_entry as u64); // write_csr! bir makro/inline assembly gerektirir
+    //
+    //     // Enable interrupts/exceptions (simplified example)
+          let mut crmd = read_csr!(CSR_CRMD);
+          crmd |= (1 << INTERRUPT_ENABLE_BIT); // INTERRUPT_ENABLE_BIT LoongArch spec'ten alınmalı
+          write_csr!(CSR_CRMD, crmd);
+     }
 
-    // 1. Kesme kaynağını belirle (USB Durum Register'ını oku)
-    // Hangi kesme bitlerinin set olduğuna bakılır.
-    let usb_status_register_address = USB_BASE_ADDRESS.wrapping_add(USB_STATUS_REGISTER_OFFSET); // Güvenli adres hesaplama
-    let status = ptr::read_volatile(usb_status_register_address as *const u32);
-
-
-    // 2. İşlenen kesme bitlerini (flag'larını) temizle (ÇOK ÖNEMLİ!)
-    // Bu, kesmenin tekrar tetiklenmesini önler. Temizleme yöntemi donanıma özgüdür.
-    // Bu örnekte, işlenen bitleri 0 yaparak statüs kaydına yazıyoruz.
-    // SADECE işlenen bitleri değiştirdiğimizden emin olmak için dikkatli olunmalıdır.
-    let status_to_clear = status & USB_STATUS_CLEAR_MASK; // Temizlenecek bitleri ayıkla
-    if status_to_clear != 0 {
-         // Sadece temizlenecek bitler varsa yazma yap
-         let mut status_reg = Volatile::new(usb_status_register_address as *mut u32);
-         // Okunan değerdeki sadece temizlenecek bitleri 0 yapıp geri yaz.
-         // Alternatif olarak, bazı donanımlar temizlemek için 1 yazılmasını bekler, veya farklı bir temizleme register'ı kullanır.
-         // Kılavuza bakın!
-         status_reg.write(status & !status_to_clear); // Örnek: Bitleri temizle
-    }
-
-
-    // 3. Kesme nedenine göre işlem yap (Veri geldi, Veri gönderildi vb.)
-    // Bu kısım, USB sürücüsünün temel logic'idir ve çekirdek içinde yer alır.
-    if (status & USB_STATUS_DATA_RECEIVED as u32) != 0 { // Bit maskelerini u32 yap (status u32)
-        // Veri geldi kesmesi oluştu
-        // Veriyi USB kontrolcüsünden oku (hardware-specific)
-         let usb_data_register_address = USB_BASE_ADDRESS.wrapping_add(USB_DATA_REGISTER_OFFSET); // Güvenli adres hesaplama
-         let received_data = ptr::read_volatile(usb_data_register_address as *const u32); // Örnek okuma (32-bit)
-        // TODO: Okunan veriyi çekirdekteki USB sürücüsü tamponuna yaz.
-        // TODO: Resource'u (USB console kaynağı) bekleyen görevleri uyandır (örn. resource::read yapan görev).
-         // Debug çıktıları için Sahne64 konsol makrolarını kullan
-         #[cfg(feature = "std")] std::println!("USB Veri Alındı: 0x{:x}", received_data);
-         #[cfg(not(feature = "std"))] println!("USB Veri Alındı: 0x{:x}", received_data);
-    }
-
-    if (status & USB_STATUS_DATA_SENT as u32) != 0 { // Bit maskelerini u32 yap
-         // Veri gönderildi kesmesi oluştu
-         // TODO: Çekirdek tamponundan bir sonraki veriyi USB kontrolcüsüne yaz (eğer gönderilecek veri varsa).
-         // TODO: Resource'u (USB console kaynağı) bekleyen görevleri uyandır (örn. resource::write'ın tamamlanmasını bekleyen görev).
-         // Debug çıktıları için Sahne64 konsol makrolarını kullan
-         #[cfg(feature = "std")] std::println!("USB Veri Gönderildi (işleyici içinde).");
-         #[cfg(not(feature = "std"))] println!("USB Veri Gönderildi (işleyici içinde).");
-    }
-
-    // TODO: Diğer kesme nedenleri (hata kesmeleri, bağlantı durum değişiklikleri vb.)
-
-
-    // NOTE: Kesme işleyiciden çıkış, LoongArch trap mekanizması tarafından yönetilir.
-    // Genellikle trap entry noktasında durum geri yüklenir ve EPC + 4 ile MRET/ERET benzeri bir yönerge kullanılır.
-    // Bu işleyici fonksiyonunun kendisi normal bir fonksiyon gibi geri döner (çekirdek trap entry noktasına).
+     println!("LoongArch Trap/Interrupt handler initialized (Placeholder)");
 }
+
+
+Aşağıdaki assembly kodu (veya Rust inline assembly), çekirdeğin giriş noktasında
+veya ayrı bir assembly dosyasında yer alacak ve `handle_trap` fonksiyonunu çağıracaktır.
+Rust tarafından doğrudan yazılmaz ama Rust kodu bu assembly'nin beklediği arayüzü sağlar.
+
+global _trap_entry
+_trap_entry:
+    // 1. Kritik Bölgeye Gir: Kesmeleri devre dışı bırak.
+    // LoongArch CRMD registerı kullanılır
+
+    // 2. Registerları Kaydet:
+    // Tüm genel amaçlı registerları (r0-r31) mevcut stack üzerine kaydet.
+    // Yeni bir TrapFrame yapısı oluşturuluyor gibi düşünülebilir.
+    // Örneğin:
+     addi.d sp, sp, -TRAP_FRAME_SIZE // stack pointer'ı indir
+     st.d r0, sp, TF_R0_OFFSET      // r0'ı kaydet
+     st.d r1, sp, TF_R1_OFFSET      // r1'ı kaydet (sp'nin kendisini de kaydediyoruz)
+    // ... r31'e kadar ...
+
+    // 3. CSR'leri Kaydet:
+    // ERA, ESTAT, CRMD, PRMD gibi ilgili CSR'leri stack üzerindeki TrapFrame içine kaydet.
+     mfcsr t0, CSR_ERA          // ERA'yı oku
+     st.d t0, sp, TF_ERA_OFFSET // TrapFrame'e yaz
+    // ... diğer CSR'ler ...
+
+    // 4. Çekirdek Stack'ine Geç:
+    // Eğer tuzak kullanıcı modunda oluştuysa, çekirdek moduna geçilmeli
+    // ve göreve özel çekirdek stack'ine geçiş yapılmalıdır.
+    // Bu genellikle PRMD ve CRMD registerları ile yönetilir.
+     t0 = current_task.kernel_stack_pointer
+     move sp, t0
+
+    // 5. Rust Handler'ı Çağır:
+    // handle_trap fonksiyonunu çağır.
+    // Argümanlar: TrapFrame pointer'ı (yeni sp'nin adresi), exception_code.
+    // LARCH ABI'ye göre argümanlar a0 (r4) ve a1'e (r5) konulur.
+     move a0, sp // TrapFrame pointer'ı
+     ld.d a1, sp, TF_ESTAT_OFFSET // ESTAT'ı (exception_code) yükle
+     jal handle_trap // Rust fonksiyonunu çağır
+
+    // 6. Dönüş Değerini Kontrol Et:
+    // handle_trap fonksiyonu bir sonraki çalışacak TrapFrame'in pointer'ını döndürür (a0 registerında).
+    // Eğer döndürülen pointer mevcut TrapFrame ile aynıysa, aynı göreve döneceğiz.
+    // Eğer farklıysa, bağlam değişimi olacak.
+
+    // 7. Yeni Bağlamı Yükle (veya Mevcut Bağlamı Geri Yükle):
+    // a0 (dönüş değeri) şimdiki TrapFrame pointer'ı.
+     ld.d r0, a0, TF_R0_OFFSET // TrapFrame'den r0'ı yükle
+    // ... r31'e kadar ...
+     ld.d t0, a0, TF_ERA_OFFSET // TrapFrame'den ERA'yı yükle
+     mtcsr t0, CSR_ERA         // ERA'yı CSR'e yaz
+    // ... diğer CSR'ler ...
+
+    // 8. Kritik Bölgeden Çık: Kesmeleri yeniden etkinleştir.
+    // LoongArch CRMD registerı kullanılır.
+
+    // 9. Tuzaktan Dön:
+    // İstisna dönüş komutunu kullan (LoongArch'ta ERET veya benzeri?).
+    // ERET komutu, ERA'daki adrese atlar ve CRMD/PRMD'yi güncelleyerek uygun moda döner.
+     ERET
