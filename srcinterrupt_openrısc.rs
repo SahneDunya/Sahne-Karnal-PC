@@ -1,285 +1,171 @@
-#![no_std] // Standart kütüphaneye ihtiyaç duymuyoruz
+#![no_std] // Standart kütüphaneye ihtiyaç yok
+#![allow(dead_code)] // Geliştirme sırasında kullanılmayan kodlara izin ver
+#![allow(unused_variables)] // Kullanılmayan argümanlara izin ver
 
-// Gerekli core modüllerini içeri aktar
-use core::arch::asm; // Inline assembly (SPR erişimi için)
-use core::ptr;      // Pointer işlemleri için
+// Karnal64 modülünü import et. Çekirdek kök dizininde veya üst seviyede olduğunu varsayalım.
+use super::karnal64;
+// Çekirdek içi yazdırma için bir makro olduğunu varsayalım (debugging için)
+ use super::println;
 
-// `volatile` crate'inden Volatile sarmalayıcıyı içeri aktar (cargo.toml'da tanımlı olmalı)
-use volatile::Volatile; // <-- Added import
+// OpenRISC Kayıtlarını Saklamak İçin Tuzak Çerçevesi (Trap Frame) Yapısı
+// Bu yapı, bir kesme veya tuzak oluştuğunda donanım veya giriş assembly kodu tarafından
+// kaydedilen CPU durumunu temsil eder. OpenRISC'in gerçek register setine göre ayarlanmalıdır.
+#[repr(C)] // C uyumluluğu için
+#[derive(Debug, Default)] // Debug yazdırma ve varsayılan değerler için
+pub struct TrapFrame {
+    // Genel Amaçlı Kayıtlar (GPRs) - R0-R31
+    // Tamamını kaydetmek en güvenlisidir, ancak syscall ABI'sine göre sadece kullanılanları
+    // veya değiştirilenleri kaydetmek performans için optimize edilebilir.
+    // Basitlik adına, syscall ABI'sinde kullanılan R3-R8 ve SP (R1) gibi kritik registerları ekleyelim.
+    // Gerçek bir implementasyonda R0'dan R31'e kadar tüm GPR'lar olmalıdır.
+    pub r0: u32, // R0 genellikle 0'dır, kaydedilmesi zorunlu olmayabilir
+    pub r1: u32, // R1: Stack Pointer (SP)
+    pub r2: u32, // R2: Frame Pointer (FP) veya diğer kullanım
+    pub r3: u32, // R3: Genellikle Fonksiyon Çağrısı Dönüş Değeri veya Syscall Numarası
+    pub r4: u32, // R4-R8: Fonksiyon Argümanları veya Syscall Argümanları
+    pub r5: u32,
+    pub r6: u32,
+    pub r7: u32,
+    pub r8: u32,
+    // ... Diğer GPR'lar (R9-R31) gerçek implementasyonda buraya eklenecek ...
+    pub r9: u32,
+    pub r10: u32,
+    pub r11: u32,
+    pub r12: u32,
+    pub r13: u32,
+    pub r14: u32,
+    pub r15: u32,
+    pub r16: u32,
+    pub r17: u32,
+    pub r18: u32,
+    pub r19: u32,
+    pub r20: u32,
+    pub r21: u32,
+    pub r22: u32,
+    pub r23: u32,
+    pub r24: u32,
+    pub r25: u32,
+    pub r26: u32,
+    pub r27: u32,
+    pub r28: u32,
+    pub r29: u32,
+    pub r30: u32,
+    pub r31: u32,
 
-// Konsol çıktı makrolarını kullanabilmek için (hata durumlarında loglama veya debug çıktısı için)
-// Bu makrolar Sahne64 crate'i tarafından sağlanır ve resource API'sini kullanır.
-// Bu crate'te kullanılabilir olmaları için uygun kurulum (örn. #[macro_use]) gereklidir.
-// Bu örnekte, #[cfg] ile std/no_std çıktısını ayarlayarak makroların
-// uygun ortamda kullanılabilir olduğunu varsayıyoruz.
- use sahne64::eprintln; // Örnek import eğer macro publicse
+    // Özel Amaçlı Kayıtlar (SPRs)
+    // Exception Program Counter (EPCR): Tuzak/Kesme oluştuğunda çalışmakta olan instruction'ın adresi (Syscall instruction'ı).
+    // Supervisor Register (SR): Çekirdek/kullanıcı modu, kesme etkinleştirme vb. bilgileri içerir.
+    // Exception Cause Register (ECR): Tuzak/Kesme sebebini içerir.
+    pub epcr: u32, // Exception Program Counter
+    pub sr: u32,   // Supervisor Register
+    pub ecr: u32,  // Exception Cause Register (veya benzeri bir kayıt)
+    // ... Diğer önemli SPR'lar (esr, ever, ppr vb.) gerçek implementasyonda buraya eklenecek ...
+    pub esr: u32, // Exception Syndrome Register
+    // ...
+}
+
+// Tuzak Sebepleri İçin Sabitler (OpenRISC ECR register değerlerine göre)
+// Bu değerler OpenRISC mimari kılavuzundan alınmalıdır. Örnek değerler kullanıyoruz.
+const TRAP_CAUSE_SYSCALL: u32 = 0x800; // OpenRISC sistem çağrısı tuzağı sebebi (örnek değer)
+const TRAP_CAUSE_TIMER: u32 = 0x200;   // Zamanlayıcı kesmesi sebebi (örnek değer)
+// ... Diğer tuzak sebepleri (page fault, alignment, illegal instruction vb.) buraya eklenecek ...
+const TRAP_CAUSE_PAGE_FAULT_LOAD: u32 = 0x100; // Örnek Load Page Fault
+const TRAP_CAUSE_PAGE_FAULT_STORE: u32 = 0x080; // Örnek Store Page Fault
+const TRAP_CAUSE_ILLEGAL_INSTR: u32 = 0x040; // Örnek Illegal Instruction
+const TRAP_CAUSE_BUS_ERROR: u32 = 0x020;   // Örnek Bus Error
 
 
-// OpenRISC mimarisine özgü ve donanıma bağımlı sabitler
-// ** GERÇEK DEĞERLERİ İŞLEMCİ VE ÇEVRE BİRİMİ REFERANS KILAVUZLARINDAN ALIN! **
-// Bu değerler çip modeline ve çevre birimi instancelarına göre değişir.
-
-// OpenRISC SPR'ler (Special Purpose Registers) (Örnek OR1200 veya başka bir çekirdek)
-// SPR_IVTBR: Interrupt Vector Table Base Register (Genellikle SPR 0x1B)
-// SPR_SR: Status Register (Genellikle SPR 0x11)
-// SPR_CSR: Cause Register veya benzeri (Kesme nedenini raporlayan register) - Donanıma özgü
-// SPR isimleri ve adresleri için kullandığınız OpenRISC çekirdeği kılavuzuna bakın.
-
-// Kesme Vektör Tablosu (IVT) adresi (spr_ivtbr'ye yazılacak adres)
-// Bu adres, bellekteki kesme vektörlerinin başlangıcıdır.
-const IVT_ADDRESS: usize = 0x100; // Örnek adres: Donanımınıza göre ayarlayın. Linker script ile belirlenebilir.
-
-// Kesme Nedenleri (Cause Register'dan okunan değerlere karşılık gelen sabitler)
-// Bu değerler, spr_csr (veya ilgili cause register) okunduğunda gelen bit maskeleri veya değerlerdir.
-// Donanımınıza göre genişletin ve doğru bit maskelerini/değerleri kullanın.
-const TIMER_INTERRUPT_CAUSE: usize = 0x01; // Örnek neden: Zamanlayıcı kesmesi biti
-const USB_INTERRUPT_CAUSE: usize = 0x02; // Örnek neden: USB kesmesi biti (Donanıma özgü!)
-// Diğer nedenler: Bus error, TLB miss, Syscall vb.
-
-// USB ile ilgili donanım adresleri ve register offset'leri (DONANIMA ÖZGÜ!)
-// USB_BASE_ADDRESS: USB kontrolcüsünün bellek eşlemeli (memory-mapped) temel adresi.
-// USB_IRQ_CLEAR_REGISTER_OFFSET: USB kesme bayrağını temizlemek için yazılacak register ofseti.
-// USB_IRQ_CLEAR_VALUE: USB kesme bayrağını temizlemek için bu register'a yazılacak değer.
-// **DİKKAT:** Bu değerler ve adresler, kullandığınız OpenRISC çipine ve USB kontrolcüsüne göre DEĞİŞİR.
-// Doğru değerler için çipinizin REFERANS KILAVUZUNA bakmanız ŞARTTIR.
-const USB_BASE_ADDRESS: usize = 0xD000_0000; // ÖRNEK ADRES! Kılavuza bakınız!
-const USB_IRQ_CLEAR_REGISTER_OFFSET: usize = 0x14; // ÖRNEK OFFSET! Kılavuza bakınız!
-const USB_IRQ_CLEAR_VALUE: u32 = 1; // ÖRNEK DEĞER! Kılavuza bakınız!
-
-
-/// Genel kesme işleyicisi.
-/// Bu fonksiyon, bir kesme veya istisna (trap) oluştuğunda CPU tarafından çağrılır.
-/// Kesme nedenini okuyarak ilgili spesifik işleyiciye dallanır.
+/// Kesme ve Tuzak İşleyici Giriş Noktası.
+/// Assembly dilindeki düşük seviyeli tuzak/kesme giriş kodu tarafından çağrılır.
+/// CPU durumunu temsil eden TrapFrame pointer'ını alır.
 ///
-/// # Güvenlik
-/// Bu fonksiyon güvenli değildir (unsafe) çünkü kesme bağlamında çalışır,
-/// donanım registerlarına erişir ve potansiyel olarak shared memory kullanabilir.
-/// Eş zamanlılık ve reentrancy (yeniden giriş) konularına dikkat edilmelidir.
-#[no_mangle] // Linker script veya donanım tarafından çağrılabilir
-pub unsafe extern "C" fn interrupt_handler() {
-     // ** Güvenlik: Kesme bağlamında çalışıyoruz. Registerları kaydetmek gerekebilir. **
+/// Güvenlik Notu: Bu fonksiyon, kullanıcı modundan gelen bir kesme/tuzak sonrası
+/// çekirdek modunda çalışır. `frame` pointer'ının geçerli bir çekirdek alanı
+/// adresini gösterdiğinden emin olunmalıdır.
+#[no_mangle] // Assembly'den çağrılabilmesi için ismini değiştirmesini engelle
+pub extern "C" fn exception_handler(frame: *mut TrapFrame) {
+    // 'frame' pointer'ının null olmadığını ve geçerli olduğunu varsayarak unsafe kullanıyoruz.
+    // Gerçek bir çekirdekte, bu noktada temel geçerlilik kontrolleri yapılabilir,
+    // ancak genellikle assembly giriş kodu bu pointer'ı güvenli bir şekilde hazırlar.
+    let frame = unsafe { &mut *frame };
 
-    // 1. Kesme nedenini okumak için SPR_CSR (veya ilgili cause register) kullan.
-    let cause = get_interrupt_cause();
+    // Tuzak/Kesme sebebini ECR register'ından oku (frame yapısına kaydedildiğini varsayarak)
+    let trap_cause = frame.ecr;
 
-    // 2. Kesme nedenine göre ilgili işleyiciye dallan.
-    // Bu, daha karmaşık bir dispatch tablosu veya lookup yapısı içerebilir.
-    match cause {
-        TIMER_INTERRUPT_CAUSE => {
-            handle_timer_interrupt();
+    // Sebebe göre ilgili handler'a dallan
+    match trap_cause {
+        TRAP_CAUSE_SYSCALL => {
+            // Sistem Çağrısı Tuzağı
+            println!("Çekirdek: Sistem Çağrısı Tuzağı Yakalandı!"); // Debug çıktısı
+
+            // Syscall ABI'sine göre argümanları TrapFrame'den çıkar
+            let syscall_number = frame.r3 as u64; // R3'te syscall numarası varsayımı
+            let arg1 = frame.r4 as u64;       // R4 ilk argüman
+            let arg2 = frame.r5 as u64;       // R5 ikinci argüman
+            let arg3 = frame.r6 as u64;       // R6 üçüncü argüman
+            let arg4 = frame.r7 as u64;       // R7 dördüncü argüman
+            let arg5 = frame.r8 as u64;       // R8 beşinci argüman
+
+            // Karnal64 API'sının sistem çağrısı işleyicisini çağır
+            // Bu fonksiyon, Karnal64'ün iç mantığını çalıştırır ve sonucu i64 olarak döndürür.
+            let result = karnal64::handle_syscall(
+                syscall_number,
+                arg1,
+                arg2,
+                arg3,
+                arg4,
+                arg5,
+            );
+
+            // Karnal64'ten dönen sonucu kullanıcı alanının beklediği register'a (R3) yaz
+            // Başarı durumunda pozitif/sıfır, hata durumunda negatif KError kodu döner.
+            frame.r3 = result as u32; // R3'e dönüş değeri yazma varsayımı (i64 -> u32 dönüşümüne dikkat)
+
+            // Kullanıcı programının sistem çağrısı instruction'ından sonraki instruction'dan
+            // devam edebilmesi için EPCR'yi (kaydedilmiş PC) güncelle.
+            // OpenRISC 'l.syscall' instruction'ı 4 byte'tır.
+            frame.epcr += 4;
+
+            println!("Çekirdek: Sistem Çağrısı Tamamlandı, Kullanıcıya Dönülüyor."); // Debug çıktısı
         }
-        USB_INTERRUPT_CAUSE => { // USB kesmesi için yeni branch eklendi
-             handle_usb_interrupt();
+        TRAP_CAUSE_TIMER => {
+            // Zamanlayıcı Kesmesi
+            println!("Çekirdek: Zamanlayıcı Kesmesi Yakalandı!");
+            // TODO: Zamanlayıcı kesmesini işle (zamanlayıcı sayacını güncelle, görev zamanlayıcıyı çalıştır vb.)
+            // Örneğin: ktask::timer_tick();
+            // Gerekiyorsa EPCR'yi güncelleme (kesmeler genellikle instruction'ı tekrar çalıştırmaz)
         }
+        TRAP_CAUSE_PAGE_FAULT_LOAD | TRAP_CAUSE_PAGE_FAULT_STORE => {
+            // Bellek Yönetimi Hatası (Page Fault)
+            //println!("Çekirdek: Sayfa Hatası Yakalandı! ECR: {:#x}, ESR: {:#x}", frame.ecr, frame.esr);
+            // TODO: Sayfa hatasını işle (sayfayı belleğe yükle, haritalama hatası ise sinyal gönder vb.)
+            // kmemory::handle_page_fault(frame.epcr, frame.ecr, frame.esr, frame);
+            // Şimdilik panikliyoruz (çekirdek hata durumuna düşüyor)
+            panic!("Unhandled Page Fault! ECR: {:#x}, ESR: {:#x}, EPCR: {:#x}", frame.ecr, frame.esr, frame.epcr);
+        }
+         TRAP_CAUSE_ILLEGAL_INSTR => {
+            // Geçersiz Instruction Hatası
+            println!("Çekirdek: Geçersiz Instruction! EPCR: {:#x}", frame.epcr);
+            // TODO: Geçersiz instruction'ı işle (göreve sinyal gönder, sonlandır vb.)
+            // Şimdilik panikliyoruz
+             panic!("Illegal Instruction at EPCR: {:#x}", frame.epcr);
+         }
+         TRAP_CAUSE_BUS_ERROR => {
+            // Bus Hatası
+             println!("Çekirdek: Bus Hatası! EPCR: {:#x}", frame.epcr);
+             // TODO: Bus hatasını işle
+             // Şimdilik panikliyoruz
+             panic!("Bus Error at EPCR: {:#x}", frame.epcr);
+         }
         _ => {
-            // Beklenmeyen kesme durumu (isteğe bağlı işleme)
-            // Sahne64 konsol makrolarını kullanarak hata logla.
-             #[cfg(feature = "std")] std::eprintln!("UYARI: Beklenmeyen kesme nedeni: {}", cause);
-             #[cfg(not(feature = "std"))] eprintln!("UYARI: Beklenmeyen kesme nedeni: {}", cause); // Sahne64 macro varsayımı
-            // TODO: Hata ayıklama veya varsayılan işleme (örn. panik veya sistem durdurma)
-              halt_system(); // Eğer tanımlıysa
+            // Bilinmeyen veya İşlenmeyen Tuzak Sebebi
+            println!("Çekirdek: İşlenmeyen Tuzak/Kesme Yakalandı! Sebebi (ECR): {:#x}, EPCR: {:#x}", trap_cause, frame.epcr);
+            // TODO: Bu tür hataları daha güvenli bir şekilde işle (görevi sonlandır, logla vb.)
+            // Şimdilik çekirdeği durduruyoruz (panic)
+            panic!("Unhandled trap/interrupt! Cause (ECR): {:#x}, EPCR: {:#x}", trap_cause, frame.epcr);
         }
     }
-     // TODO: Kaydedilen registerları geri yükle.
-     // TODO: Kesme işleyiciden çıkış yönergesini (örn. rfe - return from exception) kullan.
-      asm!("rfe"); // Dönüş yönergesi (unsafe asm)
-}
 
-// Yardımcı fonksiyon: Kesme nedenini oku
-/// SPR_CSR (veya ilgili cause register)'den kesme nedenini okur.
-/// # Güvenlik
-/// Güvenli değildir çünkü SPR okumak privilege gerektirebilir ve kesme bağlamında çağrılır.
-fn get_interrupt_cause() -> usize {
-    let mut cause: usize;
-    unsafe {
-        // SPR_CSR (Kontrol ve Durum Register)'den kesme nedenini oku
-        // 'mfspr rd, spr' yönergesi kullanılır.
-        // 'spr_csr' yerine ilgili SPR adresi/numarası kullanılmalıdır.
-        // ÖRNEK SPR ADI: spr_excause, spr_eesr gibi farklı registerlar olabilir. Kılavuza bakın!
-        const SPR_CAUSE_REGISTER: usize = 0x1A; // Örnek SPR adresi (Kılavuza bakın!)
-        asm!("mfspr {0}, {1}", out(reg) cause, const SPR_CAUSE_REGISTER, options(nostack)); // options(nostack)
-    }
-    cause
-}
-
-// Yardımcı fonksiyon: Zamanlayıcı kesmesini işle
-/// Zamanlayıcı kesmesi gerçekleştiğinde çekirdek içinde yapılacak işlemleri barındırır.
-/// # Güvenlik
-/// Güvenli değildir, kesme bağlamında çalışır.
-fn handle_timer_interrupt() {
-    // Zamanlayıcı kesmesi işleme kodu buraya gelecek
-    // Örnek: Zamanlayıcı sayacını resetleme, zamanlayıcı olayını çekirdek zamanlayıcıya bildirme, görev uyandırma
-     #[cfg(feature = "std")] std::println!("Zamanlayıcı kesmesi işleniyor.");
-     #[cfg(not(feature = "std"))] println!("Zamanlayıcı kesmesi işleniyor."); // Sahne64 macro varsayımı
-
-    // TODO: Zamanlayıcı ile ilgili çekirdek işlemleri...
-
-    clear_timer_interrupt_flag(); // Bayrağı temizle
-}
-
-// Yardımcı fonksiyon: USB kesmesini işle (Yeni eklendi)
-/// USB kesmesi gerçekleştiğinde çekirdek içinde yapılacak işlemleri barındırır.
-/// # Güvenlik
-/// Güvenli değildir, kesme bağlamında çalışır.
-unsafe fn handle_usb_interrupt() { // unsafe eklendi
-     #[cfg(feature = "std")] std::println!("USB kesmesi işleniyor.");
-     #[cfg(not(feature = "std"))] println!("USB kesmesi işleniyor."); // Sahne64 macro varsayımı
-
-     // TODO: USB sürücü kodu ile etkileşime gir (veri oku/yaz, durum kontrol et).
-     // Bu, çekirdekteki USB sürücüsü logic'idir.
-     // resource::read veya resource::write çağrısı yapan görevleri uyandırabilir.
-
-     clear_usb_interrupt_flag(); // Bayrağı temizle
-}
-
-
-// Yardımcı fonksiyon: Zamanlayıcı kesme bayrağını temizle (DONANIMA ÖZGÜ)
-/// Zamanlayıcı donanımındaki kesme bayrağını temizler.
-/// # Güvenlik
-/// Güvenli değildir, donanım registerına yazma yapar.
-fn clear_timer_interrupt_flag() {
-    // TODO: Zamanlayıcı kontrol register'ının adresini ve temizleme yöntemini tanımla.
-    // ÖRNEK ADRES VE YÖNTEM: Gerçek donanımınıza uygun register ve biti kullanın.
-     const TIMER_CONTROL_REGISTER_ADDRESS: usize = 0x...; // Donanıma özgü adres
-     const TIMER_CLEAR_BIT: u32 = 1 << ...; // Donanıma özgü temizleme biti
-
-    unsafe {
-         // Örnek: Zamanlayıcı kontrol register'ındaki ilgili biti temizle (volatile yazma)
-          volatile_store!(TIMER_CONTROL_REGISTER_ADDRESS, ...); // volatile crate kullanımı
-
-         // Ya da asm ile SPR yazma (eğer zamanlayıcı SPR üzerinden yönetiliyorsa)
-          asm!("mtspr spr_timer_control, {0}", in(reg) clear_value); // Örnek SPR
-         #[cfg(feature = "std")] std::println!("Zamanlayıcı kesme bayrağı temizlendi (simüle)."); // Debug çıktı
-         #[cfg(not(feature = "std"))] println!("Zamanlayıcı kesme bayrağı temizlendi (simüle)."); // Debug çıktı
-
-         // !!! DİKKAT: Aşağıdaki satır SADECE BİR ÖRNEKTİR ve ÇALIŞMAYABİLİR !!!
-         // !!! Gerçek donanımınızın kılavuzuna başvurarak doğru yöntemi bulun !!!
-          asm!("nop"); // Yer tutucu: Donanıma özgü bayrak temizleme komutu buraya
-     }
-}
-
-// Yardımcı fonksiyon: USB kesme bayrağını temizle (DONANIMA ÖZGÜ) (Yeni eklendi)
-/// USB donanımındaki kesme bayrağını temizler.
-/// # Güvenlik
-/// Güvenli değildir, donanım registerına yazma yapar.
-unsafe fn clear_usb_interrupt_flag() { // unsafe eklendi
-    // USB kesme bayrağını temizleme (ÇOK ÖNEMLİ!)
-    // Kesme işlendikten sonra, kesme bayrağının TEMİZLENMESİ ZORUNLUDUR.
-    // Aksi takdirde, aynı kesme sürekli olarak tekrar tetiklenir ve sistem kilitlenir.
-    // **DİKKAT:** Kesme bayrağını temizleme yöntemi DONANIMA ÖZGÜDÜR.
-    // Genellikle USB kontrolcüsünün kendi register'ındaki bir biti yazarak/temizleyerek yapılır.
-
-    let usb_irq_clear_register_address = USB_BASE_ADDRESS.wrapping_add(USB_IRQ_CLEAR_REGISTER_OFFSET); // Güvenli adres hesaplama
-
-    unsafe {
-         let mut usb_irq_clear_register = Volatile::new(usb_irq_clear_register_address as *mut u32); // Örnek: 32-bit register
-         usb_irq_clear_register.write(USB_IRQ_CLEAR_VALUE); // Örnek: Temizleme değerini yaz
-         // **UYARI:** USB_IRQ_CLEAR_REGISTER_OFFSET ve USB_IRQ_CLEAR_VALUE DONANIMA GÖRE DEĞİŞİR.
-         // Doğru yöntem için çipinizin ve USB kontrolcüsünün REFERANS KILAVUZUNA BAKIN.
-         #[cfg(feature = "std")] std::println!("USB kesme bayrağı temizlendi."); // Debug çıktı
-         #[cfg(not(feature = "std"))] println!("USB kesme bayrağı temizlendi."); // Debug çıktı
-    }
-}
-
-
-/// OpenRISC mimarisi için kesme ve trap altyapısını başlatır.
-/// IVTBR ve SR gibi ilgili SPR'ları ayarlar, kesmeleri etkinleştirir.
-/// Bu fonksiyon, sistem başlangıcında (kernel init sürecinde) çağrılmalıdır.
-pub fn init() {
-    // Bu fonksiyon, Supervisor mode (S mode) veya Machine mode (M mode) gibi
-    // yüksek privilege seviyesinde çalışmalıdır. OpenRISC'te bu genellikle
-    // Supervisor mode'dur (SR[SM]=1).
-    unsafe {
-        // 1. IVTBR (Interrupt Vector Table Base Register) Register'ını Ayarlama
-        // IVTBR register'ı, kesme vektör tablosunun (IVT) başlangıç adresini tutar.
-        // Kesme oluştuğunda işlemci, IVTBR + ofset adresine dallanır.
-        // SPR_IVTBR register'ına IVT adresini yazmak için 'mtspr' kullanılır.
-        // SPR adresi olarak spr_ivtbr (0x1B) veya çipinize özgü bir değer kullanılmalıdır.
-        const SPR_IVTBR: usize = 0x1B; // Örnek IVTBR SPR adresi (Kılavuza bakın!)
-
-        asm!(
-            "mtspr {0}, {1}", // mtspr spr, rs (spr: spr address, rs: source reg)
-            const SPR_IVTBR,      // Hedef SPR adresi
-            in(reg) IVT_ADDRESS,  // Kaynak register olarak IVT adresi sabiti
-            options(nostack)      // Stack manipulation olmadığını belirtir
-        );
-        // ** AÇIKLAMA: IVTBR adresini sisteme bildirme işlemi DONANIMA ÖZGÜDÜR! **
-        // Doğru SPR adresi ve yazma yönergesi için OpenRISC ISA ve çip kılavuzuna bakın.
-
-
-        // 2. İlgili Çevre Birimi Kesmelerini Etkinleştirme (Zamanlayıcı ve USB)
-        // OpenRISC'te bu genellikle SPR_SR (Status Register) içindeki EE (External Enable)
-        // gibi genel bitler veya özel bir kesme denetleyici SPR'ı (örn. PICMR - PIC Mask Register)
-        // kullanılarak yapılır. Bu kısım donanıma özgü en çok değişen yerdir.
-        // ÖRNEK: Varsayımsal bir PICMR kaydı üzerinden maskeleme.
-         const SPR_PICMR: usize = 0x...; // Örnek PIC Mask Register SPR adresi
-         const PICMR_TIMER_ENABLE_BIT: usize = ...; // Zamanlayıcı biti maskesi
-         const PICMR_USB_ENABLE_BIT: usize = ...; // USB biti maskesi
-         let irqs_to_enable_mask = PICMR_TIMER_ENABLE_BIT | PICMR_USB_ENABLE_BIT;
-         asm!("mtspr {0}, {1}", const SPR_PICMR, in(reg) irqs_to_enable_mask, options(nostack));
-
-        // Veya Status Register (SR) içindeki ilgili bitler.
-        enable_timer_interrupt(); // Zamanlayıcıyı etkinleştirme helper'ı çağır
-        // USB etkinleştirme helper'ı eklenebilir.
-
-        // Bu örnekte, enable_timer_interrupt() helper fonksiyonunun kendi içinde
-        // ilgili donanım veya SPR ayarını yaptığını varsayalım.
-        // USB için de benzer bir helper eklenebilir.
-         enable_timer_interrupt(); // Zamanlayıcı kesmesini etkinleştir (helper içinde donanıma özgü kod var)
-          enable_usb_interrupt(); // USB kesmesini etkinleştir (eğer helper'ı tanımlarsak)
-
-        // Not: enable_timer_interrupt() ve enable_usb_interrupt() fonksiyonları
-        // aslında kesmeleri donanımsal olarak (zamanlayıcı/USB kontrolcüsünde)
-        // etkinleştirme logic'ini içermelidir. Bu logic SPR yazmayı veya
-        // memory-mapped register yazmayı içerebilir.
-
-
-        // 3. Genel Kesmeleri Etkinleştirme (Status register'daki EE biti)
-        // OpenRISC'te genellikle SR (Status Register) içindeki EE (External Enable)
-        // veya IE (Interrupt Enable) gibi bir bit kullanılır.
-        // SPR_SR register'ını okuyun, EE bitini set edin, geri yazın.
-        const SPR_SR: usize = 0x11; // Örnek SR SPR adresi (Kılavuza bakın!)
-        const SR_EE_BIT: usize = 1 << 1; // Örnek EE (External Enable) bit pozisyonu (Kılavuza bakın!)
-
-        // Status register'ı oku: mfspr rd, spr
-        // $t0 geçici olarak kullanılabilecek bir register.
-        let mut sr_value: usize;
-        asm!("mfspr {0}, {1}", out(reg) sr_value, const SPR_SR, options(nostack));
-
-        // Okunan Status değerine EE bitini OR'la
-        sr_value |= SR_EE_BIT;
-
-        // Yeni Status değerini geri yaz: mtspr spr, rs
-        asm!("mtspr {0}, {1}", const SPR_SR, in(reg) sr_value, options(nostack));
-
-        // **DİKKAT:** SPR_SR, SR_EE_BIT ve etkinleştirme yöntemi DONANIMA GÖRE DEĞİŞİR.
-        // Doğru değerler için OpenRISC ISA ve çip kılavuzuna bakın.
-
-
-        // Diğer platforma özgü başlatma adımları buraya eklenebilir.
-    }
-    // init fonksiyonu başarıyla tamamlanırsa geri döner.
-}
-
-// Yardımcı fonksiyon: USB kesmesini etkinleştir (DONANIMA ÖZGÜ) (Yeni eklendi)
-/// USB donanımındaki kesme üretme yeteneğini etkinleştirir.
-/// # Güvenlik
-/// Güvenli değildir, donanım registerına yazma yapar.
-
-unsafe fn enable_usb_interrupt() {
-     #[cfg(feature = "std")] std::println!("USB kesmesi etkinleştiriliyor (simüle).");
-     #[cfg(not(feature = "std"))] println!("USB kesmesi etkinleştiriliyor (simüle)."); // Sahne64 macro varsayımı
-
-    // TODO: USB kontrolcüsünün kesme etkinleştirme register'ının adresini ve bitini tanımla.
-    // ÖRNEK ADRES VE BİT: Gerçek donanımınıza uygun register ve biti kullanın.
-     const USB_CONTROL_REGISTER_ADDRESS: usize = 0x...; // Donanıma özgü adres
-     const USB_ENABLE_BIT: u32 = 1 << ...; // Donanıma özgü etkinleştirme biti
-
-    // volatile yazma ile etkinleştirme
-     volatile_store!(USB_CONTROL_REGISTER_ADDRESS, ...);
-
-    // Veya asm ile SPR yazma (eğer USB SPR üzerinden yönetiliyorsa)
-     asm!("mtspr spr_usb_control, {0}", in(reg) enable_value); // Örnek SPR
-
-     // !!! BU KISIM DONANIMA ÖZGÜ KOD İLE DOLDURULMALIDIR. !!!
+    // İşleyici fonksiyonundan dönüş yapıldığında, düşük seviyeli assembly kodu
+    // TrapFrame'den registerları geri yükleyerek kullanıcı programına (EPCR'den başlayarak) dönecektir.
 }
