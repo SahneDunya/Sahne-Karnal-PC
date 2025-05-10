@@ -1,246 +1,246 @@
-#![no_std] // Standart kütüphaneye ihtiyaç duymuyoruz
+use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
+use lazy_static::lazy_static;
+use spin::Mutex;
 
-// Gerekli core modüllerini içeri aktar
-use core::{arch::asm, ptr, mem}; // Added mem for size_of
+// Karnal64 çekirdek API'sını ve diğer modülleri dışarıdan import ediyoruz.
+// Bu modüllerin src/ dizininde veya başka bir yerde tanımlı olduğunu varsayıyoruz.
+// extern crate karnal64; // Eğer ayrı bir crate ise
+use crate::karnal64; // Genellikle aynı çekirdek projesi içindeyse
 
-// `volatile` crate'inden Volatile sarmalayıcıyı içeri aktar (cargo.toml'da tanımlı olmalı)
-use volatile::Volatile; // <-- Added import
+// Diğer çekirdek modülleri için yer tutucu importlar
+use crate::ktask;
+use crate::kmemory;
 
-// Konsol çıktı makrolarını kullanabilmek için (hata durumlarında loglama veya debug çıktısı için)
-// Bu makrolar Sahne64 crate'i tarafından sağlanır ve resource API'sini kullanır.
-// Bu crate'te kullanılabilir olmaları için uygun kurulum (örn. #[macro_use]) gereklidir.
-// Bu örnekte, #[cfg] ile std/no_std çıktısını ayarlayarak makroların
-// uygun ortamda kullanılabilir olduğunu varsayıyoruz.
-// use sahne64::eprintln; // Örnek import eğer macro publicse
+// --- Sabitler ---
 
+// Programlanabilir Kesme Denetleyicisi (PIC) ofsetleri
+// x86 sistemlerde donanım kesmeleri (IRQ'ler) genellikle 0-15 aralığındadır.
+// Bu aralığın istisnalar (0-31) ile çakışmasını önlemek için PIC'leri yeniden haritalarız.
+// Genellikle PIC1 (master) IRQ0-7 -> Vektör 32-39
+// PIC2 (slave) IRQ8-15 -> Vektör 40-47
+const PIC_1_OFFSET: u8 = 32;
+const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
 
-use crate::exception; // x86 için istisna işleme modülü (çekirdek içi)
+// Kullanacağımız sistem çağrısı kesme numarası (genel bir seçenektir)
+const SYSCALL_INT_VECTOR: u8 = 0x80; // Vektör 128
 
-// x86'da kesme numaraları (IRQ)
-// IDT indeksi, kesme/istisna vektör numarasıdır.
-// Donanım IRQ numaraları genellikle 0-15 arasıdır (PIC) veya daha yüksek (APIC).
-// Bu IRQ numaraları, IDT vektör numaralarına maplenir (genellikle 32+IRQ).
-// **DİKKAT**: USB_IRQ değeri DONANIMA GÖRE DEĞİŞİR!
-// Bu sadece bir ÖRNEK değerdir (örneğin, PIC IRQ 11). Bu, IDT indeksi *değildir*.
-// Bu IRQ'nun hangi IDT vektörüne maplendiğini (genellikle 32 + IRQ_numarası) bilmelisiniz.
-const USB_IRQ_NUM: u8 = 11; // ÖRNEK USB Donanım IRQ numarası. DONANIMA ÖZGÜ DEĞER!
-// Bu IRQ'nun maplendiği IDT vektör numarasını belirleyelim (genellikle IRQ base + IRQ num).
-const IRQ_BASE_VECTOR: u8 = 32; // Örnek: İlk 32 vektör istisnalar için, 32 sonrası IRQ'lar için.
-const USB_IRQ_VECTOR: u8 = IRQ_BASE_VECTOR + USB_IRQ_NUM; // USB IRQ'sunun maplendiği IDT vektör numarası
+// --- Kesme Tanımlayıcı Tablosu (IDT) ---
 
-
-// Kesme tanımlama tablosu (IDT) için yapı
-// `#[repr(C, packed)]` x86 segment/gate tanımları için doğru bellekle yerleşimini sağlar.
-// Bu yapı 32-bit interrupt gate tanımını temsil eder.
-#[repr(C, packed)]
-#[derive(Clone, Copy)] // init döngüsünde kopyalama için
-struct IDTEntry {
-    offset_low: u16,        // İşleyici adresinin düşük 16 biti
-    selector: u16,          // Kod segment seçicisi (genellikle kernel kod segmenti)
-    zero: u8,               // Boş byte (0 olmalı)
-    type_attributes: u8,    // Tür ve öznitelikler (DPL, Varlık biti, Kapı türü vb.)
-    offset_high: u16,       // İşleyici adresinin yüksek 16 biti
-    // 64-bit (x86_64) için bu yapı daha farklıdır (offset_high 32 bit, zero alanı 32 bit daha uzar).
-    // Bu kod 32-bit IDT entry formatına uygundur.
+// IDT'yi statik olarak tanımlıyoruz ve erişimini Mutex ile koruyoruz.
+// lazy_static, IDT'nin ilk kullanıldığında başlatılmasını sağlar.
+lazy_static! {
+    static ref IDT: Mutex<InterruptDescriptorTable> = Mutex::new(InterruptDescriptorTable::new());
 }
 
-// IDT'nin kendisi. Sabit boyutlu bir dizi olarak tanımlanır.
-// x86 mimarisinde 256 kesme vektörü vardır (0-255).
-static mut IDT: [IDTEntry; 256] = [IDTEntry {
-    offset_low: 0,
-    selector: 0,
-    zero: 0,
-    type_attributes: 0,
-    offset_high: 0,
-}; 256]; // static mut IDT: writable olmalı
+// --- Kesme İşleyicileri (Handler) ---
 
-// Varsayılan Kesme/İstisna İşleyicisi
-// IDT'de özel bir işleyici tanımlanmayan tüm vektörler için kullanılır.
-// Genellikle basit bir hata raporlama ve sistem durdurma işlemi yapar.
-// Güvenli olmayan (unsafe) extern "C" fn olarak tanımlanmalıdır.
-// x86 kesme işleyicileri genellikle hiçbir argüman almaz (bazı istisnalar hata kodu pushlar).
-unsafe extern "C" fn default_trap_handler() {
-     // ** Güvenlik: Bu işleyici unsafe'dir çünkü trap/kesme bağlamında çalışır **
-     // ve muhtemelen stack, donanım veya paylaşılan bellekle etkileşime girecektir.
+// Bu fonksiyonlar, assembly stubs (yardımcı montaj kodları) tarafından çağrılır.
+// Assembly stub'lar, kesme sırasında CPU'nun kaydettiği durumu (InterruptStackFrame) hazırlar,
+// ek bilgileri (hata kodu gibi) yığına koyar ve bu Rust fonksiyonlarını çağırır.
+// Daha sonra Rust fonksiyonundan döndükten sonra, assembly stub'lar kaydedilen durumu geri yükler ve `iret` ile kesmeden döner.
 
-     // Sahne64 konsol makrolarını kullanarak hata logla.
-     // Hata ayıklama için hangi vektörün tetiklendiğini bulmak önemlidir.
-     // Bu bilgi genellikle stack'te (eğer işlemci hata kodu pushladıysa) veya debug registerlarında bulunur.
-     // Basitlik adına sadece genel bir hata loglayalım.
-     #[cfg(feature = "std")] std::eprintln!("UYARI: x86 Beklenmeyen kesme/istisna!");
-     #[cfg(not(feature = "std"))] eprintln!("UYARI: x86 Beklenmeyen kesme/istisna!"); // Sahne64 macro varsayımı
-
-     // TODO: Hata durumunu logla, vektör numarasını belirle (stack veya debug register'lardan).
-     // panic!("Beklenmeyen kesme/istisna!"); // Panik, debug amaçlı kullanılabilir.
-     // Kritik hata durumunda sistemi durdur.
-     loop { core::hint::spin_loop(); } // Veya halt_system();
+// Assembly stubs için extern tanımlamalar.
+// Bu fonksiyonların gövdesi Rust'ta değil, assembly dilinde yazılacaktır.
+extern "x86-interrupt" fn exception_handler(stack_frame: InterruptStackFrame, vector: u8, error_code: Option<u64>) {
+    // Genel istisna işleyicisi
+    println!("KERNEL PANIC: EXCEPTION: {}! Error Code: {:?} Stack Frame: {:#?}", vector, error_code, stack_frame);
+    // Gerçek bir çekirdekte burada hata ayıklama bilgileri loglanır veya bir çökme ekranı gösterilir.
+    // Sonsuz döngüye girerek sistemi durdurun.
+    loop { x86_64::instructions::hlt(); }
 }
 
+extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    // Zamanlayıcı kesme işleyicisi (IRQ0 / Vektör 32)
+    // Bu kesme, işletim sisteminin zamanlayıcısı (scheduler) tarafından kullanılır.
+    // Genellikle bir görev değişimi (context switch) burada tetiklenir.
 
-/// x86 mimarisi için kesme ve trap altyapısını başlatır.
-/// IDT'yi kurar, işleyici adreslerini yazar ve genel kesmeleri etkinleştirir.
-/// Bu fonksiyon, sistem başlangıcında (kernel init sürecinde) Ring 0 privilege seviyesinde çağrılmalıdır.
-pub fn init() {
-    // Bu fonksiyon Ring 0 (Kernel mode) privilege seviyesinde çalışmalıdır.
+    // TODO: Karnal64'ün görev yöneticisini (ktask) çağırarak zamanlayıcıyı çalıştır.
+     ktask::schedule();
+
+    // PIC'e (Programlanabilir Kesme Denetleyicisi) sinyal gönder: Kesmeyi işledik.
+    // Bu, PIC'in aynı kesmeyi tekrar göndermesini engeller.
+    // Bu PIC yönetimi src/pic.rs gibi ayrı bir modülde olabilir.
     unsafe {
-        // 1. IDT'yi Başlatma
-        // Başlangıçta tüm IDT girişlerini varsayılan işleyiciye ayarla.
-        let default_handler_addr = default_trap_handler as unsafe extern "C" fn() as usize;
-
-         // Varsayılan IDT girişi yapısını oluştur
-        let default_entry = IDTEntry {
-             offset_low: (default_handler_addr as u16) & 0xFFFF,
-             selector: 0x08, // Varsayım: Kernel kod segment seçici
-             zero: 0,
-             type_attributes: 0x8E, // Varsayım: 32-bit Interrupt Gate, DPL=0, Present
-             offset_high: (default_handler_addr >> 16) as u16,
-         };
-
-        // Tüm IDT girişlerini varsayılan işleyici ile doldur
-        for i in 0..256 {
-             IDT[i] = default_entry; // struct Copy olduğu için doğrudan atama
-         }
-
-
-        // 2. Özel Kesme İşleyicilerini IDT'ye Yerleştirme
-        // USB kesme işleyicisi fonksiyonunun adresini al
-        let usb_interrupt_handler_addr = usb_interrupt_handler as unsafe extern "C" fn() as usize;
-
-        // IDT'nin USB_IRQ_VECTOR numaralı girişini yapılandır (USB IRQ'sunun maplendiği vektör)
-        if USB_IRQ_VECTOR < 256 {
-             IDT[USB_IRQ_VECTOR as usize].offset_low = (usb_interrupt_handler_addr as u16) & 0xFFFF;
-             IDT[USB_IRQ_VECTOR as usize].selector = 0x08; // Kod segment seçicisi (genellikle 0x08 kernel)
-             IDT[USB_IRQ_VECTOR as usize].zero = 0;
-             IDT[USB_IRQ_VECTOR as usize].type_attributes = 0x8E; // Varlık biti (Present=1), DPL=0, Kesme kapısı (32-bit Interrupt Gate)
-             IDT[USB_IRQ_VECTOR as usize].offset_high = (usb_interrupt_handler_addr >> 16) as u16;
-         } else {
-              #[cfg(feature = "std")] std::eprintln!("KRİTİK HATA: x86 USB IRQ Vektör numarası ({}) IDT boyutundan ({}) büyük!", USB_IRQ_VECTOR, 256);
-              #[cfg(not(feature = "std"))] eprintln!("KRİTİK HATA: x86 USB IRQ Vektör numarası ({}) IDT boyutundan ({}) büyük!", USB_IRQ_VECTOR, 256);
-               loop { core::hint::spin_loop(); } // Veya halt_system();
-         }
-
-
-        // Diğer istisna işleyicileri (Page Fault, General Protection Fault, Syscall, vb.) de buraya veya exception modülünde ayarlanmalıdır.
-        // Exception modülü genellikle temel istisna işleyicilerini IDT'ye yerleştirir.
-
-
-        // 3. IDT İşaretçi Yapısını Oluşturma ve Yükleme
-        // lidt komutu için gerekli IDT işaretçi yapısı
-        #[repr(C, packed)] // Doğru paketleme önemli
-        struct IDTPointer {
-            limit: u16,       // IDT'nin boyutu - 1
-            base: u32,        // IDT'nin başlangıç adresi (32-bit)
-            // 64-bit (x86_64) için base 64 bit olmalıdır.
-        }
-
-        let idt_pointer = IDTPointer {
-            limit: (mem::size_of::<[IDTEntry; 256]>() - 1) as u16,
-            base: &IDT as *const _ as u32, // static mut IDT'nin 32-bit adresini al
-        };
-
-        // IDT'yi işlemciye yükle: lidt komutu
-         asm!("lidt [{0}]", in(reg) &idt_pointer); // Pointer'a referans
-         asm!("lidt ({0})", in(reg) &idt_pointer, options(nostack, nomem)); // Offset olarak pointer'ı ver
-
-        // 4. Harici Kesme Denetleyicilerini (PIC/APIC/MSI) Yapılandırma ve Kesmeleri Etkinleştirme
-        // Bu kısım TAMAMEN DONANIMA ÖZGÜDÜR ve KULLANILAN CHIPSET/ANAKART/IRQ KONTROLCÜSÜNE BAĞLIDIR.
-        // Exception modülü genellikle PIC/APIC başlatma ve temel IRQ yönlendirmesini yapar.
-        // Sadece USB IRQ'sunu etkinleştirmek için, bu IRQ'yu kontrol eden denetleyiciyi (PIC/APIC/MSI)
-        // doğru şekilde ayarlamanız gerekir.
-
-        // Örnek PIC/APIC/MSI yapılandırmaları (YORUM SATIRI OLARAK BIRAKILDI - GERÇEK DEĞER VE YÖNTEM İÇİN KILAVUZA BAKIN!):
-        
-        // PIC Yeniden Eşleme (Genellikle IRQ 0-15'i vektör 32-47'ye mapler)
-         outb(0x20, 0x11); outb(0xA0, 0x11); // ICW1
-         outb(0x21, IRQ_BASE_VECTOR); outb(0xA1, IRQ_BASE_VECTOR + 8); // ICW2 (Offset)
-         outb(0x21, 0x04); outb(0xA1, 0x02); // ICW3 (Cascade)
-         outb(0x21, 0x01); outb(0xA1, 0x01); // ICW4 (8086 mode)
-
-        // Tüm IRQ'ları maskele (şimdilik)
-         outb(0x21, 0xFF); outb(0xA1, 0xFF);
-
-        // APIC/MSI yapılandırması çok daha karmaşıktır.
-
-        // USB IRQ'sunu Etkinleştirme (Kullanılan denetleyiciye göre)
-         outb(0x21, inb(0x21) & !(1 << USB_IRQ_NUM)); // PIC Master maskesini aç (USB IRQ 11 = bit 11)
-
-        // APIC veya MSI ile etkinleştirme çok daha karmaşık donanım yazmalarını içerir.
-        // APIC'in LVT'sini veya IOAPIC'in Redirection Table'ını ayarlama.
-        // MSI için PCI yapılandırma alanını ve bellek eşlemeli kontrolcü registerlarını ayarlama.
-
-        // Genel Kesmeleri Etkinleştirme (EFLAGS register'ındaki IF biti)
-        // sti (Set Interrupt Flag) komutu kullanılır.
-        asm!("sti", options(nostack, nomem)); // Kesmeleri etkinleştir
-        // ** UYARI: Kesmeleri etkinleştirmeden önce TÜM İŞLEYİCİLERİN ve İLGİLİ DONANIMIN
-        // doğru yapılandırıldığından EMİN OLUN! **
+         pic::notify_end_of_interrupt(PIC_1_OFFSET); // PIC1'den geldi
+         // Yer tutucu PIC sinyali
+        print!("."); // Zamanlayıcının çalıştığını göstermek için basit bir çıktı
     }
-    // Exception modülünü başlat (bu genellikle genel istisna işleyicilerini kurar)
-     exception::init(); // <-- exception::init() burada veya daha önce çağrılabilir.
-                         // Genellikle IDT kurulduktan sonra çağrılır.
-
-     // init fonksiyonu başarıyla tamamlanırsa geri döner.
+    // Zamanlayıcı kesmesi oldukça sık gerçekleşebilir, dikkatli loglama yapılmalı.
 }
 
-// USB kesme işleyicisi (DONANIMA ÖZGÜ UYGULAMA GEREKLİ! - ÖRNEK YAPI)
-// Bu fonksiyon, IDT'den çağrılır.
-#[no_mangle] // Linker script veya IDT tarafından çağrılabilir
-// Kesme işleyicisi fonksiyonları genellikle 'unsafe extern "C"' olarak tanımlanır.
-// IDT Gate Type 0x8E (32-bit Interrupt Gate) otomatik olarak IF bitini temizler
-// ve hat kodu pushlamaz (sadece bazı istisnalar pushlar).
-// Bu nedenle 'extern "C" fn()' imzası IRQ handlerları için uygundur.
-pub unsafe extern "C" fn usb_interrupt_handler() {
-    // ** Güvenlik: Bu işleyici unsafe'dir çünkü kesme bağlamında çalışır **
-    // ve donanımla doğrudan etkileşime girer, stack manipülasyonu gerekebilir.
-    // TODO: Gerekirse (örneğin iç içe kesmeler veya task switch öncesi) registerları kaydet!
+extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    // Klavye kesme işleyicisi (IRQ1 / Vektör 33)
+    // Klavye denetleyicisinden gelen tuş basma/bırakma olaylarını işler.
 
-    // ** DİKKAT: Bu bölüm DONANIMA ÖZGÜDÜR ve KULLANILAN ÇİPİN VE USB KONTROLCÜSÜNÜN KILAVUZUNA GÖRE KODLANMALIDIR! **
-    // Bu işleyici çekirdek içinde çalışır, kullanıcı alanındaki Sahne64 API'sini doğrudan çağırmaz.
-    // Gelen USB verisini alır ve çekirdekteki USB sürücüsü koduna iletir.
-    // Ardından, bu veriyi bekleyen kullanıcı görevini Sahne64 çekirdek zamanlama mekanizması
-    // aracılığıyla uyandırır (örn. resource::read için bekleyen görev).
+    // TODO: Klavye donanımından veriyi oku.
+    // TODO: Okunan veriyi Karnal64'ün kaynak yöneticisi (kresource) üzerinden konsol kaynağına veya bir girdi kuyruğuna ilet.
 
-    // 1. USB ile ilgili işlemleri gerçekleştir
-    // Örnek: USB durum register'ını okuyarak kesme nedenini belirle (veri geldi, TX bitti vb.)
-    // ve ilgili işlemleri yap (veri okuma/yazma).
-    // Bu genellikle donanım registerlarına volatile okuma/yazma ile yapılır (memory-mapped I/O)
-    // veya port I/O (inb/outb) ile yapılır (legacy donanım).
+    // PIC'e sinyal gönder: Kesmeyi işledik.
+    unsafe {
+        // pic::notify_end_of_interrupt(PIC_1_OFFSET + 1); // PIC1'den geldi
+         // Yer tutucu PIC sinyali
+        print!("K"); // Klavye kesmesinin geldiğini göstermek için basit bir çıktı
+    }
+}
 
-    // Örnek: USB durum register'ını oku (memory-mapped I/O)
-     const USB_STATUS_REGISTER_ADDRESS: usize = 0x...; // DONANIMA ÖZGÜ
-     let usb_status = ptr::read_volatile(USB_STATUS_REGISTER_ADDRESS as *const u32);
-    // TODO: Durum bitlerine göre işlem yap (veri oku/yaz).
+extern "x86-interrupt" fn page_fault_handler(stack_frame: InterruptStackFrame, error_code: PageFaultErrorCode) {
+    // Sayfa Hatası işleyicisi (Exception 14)
+    // Bellek yönetiminde (virtüel bellek) önemli bir istisnadır.
+    // Erişilmek istenen sayfa bellekte değilse, sayfa koruma ihlali olursa tetiklenir.
 
-    // Debug çıktıları için Sahne64 konsol makrolarını kullan
-     #[cfg(feature = "std")] std::println!("x86 USB kesmesi işleniyor (Vektör {}).", USB_IRQ_VECTOR);
-     #[cfg(not(feature = "std"))] println!("x86 USB kesmesi işleniyor (Vektör {}).", USB_IRQ_VECTOR); // Sahne64 macro varsayımı
+    use x86_64::registers::control::Cr2;
+
+    println!("EXCEPTION: PAGE FAULT");
+    println!("Erişim Adresi: {:?}", Cr2::read()); // Hatanın oluştuğu sanal adres
+    println!("Hata Kodu: {:?}", error_code);
+    println!("Stack Frame: {:#?}", stack_frame);
+
+    // TODO: Karnal64'ün bellek yöneticisini (kmemory) çağırarak sayfayı yüklemeye çalış,
+    // izinleri kontrol et veya süreci sonlandır.
+     kmemory::handle_page_fault(Cr2::read(), error_code);
 
 
-    // 2. Kesme bayrağını temizle ve/veya EOI (End Of Interrupt) gönder (ÇOK ÖNEMLİ! - DONANIMA ÖZGÜ)**
-    // Kesme işlendikten sonra, kesme bayrağının TEMİZLENMESİ veya interrupt denetleyicisine
-    // EOI gönderilmesi ZORUNLUDUR. Aksi takdirde, aynı kesme sürekli olarak tekrar tetiklenir.
-    // Yöntem kullanılan IRQ denetleyicisine (PIC/APIC/MSI) ve çevre birimine bağlıdır.
+    // Page Fault istisnası bir donanım kesmesi değil, CPU istisnasıdır.
+    // Bu nedenle PIC'e EOI göndermeye GEREK YOKTUR.
 
-    // Örnek: PIC için EOI gönderme (SADECE PIC KULLANILIYORSA!)
-     outb(0x20, 0x20); // Master PIC EOI komut portu (0x20), EOI değeri (0x20)
-    // Eğer USB IRQ'su Slave PIC'ten geliyorsa, Slave PIC'e EOI (0xA0, 0x20) ve Master PIC'e EOI gönderilmeli.
-    // Bu işlem port I/O (outb) gerektirir.
+    // Çözülemez bir sayfa hatası (örn. geçersiz adres) sistem çökmesine neden olur.
+    loop { x86_64::instructions::hlt(); }
+}
 
-    // Örnek: APIC için EOI gönderme (APIC KULLANILIYORSA!)
-    // APIC EOI register'ı memory-mapped'dir.
-     const APIC_EOI_REGISTER_ADDRESS: usize = ...; // Memory-mapped APIC base + EOI offset
-     ptr::write_volatile(APIC_EOI_REGISTER_ADDRESS as *mut u32, 0); // Genellikle 0 yazılır
+extern "x86-interrupt" fn general_protection_fault_handler(stack_frame: InterruptStackFrame, error_code: u64) {
+    // Genel Koruma Hatası işleyicisi (Exception 13)
+    // Segmentasyon ihlalleri, yetkisiz bellek erişimleri, geçersiz komutlar gibi birçok hatada tetiklenir.
 
-    // Örnek: MSI için kesme temizleme (MSI KULLANILIYORSA!)
-    // MSI, kesme bilgisini belleğe yazar. Bayrak temizleme donanıma özgüdür,
-    // genellikle USB kontrolcüsünün kendi registerına yazılır.
-     const USB_MSI_IRQ_CLEAR_REGISTER_ADDRESS: usize = ...; // DONANIMA ÖZGÜ
-     ptr::write_volatile(USB_MSI_IRQ_CLEAR_REGISTER_ADDRESS as *mut u32, CLEAR_VALUE);
+    println!("EXCEPTION: GENERAL PROTECTION FAULT (GPF)");
+    println!("Error Code: {}", error_code);
+    println!("Stack Frame: {:#?}", stack_frame);
 
-    // TODO: Kullanılan donanıma uygun kesme temizleme/EOI kodunu buraya ekleyin.
+    // TODO: Hata koduna göre daha detaylı analiz yap.
+    // Genellikle bu tür bir hata, kullanıcı programında ciddi bir hata veya çekirdekte bir bug olduğunu gösterir.
+    // Kullanıcı sürecini sonlandır veya çekirdeği çökert.
 
-    // TODO: Kesme işleyiciden çıkış. Kaydedilen registerları geri yükle.
-    // TODO: iret, iretd veya iretq yönergesini kullan. Bu, EFLAGS'ı (ve x66_64'te RFLAGS), CS, EIP (RIP) ve muhtemelen SS, ESP (RSP) değerlerini stack'ten yükler.
-     asm!("iret"); // veya "iretd" (32-bit), "iretq" (64-bit)
-    // NOT: Exception entry noktası register kaydı ve iret/iretd/iretq'yi yapıyorsa,
-    // bu handler sadece işini yapıp normal geri dönebilir.
+    loop { x86_64::instructions::hlt(); }
+}
+
+
+// --- Sistem Çağrısı İşleyicisi ---
+
+// `x86-interrupt` çağrı kuralı, CPU'nun kesme sırasındaki yığın düzenini ve
+// kaydettiği durumu (InterruptStackFrame) otomatik olarak argüman olarak sağlar.
+// Syscall kesmesi için hata kodu PUSH YAPMAZ, bu nedenle stack frame direkt gelir.
+extern "x86-interrupt" fn syscall_handler(stack_frame: InterruptStackFrame) {
+    // Sistem Çağrısı (Syscall) işleyicisi (Vektör 128 - 0x80)
+    // Kullanıcı alanından çekirdek hizmetlerini talep etmek için kullanılır.
+
+    // Kullanıcı alanı, sistem çağrısı numarasını ve argümanlarını belirli kayıtlara koyar.
+    // x86_64 SysV ABI'sine göre (çoğu Unix benzeri sistemde yaygın):
+    // Syscall numarası: RAX
+    // Argümanlar: RDI, RSI, RDX, RCX, R8, R9
+    // Dönüş değeri: RAX
+
+    // stack_frame, kesme sırasında kullanıcı görevinin kaydettiği CPU durumunu içerir.
+    let syscall_number = stack_frame.registers.rax;
+    let arg1 = stack_frame.registers.rdi;
+    let arg2 = stack_frame.registers.rsi;
+    let arg3 = stack_frame.registers.rdx;
+    let arg4 = stack_frame.registers.rcx; // RCX genellikle System V ABI'de 4. argüman olarak kullanılır
+    let arg5 = stack_frame.registers.r8;
+    let arg6 = stack_frame.registers.r9;
+
+    // --- Karnal64 API Çağrısı ---
+    // Karnal64'ün genel sistem çağrısı dağıtım fonksiyonunu çağır.
+    // Bu fonksiyon, syscall numarasını kullanarak hangi Karnal64 fonksiyonunun
+    // çalışacağını belirler ve gerekli validasyonları yapar.
+    let syscall_result = karnal64::handle_syscall(
+        syscall_number,
+        arg1,
+        arg2,
+        arg3,
+        arg4,
+        arg5 // Karnal64 handle_syscall'da 5 argüman vardı, altıncıyı (arg6) şimdilik kullanmayalım.
+    );
+
+    // --- Sonucu Kullanıcı Alanına Döndürme ---
+    // Sistem çağrısının dönüş değeri (syscall_result) kullanıcı alanına
+    // genellikle RAX kaydı üzerinden döndürülür.
+    // Bu nedenle, stack_frame üzerinde RAX kaydını güncelliyoruz.
+    // `x86-interrupt` abi'si, handler döndüğünde bu stack frame'i kullanarak `iret` yapar.
+    // Başarı (pozitif/sıfır) veya hata (negatif) değeri RAX'e yazılır.
+    let mut_stack_frame = unsafe {
+        // stack_frame'e yazmak için güvenli olmayan (unsafe) blok gerekli.
+        // Dikkatli kullanılmalıdır!
+        // stack_frame Immutable gelmiyor mu? InterruptStackFrame dokümantasyonuna bakmak lazım.
+        // `x86_64` crate'inin `InterruptStackFrame`'i genellikle `&mut` olarak gelir.
+        // Eğer gelmiyorsa, assembly stub'ın argümanı mutable yapması gerekebilir veya
+        // buradaki `unsafe` cast yerine başka bir mekanizma (örneğin assembly'de doğrudan yazma) gerekebilir.
+        // Genellikle `&mut` geldiği varsayılır.
+         &mut *(core::ptr::addr_of!(stack_frame) as *mut InterruptStackFrame)
+    };
+
+    mut_stack_frame.registers.rax = syscall_result as u64; // i64'ü u64'e dönüştürürken taşma riskine dikkat
+
+    // TODO: Eğer sistem çağrısı görev değişimi gerektiriyorsa (örn. sleep, yield),
+    // zamanlayıcı (ktask) burada çağrılmalı ve dönüş değeri ayarlanmalıdır.
+     task::yield_now(); // gibi
+}
+
+
+// --- IDT Kurulum Fonksiyonu ---
+
+pub fn init_idt() {
+    let mut idt = IDT.lock(); // IDT'ye Mutex kilidi ile güvenli erişim
+
+    // İstisna işleyicilerini kur
+    // x86-64 mimarisinde tanımlanmış istisnalar (0-31 arası)
+    idt.breakpoint.set_handler_fn(breakpoint_handler);
+    // ... Diğer istisnalar için handler'lar (double_fault, general_protection_fault vb.) ...
+    idt.page_fault.set_handler_fn(page_fault_handler);
+    idt.general_protection_fault.set_handler_fn(general_protection_fault_handler);
+
+    // Donanım kesme işleyicilerini kur (PIC üzerinden gelenler)
+    // Vektör 32: Zamanlayıcı (Timer - IRQ0)
+    idt[PIC_1_OFFSET].set_handler_fn(timer_interrupt_handler);
+    // Vektör 33: Klavye (Keyboard - IRQ1)
+    idt[PIC_1_OFFSET + 1].set_handler_fn(keyboard_interrupt_handler);
+    // ... Diğer donanım kesmeleri ...
+
+    // Sistem Çağrısı işleyicisini kur
+    // Vektör 128 (0x80) genellikle syscall için kullanılır
+    idt[SYSCALL_INT_VECTOR]
+        .set_handler_fn(syscall_handler)
+        // DPL (Descriptor Privilege Level): Bu kapıya erişmek için gereken yetki seviyesi.
+        // Kullanıcı alanının (Ring 3) sistem çağrısı yapabilmesi için DPL = 3 olmalıdır.
+        .set_present(true)
+        .set_privilege_level(x86_64:: PrivilegeLevel::Ring3);
+
+
+    // ... Gerekirse diğer istisna ve kesmeleri de ekleyin ...
+
+    // Hazırlanan IDT'yi donanıma yükle
+    unsafe {
+        idt.load();
+    }
+
+    println!("Karnal64: IDT yüklendi.");
+}
+
+// --- Kesmeleri Etkinleştirme ---
+
+pub fn enable_interrupts() {
+    unsafe {
+        // PIC'leri başlat (IRQ'ları yönlendirmek için)
+        // Bu fonksiyon pic modülünde implemente edilmelidir.
+         pic::init_pics(PIC_1_OFFSET, PIC_2_OFFSET);
+
+        // CPU'daki kesme bayrağını (IF - Interrupt Flag) ayarla (STI komutu).
+        // Bu, CPU'nun kesmeleri dinlemeye başlamasını sağlar.
+        x86_64::instructions::interrupts::enable();
+    }
+    println!("Karnal64: Kesmeler etkinleştirildi.");
+}
+
+// --- Basit Breakpoint İstisnası İşleyicisi (Hata Ayıklama İçin Kullanışlı) ---
+// Bu handler, gdb gibi hata ayıklayıcılar için veya kodda kasıtlı durdurma noktaları için kullanışlıdır.
+extern "x86-interrupt" fn breakpoint_handler(stack_frame: InterruptStackFrame) {
+    println!("EXCEPTION: BREAKPOINT\n{:#?}", stack_frame);
 }
