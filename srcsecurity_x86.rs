@@ -1,97 +1,198 @@
-#![no_std]
+#![no_std] // Bu dosya da çekirdek alanında çalışacak, standart kütüphaneye ihtiyaç duymaz.
 
-// x86 mimarisinde segment tabanlı bellek koruması (basitleştirilmiş örnek)
-// Modern x86-64 sistemlerde paging yaygın olarak kullanılsa da,
-// segmentasyon konsepti bellek koruma mekanizmalarının temelini anlamak için hala yararlıdır.
-// Bu örnek, segmentasyonun basitleştirilmiş bir versiyonunu göstermektedir.
+// Geliştirme sırasında kullanılmayan kod veya argümanlar için izinler (geçici olarak açık bırakılabilir)
+#![allow(dead_code)]
+#![allow(unused_variables)]
 
-// **Uyarı:** Bu kod, x86 bellek segmentasyonunun **basitleştirilmiş** bir örneğidir.
-// Gerçek dünya x86 sistemlerinde bellek koruması çok daha karmaşık mekanizmalar (paging, yetki seviyeleri vb.) ile sağlanır.
-// Bu örnek sadece **eğitim amaçlıdır** ve gerçek bir güvenlik çözümü olarak kullanılmamalıdır.
+// Karnal64 API'sından gerekli tipleri ve hataları içe aktaralım.
+// 'crate::' kullanımı, kök modülden (lib.rs veya main.rs'in olduğu yerden)
+// diğer modüllere (karnal64 gibi) erişimi temsil eder.
+use crate::karnal64::{KError, KHandle, KTaskId}; // Karnal64'te tanımlı tipler
+// Bellek yönetimi modülünden de güvenlik kontrolleri için bilgi gerekebilir.
+use crate::kmemory; // Karnal64'teki kmemory yer tutucusuna erişim
 
-// Güvenli bellek bölgesi sınırları (örnek olarak sabit kodlanmış)
-const SECURE_MEMORY_START: usize = 0x100000; // 1MB
-const SECURE_MEMORY_END: usize = 0x200000;   // 2MB
+/// x86 mimarisine özgü güvenlik ile ilgili fonksiyonları barındıran modül.
+/// Bu modül, sistem çağrısı işleyicisi gibi yerlerden çağrılarak güvenlik kontrolleri yapar.
+pub mod security_x86 {
+    use super::*; // Üst scope'taki importları ve tipleri kullan
 
-// Güvenli bölgeye erişimi kontrol eden fonksiyon (basitleştirilmiş)
-pub fn is_address_secure(address: usize) -> bool {
-    address >= SECURE_MEMORY_START && address < SECURE_MEMORY_END
-}
+    /// Kullanıcı alanından gelen bir pointer'ın belirli bir uzunluktaki bellek alanını
+    /// okumak için geçerli ve erişilebilir (readable) olduğunu doğrular.
+    ///
+    /// Bu fonksiyon, sistem çağrısı işleyici tarafından, kullanıcıdan okuma tamponu
+    /// pointer'ı alındığında çağrılmalıdır.
+    ///
+    /// # Güvenlik
+    /// Bu, çekirdeğin güvenliği için KRİTİK bir fonksiyondur. Geçersiz veya kötü niyetli
+    /// pointer'ların çekirdek belleğine erişmesini önler.
+    ///
+    /// # Argümanlar
+    /// * `user_ptr`: Kullanıcı alanındaki başlangıç adresi.
+    /// * `size`: Erişilmek istenen bellek alanının boyutu (byte).
+    ///
+    /// # Dönüş Değeri
+    /// Başarılı olursa `Ok(())`, geçersiz veya erişilemez ise `Err(KError::BadAddress)` döner.
+    pub fn validate_user_pointer_read(user_ptr: *const u8, size: usize) -> Result<(), KError> {
+        if user_ptr.is_null() && size > 0 {
+            // Null pointer ve sıfırdan büyük boyut geçersizdir.
+            return Err(KError::BadAddress);
+        }
+        if size == 0 {
+            // Sıfır boyutlu okuma her zaman geçerlidir (erişim olmaz).
+            return Ok(());
+        }
 
-// Bellek erişimini simüle eden fonksiyon (güvenlik kontrolü ile)
-pub fn access_memory(address: usize, is_write: bool) -> Result<(), &'static str> {
-    if is_address_secure(address) {
-        // Güvenli bölgeye erişim izni (burada sadece bir mesaj yazdırıyoruz)
-        if is_write {
-            // Yazma erişimi simülasyonu
-            kprintln!("Güvenli bölgeye yazma erişimi: 0x{:x}", address);
+        // TODO: x86 mimarisine özgü bellek yönetim birimi (MMU) kontrollerini kullanarak
+        //       veya çekirdeğin bellek yöneticisi (kmemory) ile etkileşime girerek
+        //       `[user_ptr, user_ptr + size)` aralığının:
+        //       1. Kullanıcı alanına ait olduğunu (çekirdek alanında olmadığını).
+        //       2. Mevcut görevin (task) sanal adres alanı içinde geçerli olduğunu.
+        //       3. Okuma (read) iznine sahip olduğunu doğrula.
+        //
+        // Bu doğrulama, mevcut görev/iş parçacığı bağlamına ve sanal adres alanının
+        // haritalamasına (sayfa tablolarına) dayanır.
+        // kmemory modülünden geçerli adres alanı bilgilerini veya doğrulama fonksiyonlarını almanız gerekir.
+        // Örnek bir placeholder çağrı:
+         match kmemory::validate_user_range(user_ptr as usize, size, kmemory::AccessFlags::READ) {
+             Ok(_) => Ok(()),
+             Err(_) => Err(KError::BadAddress), // veya kmemory'nin döndürdüğü hatayı eşle
+         }
+
+        // Şimdilik sadece yer tutucu olarak bir kontrol yapalım (gerçek doğrulama değildir!)
+        // Gerçek çekirdekte bu kısım çok daha karmaşık ve donanıma bağımlı olacaktır.
+        let is_valid_range = kmemory::is_user_range_valid_and_readable(user_ptr, size); // kmemory modülünde böyle bir fonksiyon olmalı
+        if is_valid_range {
+             Ok(())
         } else {
-            // Okuma erişimi simülasyonu
-            kprintln!("Güvenli bölgeden okuma erişimi: 0x{:x}", address);
+             Err(KError::BadAddress)
         }
-        Ok(()) // Erişim başarılı
-    } else {
-        // Güvenli bölge dışına erişim engellendi
-        Err("Güvenli bölge dışına yetkisiz erişim!")
     }
-}
 
-// Basit bir çekirdek println! benzeri fonksiyon (no_std ortamı için)
-macro_rules! kprintln {
-    ($($arg:tt)*) => {{
-        let mut s = StringWriter;
-        use core::fmt::Write;
-        let _ = core::write!(&mut s, $($arg)*);
-    }};
-}
+    /// Kullanıcı alanından gelen bir pointer'ın belirli bir uzunluktaki bellek alanına
+    /// yazmak için geçerli ve erişilebilir (writable) olduğunu doğrular.
+    ///
+    /// Bu fonksiyon, sistem çağrısı işleyici tarafından, kullanıcıdan yazma tamponu
+    /// pointer'ı alındığında çağrılmalıdır.
+    ///
+    /// # Güvenlik
+    /// Bu da çekirdeğin güvenliği için KRİTİK bir fonksiyondur. Kullanıcı kodunun
+    /// çekirdek belleğine veya başka görevlerin belleğine yazmasını önler.
+    ///
+    /// # Argümanlar
+    /// * `user_ptr`: Kullanıcı alanındaki başlangıç adresi.
+    /// * `size`: Erişilmek istenen bellek alanının boyutu (byte).
+    ///
+    /// # Dönüş Değeri
+    /// Başarılı olursa `Ok(())`, geçersiz veya erişilemez ise `Err(KError::BadAddress)` döner.
+    pub fn validate_user_pointer_write(user_ptr: *mut u8, size: usize) -> Result<(), KError> {
+         if user_ptr.is_null() && size > 0 {
+             // Null pointer ve sıfırdan büyük boyut geçersizdir.
+             return Err(KError::BadAddress);
+         }
+         if size == 0 {
+             // Sıfır boyutlu yazma her zaman geçerlidir (erişim olmaz).
+             return Ok(())
+         }
 
-// StringWriter yapısı (kprintln! makrosu için)
-use core::fmt;
-struct StringWriter;
+        // TODO: x86 MMU kontrolleri veya kmemory modülü ile etkileşime girerek
+        //       `[user_ptr, user_ptr + size)` aralığının:
+        //       1. Kullanıcı alanına ait olduğunu.
+        //       2. Mevcut görevin sanal adres alanı içinde geçerli olduğunu.
+        //       3. Yazma (write) iznine sahip olduğunu doğrula.
+        //
+        // Örnek bir placeholder çağrı:
+         match kmemory::validate_user_range(user_ptr as usize, size, kmemory::AccessFlags::WRITE) {
+             Ok(_) => Ok(()),
+             Err(_) => Err(KError::BadAddress), // veya kmemory'nin döndürdüğü hatayı eşle
+         }
 
-impl fmt::Write for StringWriter {
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-        // Bu örnekte basitçe karakterleri ekrana yazdırıyoruz (gerçek bir sistemde UART vb. kullanılabilir)
-        for byte in s.bytes() {
-            unsafe {
-                let vga_buffer = 0xb8000 as *mut u8;
-                static mut VGA_INDEX: usize = 0;
-                vga_buffer.add(VGA_INDEX).write_volatile(byte);
-                VGA_INDEX += 1;
-            }
+        // Şimdilik sadece yer tutucu olarak bir kontrol yapalım (gerçek doğrulama değildir!)
+        let is_valid_range = kmemory::is_user_range_valid_and_writable(user_ptr, size); // kmemory modülünde böyle bir fonksiyon olmalı
+        if is_valid_range {
+             Ok(())
+        } else {
+             Err(KError::BadAddress)
         }
-        Ok(())
     }
+
+    // TODO: Kaynak handle'ının geçerliliğini ve izinlerini kontrol eden fonksiyonlar
+    //       (Karnal64'teki kresource::handle_has_permission gibi fonksiyonları
+    //        daha yüksek seviye güvenlik politikalarıyla birleştirebilirsiniz)
+     pub fn check_resource_permission(handle: &KHandle, required_mode: u32) -> Result<(), KError> {
+    //     // Örneğin, handle'ın hala geçerli bir handle olduğunu ve gerekli izinlere sahip olduğunu kontrol et.
+    //     // Kresource modülündeki fonksiyonları çağırabilirsiniz.
+         if crate::kresource::is_handle_valid(handle) && crate::kresource::handle_has_permission(handle, required_mode) {
+              Ok(())
+         } else {
+              Err(KError::PermissionDenied)
+         }
+     }
+
+
+    // TODO: Görev/İş parçacığı yönetimiyle ilgili güvenlik kontrolleri (örneğin, bir görevin başka bir görevi yönetme izni var mı?)
+     pub fn check_task_permission(current_task: KTaskId, target_task: KTaskId, action: TaskAction) -> Result<(), KError> { ... }
+
+
+    // TODO: Diğer x86'ya özgü güvenlik mekanizmaları (örneğin, SYSCALL/SYSRET kullanımı, MSR'ler, izolasyon teknikleri)
+    //       burada implemente edilebilir veya bu modül içinden çağrılabilir.
+
+    // ... diğer güvenlik yardımcı fonksiyonları ...
 }
 
+// --- kmemory modülü için placeholder fonksiyonlar ---
+// security_x86 modülü içinden çağrılan ancak kmemory modülünde implemente edilmesi gereken
+// placeholder fonksiyonların tanımları. Gerçek implementasyonlar kmemory.rs'e gidecektir.
+// Bu sadece kodun derlenmesi için buraya eklendi, gerçekte kmemory.rs dosyasında olmalılar.
+mod kmemory {
+    use super::*;
 
-// Örnek kullanım fonksiyonu
-pub fn example_usage() {
-    kprintln!("x86 Güvenlik Örneği Başlatılıyor...\n");
+    // Bu fonksiyon kmemory modülünde gerçek bir sanal adres alanı ve MMU kontrolü yapmalıdır.
+    pub fn is_user_range_valid_and_readable(user_ptr: *const u8, size: usize) -> bool {
+        // TODO: Gerçek doğrulama mantığı buraya veya kmemory modülüne gelecek.
+        // Şimdilik sadece bir tahmin: Kullanıcı alanının 0x8000_0000'dan başladığını varsayalım
+        let user_space_start: usize = 0x8000_0000;
+        let user_ptr_usize = user_ptr as usize;
 
-    let safe_address = SECURE_MEMORY_START + 0x100;
-    let unsafe_address = SECURE_MEMORY_END + 0x100;
-
-    match access_memory(safe_address, false) {
-        Ok(_) => kprintln!("0x{:x} adresine okuma erişimi başarılı.\n", safe_address),
-        Err(e) => kprintln!("0x{:x} adresine okuma erişimi hatası: {}\n", safe_address, e),
+        user_ptr_usize >= user_space_start && user_ptr_usize.checked_add(size).map_or(false, |end| end >= user_space_start && end <= usize::MAX /* Ayrıca kullanıcının adres alanı sonuna kadar kontrol edilmeli */)
+        // Ayrıca sayfa tabloları kontrol edilerek okuma izni olduğu doğrulanmalı.
     }
 
-    match access_memory(safe_address, true) {
-        Ok(_) => kprintln!("0x{:x} adresine yazma erişimi başarılı.\n", safe_address),
-        Err(e) => kprintln!("0x{:x} adresine yazma erişimi hatası: {}\n", safe_address, e),
+     // Bu fonksiyon kmemory modülünde gerçek bir sanal adres alanı ve MMU kontrolü yapmalıdır.
+    pub fn is_user_range_valid_and_writable(user_ptr: *mut u8, size: usize) -> bool {
+        // TODO: Gerçek doğrulama mantığı buraya veya kmemory modülüne gelecek.
+        // Şimdilik sadece bir tahmin: Kullanıcı alanının 0x8000_0000'dan başladığını varsayalım
+        let user_space_start: usize = 0x8000_0000;
+        let user_ptr_usize = user_ptr as usize;
+
+        user_ptr_usize >= user_space_start && user_ptr_usize.checked_add(size).map_or(false, |end| end >= user_space_start && end <= usize::MAX /* Ayrıca kullanıcının adres alanı sonuna kadar kontrol edilmeli */)
+        // Ayrıca sayfa tabloları kontrol edilerek yazma izni olduğu doğrulanmalı.
     }
+    // TODO: kmemory modülündeki diğer fonksiyonlar buraya gelecek.
+     pub fn init_manager() { /* ... */ }
+     pub fn allocate_user_memory(size: usize) -> Result<*mut u8, KError> { Err(KError::NotSupported) }
+     pub fn free_user_memory(ptr: *mut uu8, size: usize) -> Result<(), KError> { Err(KError::NotSupported) }
+     // ... diğer bellek fonksiyonları ...
 
+}
 
-    match access_memory(unsafe_address, false) {
-        Ok(_) => kprintln!("0x{:x} adresine okuma erişimi başarılı (HATALI!):\n", unsafe_address),
-        Err(e) => kprintln!("0x{:x} adresine okuma erişimi hatası (DOĞRU!): {}\n", unsafe_address, e),
-    }
-
-    match access_memory(unsafe_address, true) {
-        Ok(_) => kprintln!("0x{:x} adresine yazma erişimi başarılı (HATALI!):\n", unsafe_address),
-        Err(e) => kprintln!("0x{:x} adresine yazma erişimi hatası (DOĞRU!): {}\n", unsafe_address, e),
-    }
-
-    kprintln!("\n--- x86 Güvenlik Örneği Sonu ---");
+// --- Diğer modüller için placeholder (Eğer security_x86 içinde bunlardan bir şey çağrılırsa) ---
+// Örneğin, kresource modülünden handle geçerliliği kontrolü yapıyorsanız,
+// kresource modülü için de placeholder eklemeniz gerekebilir.
+mod kresource {
+     use super::*;
+     pub fn is_handle_valid(handle: &KHandle) -> bool {
+         // TODO: Gerçek handle doğrulama mantığı
+         handle.0 != 0 // Basit bir kontrol
+     }
+     pub fn handle_has_permission(handle: &KHandle, mode: u32) -> bool {
+         // TODO: Gerçek izin kontrolü mantığı
+         true // Her izne sahipmiş gibi davran
+     }
+     // TODO: Diğer kresource fonksiyonları
+     pub fn init_manager() { /* ... */ }
+     pub fn lookup_provider_by_name(name: &str) -> Result<&'static dyn crate::karnal64::ResourceProvider, KError> { Err(KError::NotFound) }
+     pub fn issue_handle(provider: &'static dyn crate::karnal64::ResourceProvider, mode: u32) -> KHandle { KHandle(123) }
+     pub fn get_provider_by_handle(handle_value: u64) -> Result<&'static dyn crate::karnal64::ResourceProvider, KError> { Err(KError::BadHandle) }
+     pub fn update_handle_offset(handle: &KHandle, offset_delta: usize) { /* ... */ }
+     pub fn release_handle(handle_value: u64) -> Result<(), KError> { Ok(()) }
 }
