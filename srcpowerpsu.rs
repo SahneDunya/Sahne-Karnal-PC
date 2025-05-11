@@ -19,7 +19,7 @@ use crate::karnal64::{
     // Kmemory modülünden belki gelecekte bellek ayırma gerekebilir
      kmemory,
     // Ktask modülünden mevcut görevin ID'si veya sleep gibi şeyler gerekebilir
-    // ktask,
+     ktask,
     // Diğer ihtiyacınız olabilecek Karnal64 tipleri/modülleri
 };
 
