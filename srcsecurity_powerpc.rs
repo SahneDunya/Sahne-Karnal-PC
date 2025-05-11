@@ -1,97 +1,168 @@
-#![no_std]
+use karnal64::{
+    KError,        // Karnal64'ün genel hata türü
+    KHandle,       // Karnal64 kaynak tanıtıcısı
+    ResourceProvider, // Kaynak sağlayıcı trait'i
+    KseekFrom,     // Seek işlemleri için enum
+    KResourceStatus, // Kaynak durum bilgisi
+    // İhtiyaç duyuldukça diğer Karnal64 modüllerinden de import yapılabilir:
+    // ktask, kmemory, ksync, kmessaging
+};
 
-use core::arch::asm;
+// Karnal64'ün dahili kresource modülündeki fonksiyonları kullanmak için
+// kresource modülünün public (dışarıya açık) olması veya gerekli fonksiyonların
+// karnal64.rs içinde public olarak tanımlanması gerekir.
+// Varsayım: kresource modülündeki register_provider ve ilgili modlar public.
+// Bu varsayıma göre importu yapalım:
+#[allow(unused_imports)] // Şu an kullanılmasa bile ileride gerekebilir
+use karnal64::kresource;
 
-// Sabit tanımları
-
-// Sayfa Tablosu Girişi (Page Table Entry - PTE) bayrakları
-const PTE_VALID: u32 = 1 << 0;   // Geçerli (Valid) bit
-const PTE_READ: u32 = 1 << 1;    // Okuma izni
-const PTE_WRITE: u32 = 1 << 2;   // Yazma izni
-const PTE_EXECUTE: u32 = 1 << 3; // Çalıştırma izni
-// ... Diğer PTE bayrakları (örneğin, kullanıcı/denetleyici, önbellekleme politikaları vb.) ...
-
-// Bellek bölgesi adresleri ve boyutları (örnek değerler)
-const KERNEL_CODE_START: usize = 0x100000;
-const KERNEL_CODE_SIZE: usize = 0x20000; // 128KB
-const KERNEL_DATA_START: usize = KERNEL_CODE_START + KERNEL_CODE_SIZE;
-const KERNEL_DATA_SIZE: usize = 0x10000; // 64KB
-const USER_CODE_START: usize = 0x400000;
-const USER_CODE_SIZE: usize = 0x20000;   // 128KB
-const USER_DATA_START: usize = USER_CODE_START + USER_CODE_SIZE;
-const USER_DATA_SIZE: usize = 0x10000;   // 64KB
-
-// Sayfa Tablosu için temel adres (örnek olarak statik bir dizi kullanıyoruz)
-static mut PAGE_TABLE: [u32; 1024] = [0; 1024]; // Basit bir birinci seviye sayfa tablosu (örnek)
-
-// Sayfa tablosu girişini ayarlamak için fonksiyon
-fn set_page_table_entry(index: usize, physical_address: usize, flags: u32) {
-    if index >= 1024 { // Sayfa tablosu boyut kontrolü
-        panic!("Geçersiz sayfa tablosu indeksi: {}", index);
-    }
-
-    // Sayfa tablosu girişini oluştur
-    let pte: u32 = (physical_address as u32) | flags | PTE_VALID; // Basit örnek, adresin düşük 20 bitini varsayar.
-
-    unsafe {
-        PAGE_TABLE[index] = pte;
-    }
+// PowerPC'ye özgü güvenlik donanımı veya yazılım bileşenlerini temsil edecek
+// bir yapı tanımlayalım.
+pub struct PowerPCSecurityManager {
+    // TODO: PowerPC'ye özgü güvenlik durumu, register adresleri veya
+    // dahili konfigürasyon bilgilerini buraya ekleyin.
+    is_initialized: bool,
+    // Örnek: Bir donanım RNG'sinin taban adresi
+    rng_base_address: usize,
 }
 
-// MMU'yu başlatmak ve bellek bölgelerini yapılandırmak için fonksiyon
-pub fn init_mmu() {
-    // Sayfa boyutunu ve diğer MMU ayarlarını yapılandır (CSR'ler aracılığıyla - PowerPC özelinde değişebilir)
-    // ... (PowerPC mimarisine özgü MMU yapılandırma adımları) ...
+// Bu güvenlik yöneticisi için başlangıç (init) fonksiyonu.
+// Bu fonksiyon, çekirdek başlatma sırasında karnal64::init() tarafından
+// veya ilgili bir mimariye özgü başlatma rutini tarafından çağrılmalıdır.
+pub fn init() -> Result<(), KError> {
+    // TODO: PowerPC'ye özgü güvenlik donanımını başlatma veya konfigüre etme mantığını buraya ekleyin.
+    // Örneğin: Güvenlik co-işlemcisini etkinleştirme, güvenlik registerlarını ayarlama vb.
 
-    // Çekirdek kodu bölgesi için sayfa tablosu girişlerini ayarla (Okuma ve Çalıştırma)
-    let kernel_code_pages = KERNEL_CODE_SIZE / 4096; // 4KB sayfa boyutu varsayımı
-    for i in 0..kernel_code_pages {
-        let physical_address = KERNEL_CODE_START + i * 4096;
-        set_page_table_entry(i, physical_address, PTE_READ | PTE_EXECUTE);
+    println!("Karnal64/PowerPC Güvenlik Modülü Başlatılıyor..."); // Placeholder log
+
+    let manager = PowerPCSecurityManager {
+        is_initialized: true,
+        // TODO: Gerçek PowerPC RNG adresini alın
+        rng_base_address: 0xDEADBEEF, // Örnek bir adres
+    };
+
+    // TODO: Başlatma sırasında bir hata olursa KError döndürün.
+     if some_powerpc_security_hardware_check_fails() {
+         return Err(KError::InternalError);
+     }
+
+    // Eğer bu güvenlik modülü, dışarıya (diğer kernel bileşenlerine veya kullanıcı alanına
+    // sistem çağrısı üzerinden) bir kaynak sağlıyorsa, ResourceProvider traitini
+    // implemente etmeli ve Karnal64'ün Kaynak Kayıt Yöneticisine kaydolmalıdır.
+    // Örnek: Bir donanım rastgele sayı üretecisini (RNG) kaynak olarak sunalım.
+
+    // RNG kaynağını temsil eden bir struct tanımlayalım
+    struct PowerPCRngResource {
+        // Gerekirse PowerPCSecurityManager'a referans veya kopyasını tutabilir
+         manager: &'static PowerPCSecurityManager,
+        // TODO: RNG donanımına erişim için gerekli PowerPC'ye özgü bilgiler/handler
     }
 
-    // Çekirdek veri bölgesi için sayfa tablosu girişlerini ayarla (Okuma ve Yazma)
-    let kernel_data_pages = KERNEL_DATA_SIZE / 4096;
-    for i in 0..kernel_data_pages {
-        let physical_address = KERNEL_DATA_START + i * 4096;
-        set_page_table_entry(kernel_code_pages + i, physical_address, PTE_READ | PTE_WRITE); // Sayfa tablosunda sonraki indekslere yerleştir
+    // ResourceProvider traitini PowerPCRngResource için implemente edelim
+    impl ResourceProvider for PowerPCRngResource {
+        fn read(&self, buffer: &mut [u8], _offset: u64) -> Result<usize, KError> {
+            // TODO: PowerPC'ye özgü donanım RNG'sinden veri okuma mantığını buraya ekleyin.
+            // buffer'a okunan veriyi yazın.
+
+            println!("PowerPC RNG Kaynağından Okuma İsteği (Yer Tutucu)"); // Placeholder log
+
+            if buffer.is_empty() {
+                return Ok(0);
+            }
+
+            // Örnek: Basitçe tamponu 0xAA ile dolduralım (gerçek RNG verisi değil!)
+            // Güvenlik Notu: Bu simülasyondur. Gerçekte güvenli RNG verisi okunmalıdır.
+            for byte in buffer.iter_mut() {
+                *byte = 0xAA; // Dummy veri
+            }
+
+            let bytes_read = buffer.len();
+
+            // TODO: Donanım okuma sırasında hata olursa KError::InternalError veya KError::HardwareError gibi bir hata döndürün.
+
+            Ok(bytes_read) // Başarıyla okunan byte sayısını döndür
+        }
+
+        fn write(&self, _buffer: &[u8], _offset: u64) -> Result<usize, KError> {
+            // RNG kaynağına yazılamaz
+            Err(KError::NotSupported)
+        }
+
+        fn control(&self, request: u64, arg: u64) -> Result<i64, KError> {
+            // TODO: RNG kaynağına özgü kontrol komutlarını (ioctl benzeri) burada işleyin.
+            // Örneğin: RNG durumunu sorgulama, özel modları ayarlama (varsa)
+
+            println!("PowerPC RNG Kaynağı Kontrol İsteği (Yer Tutucu): Request={}, Arg={}", request, arg); // Placeholder log
+
+            // Belirli bir komut kodu için işlem yap
+             match request {
+                SOME_RNG_STATUS_REQUEST => Ok(self.get_rng_status() as i64),
+                _ => Err(KError::InvalidArgument), // Bilinmeyen komut
+             }
+
+            Err(KError::NotSupported) // Varsayılan olarak desteklenmiyor
+        }
+
+        fn seek(&self, _position: KseekFrom) -> Result<u64, KError> {
+            // RNG kaynağı genellikle seekable değildir
+            Err(KError::NotSupported)
+        }
+
+        fn get_status(&self) -> Result<KResourceStatus, KError> {
+            // TODO: RNG kaynağının durumunu (hazır mı, hata var mı vb.) döndürün.
+            // KResourceStatus enum/struct'ı karnal64.rs'te tanımlanmış olmalıdır.
+
+            println!("PowerPC RNG Kaynağı Durum Sorgulama (Yer Tutucu)"); // Placeholder log
+            // Örnek bir durum döndürelim (KResourceStatus'un yapısına bağlı olarak)
+            // Varsayım: KResourceStatus basit bir enum veya struct.
+            // Result<KResourceStatus, KError>
+            Err(KError::NotSupported) // Veya gerçek durum döndürün
+        }
+
+        // TODO: ResourceProvider traitine eklenen diğer fonksiyonları (eğer eklendiyse) burada implemente edin.
     }
 
-    // Kullanıcı kodu bölgesi için sayfa tablosu girişlerini ayarla (Okuma ve Çalıştırma - kullanıcı modu erişimi de ayarlanabilir)
-    let user_code_pages = USER_CODE_SIZE / 4096;
-    for i in 0..user_code_pages {
-        let physical_address = USER_CODE_START + i * 4096;
-        set_page_table_entry(kernel_code_pages + kernel_data_pages + i, physical_address, PTE_READ | PTE_EXECUTE); // Sayfa tablosunda sonraki indekslere yerleştir
+    // PowerPC RNG kaynağını oluşturun ve Kaynak Kayıt Yöneticisine kaydedin.
+    // Kaynak ID'si olarak "karnal://device/powerpc/rng" gibi bir isim kullanabiliriz.
+    // TODO: Kayıt işlemi için kresource::register_provider fonksiyonunun Karnal64'te
+    // mevcut ve buradan çağrılabilir (public) olduğundan emin olun.
+    // TODO: register_provider, Box<dyn ResourceProvider> bekleyebilir, bu durumda 'alloc'
+    // crate'ine veya statik/arena tabanlı bir ayırıcıya ihtiyaç duyulur.
+    let rng_provider = Box::new(PowerPCRngResource { /* Alanlar doldurulur */ });
+
+    // Varsayım: kresource::register_provider mevcuttur.
+    match kresource::register_provider("karnal://device/powerpc/rng", rng_provider) {
+        Ok(_) => println!("PowerPC RNG Kaynağı Kaydedildi."),
+        Err(e) => {
+            // Kayıt başarısız olursa kritik bir hata olabilir
+            println!("HATA: PowerPC RNG Kaynağı Kaydedilemedi: {:?}", e); // Placeholder log
+            // TODO: Hata işleme stratejisi - çekirdek bu durumda ne yapmalı?
+             return Err(e); // Hata döndürülebilir
+        }
     }
 
-    // Kullanıcı veri bölgesi için sayfa tablosu girişlerini ayarla (Okuma ve Yazma - kullanıcı modu erişimi de ayarlanabilir)
-    let user_data_pages = USER_DATA_SIZE / 4096;
-    for i in 0..user_data_pages {
-        let physical_address = USER_DATA_START + i * 4096;
-        set_page_table_entry(kernel_code_pages + kernel_data_pages + user_code_pages + i, physical_address, PTE_READ | PTE_WRITE); // Sayfa tablosunda sonraki indekslere yerleştir
-    }
 
+    // Güvenlik modülü başlatması başarılı oldu.
+    println!("Karnal64/PowerPC Güvenlik Modülü Başlatma Tamamlandı."); // Placeholder log
+    Ok(())
+}
 
-    // Sayfa Tablosu Taban Kaydını (Page Table Base Register - örneğin PowerPC'de 'SDR1' veya 'PTEGBASE' olabilir) ayarla
-    unsafe {
-        // **UYARI**: Gerçek PowerPC mimarisine ve çekirdek yapılandırmasına göre CSR/register adı ve yazma yöntemi değişebilir.
-        // Aşağıdaki örnek pseudocode'dur ve gerçek donanım üzerinde çalışmayabilir!
-        asm!(
-            "mtlr {}, {}", // mtlr: Move To Link Register (Örnek - Gerçek register farklı olabilir)
-            in(reg) PAGE_TABLE.as_ptr(), // Sayfa tablosunun başlangıç adresi
-            options(nostack, nomem)
-        );
+// TODO: PowerPC'ye özgü diğer güvenlik fonksiyonlarını buraya ekleyin.
+// Örneğin: Bellek koruma ayarları, güvenli önyükleme kontrolü, istismar önleme mekanizmaları vb.
+// Bu fonksiyonlar doğrudan Karnal64 API'sını (ktask, kmemory gibi) kullanabilir.
 
-        // MMU'yu etkinleştir (PowerPC'ye özgü etkinleştirme prosedürü)
-        // ... (MMU etkinleştirme kodu - PowerPC mimarisine ve yapılandırmaya bağlı) ...
-        // Örneğin, "mfspr r0, SPRG0; ori r0, r0, MMU_ENABLE_BIT; mtspr SPRG0, r0;" gibi bir şey olabilir.
-        // Ancak bu çok basitleştirilmiş bir örnek ve kesinlikle mimariye özel referans kılavuzuna bakılmalıdır.
+// Örnek: Görev oluşturma sırasında güvenlik kontrolü (karnal64::ktask modülü ile entegre edilebilir)
+pub fn check_task_creation_policy(task_attributes: &TaskAttributes) -> Result<(), KError> {
+    // TODO: Belirli görev özelliklerinin (izinler, bellek limitleri vb.) güvenlik politikanıza uygunluğunu kontrol edin.
+    println!("PowerPC Güvenlik: Görev Oluşturma Politikası Kontrolü (Yer Tutucu)");
+    // Güvenlik kuralı ihlali varsa Err(KError::PermissionDenied) döndürün
+    Ok(()) // Varsayılan olarak izin ver
+}
 
-        // **ÖNEMLİ UYARI**: MMU etkinleştirme ve Sayfa Tablosu Taban Kaydı ayarlama işlemleri
-        // çok kritik ve mimariye özgüdür. Bu kod sadece kavramsal bir örnektir.
-        // Gerçek bir sistemde, PowerPC mimarisi referans kılavuzuna ve kullanılan PowerPC çekirdeğine
-        // (örneğin, e500mc, e6500 vb.) özgü dokümantasyona başvurulmalıdır.
-    }
-
-    // ... (Diğer MMU ve bellek koruma yapılandırmaları - örneğin Segment Kayıtları vb.) ...
+// Örnek: Bellek eşleme sırasında güvenlik kontrolü (karnal64::kmemory modülü ile entegre edilebilir)
+pub fn check_memory_mapping_policy(task_id: KTaskId, address: usize, size: usize, flags: u32) -> Result<(), KError> {
+    // TODO: Belirli bir görevin belirli bir bellek alanını eşleme isteğinin güvenlik politikanıza uygunluğunu kontrol edin.
+    println!("PowerPC Güvenlik: Bellek Eşleme Politikası Kontrolü (Yer Tutucu)");
+    // Güvenlik kuralı ihlali varsa Err(KError::PermissionDenied) döndürün
+    Ok(()) // Varsayılan olarak izin ver
 }
