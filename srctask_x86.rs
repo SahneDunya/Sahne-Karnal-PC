@@ -1,182 +1,151 @@
-#![no_std]
-use core::ptr::NonNull;
-use core::panic::PanicInfo;
+#![no_std] // Standart kütüphaneye ihtiyaç duymuyoruz, çekirdek alanında çalışırız
 
-// Basit görev yapısı (Simple task structure)
-pub struct Task {
-    stack: [u8; 1024], // Her görev için 1KB yığın (1KB stack for each task)
-    context: TaskContext,
+// Geliştirme sırasında kullanılmayan kod veya argümanlar için izinler
+#![allow(dead_code)]
+#![allow(unused_variables)]
+#![allow(improper_ctypes_definitions)] // Bağlam değiştirme fonksiyonu için gerekli olabilir
+
+// Karnal64'ün temel tiplerini kullanabiliriz
+// Özellikle KThreadId, KError gibi tipler burada tanımlanan yapılarla ilişkilendirilebilir.
+ use crate::karnal64::{KThreadId, KError}; // Örnek kullanım, gerçek import yolu kernel yapısına göre değişir.
+// Şu an için doğrudan temel Rust tiplerini kullanacağız.
+
+/// x86_64 iş parçacığı/görev bağlamını (context) temsil eden yapı.
+/// Kaydedilmesi ve geri yüklenmesi gereken CPU yazmaçlarını (register) içerir.
+/// Bağlam değiştirme (context switch) sırasında bu yapı kullanılır.
+#[derive(Debug, Copy, Clone)]
+#[repr(C)] // C uyumlu bellek düzeni sağlamak için, genellikle assembly ile etkileşimde önemlidir.
+pub struct ThreadContext {
+    /// Geri yüklenecek genel amaçlı yazmaçlar (r15, r14, r13, r12, rbp, rbx, rflags)
+    pub regs: [u64; 7],
+    /// Instruction Pointer (Sonraki çalıştırılacak komutun adresi)
+    pub rip: u64,
+    /// Stack Pointer (Yığıtın güncel tepesi)
+    pub rsp: u64,
+    /// Segment yazmaçları (cs, ss - genellikle kullanıcı/kernel modları için)
+    pub cs: u64,
+    pub ss: u64,
+    /// Bazı hata kodları veya diğer özel yazmaçlar da eklenebilir (örneğin, exception stack frame için)
 }
 
-#[derive(Default, Copy, Clone)]
-#[repr(C)]
-struct TaskContext {
-    // x86-64 genel amaçlı registerler (x86-64 general purpose registers)
-    // Burada sadece örnek olarak bazı temel registerler dahil edilmiştir.
-    // (Only some basic registers are included here as an example.)
-    rsp: u64, // Yığın işaretçisi (Stack Pointer)
-    rip: u64, // Komut işaretçisi (Instruction Pointer)
-    rbx: u64, // Örnek genel amaçlı register (Example general purpose register)
-    rflags: u64, // Bayrak registeri (Flags register) - Zorunlu olmayabilir basit örnek için (Might not be necessary for a simple example)
-    rbp: u64, // Base Pointer
-    r12: u64,
-    r13: u64,
-    r14: u64,
-    r15: u64,
+/// Yeni bir iş parçacığı/görev için başlangıç bağlamını hazırlar.
+///
+/// Bu fonksiyon, iş parçacığı ilk kez zamanlandığında çalışacak olan
+/// entry point fonksiyonuna kontrollü bir şekilde dallanabilmek için
+/// yığıtı (stack) manipüle eder.
+///
+/// # Argümanlar
+/// * `stack_top`: İş parçacığına ayrılan yığıt alanının en üst (en yüksek adresli) pointer'ı.
+/// * `entry_point`: İş parçacığı çalışmaya başladığında çağrılacak olan fonksiyonun adresi.
+/// * `arg`: Entry point fonksiyonuna geçirilecek argüman (isteğe bağlı, u64).
+///
+/// # Dönüş Değeri
+/// Başlangıç için ayarlanmış bir `ThreadContext` yapısı.
+pub unsafe fn create_initial_context(
+    stack_top: *mut u8,
+    entry_point: extern "C" fn(u64) -> !, // !: Asla geri dönmeyen fonksiyon (task_exit gibi)
+    arg: u64,
+) -> ThreadContext {
+    // Yığıtın en üstünden (stack_top) aşağı doğru (düşük adreslere) yazacağız.
+    // x86-64 SysV ABI (genellikle Unix benzeri sistemlerde kullanılır, çekirdeklerde de popülerdir)
+    // veya özel bir çekirdek ABI'sine göre yığıt çerçevesi oluşturulur.
+    // Basit bir yaklaşım: Bağlam değiştirme fonksiyonu geri döndüğünde,
+    // RIP olarak entry_point'e, RSP olarak başlangıç yığıt tepesine gidecek şekilde yığıtı ayarla.
+    // Ayrıca, entry_point'e argümanı geçirmek için çağrı kuralına (calling convention) uygun yazmaçları (rdi) ayarla.
+
+    // Güvenli olmayan (unsafe) blok içinde pointer aritmetiği yapacağız.
+    // `stack_top`, ayrılan alanın *sonrasını* gösteriyor olabilir, bu durumda önce biraz çıkarmak gerekir.
+    // Veya ayrılan alanın en üstünü gösteriyorsa, doğrudan çıkarma ile kullanırız.
+    // Basitlik adına, stack_top'ın kullanılabilecek en yüksek adresi temsil ettiğini varsayalım.
+
+    // Bağlam değiştirme rutininin beklediği kaydedilmiş yazmaçları simüle edin.
+    // Bunlar, ThreadContext yapısındaki sırayla yığıta itilebilir.
+    // Ancak, context switch assembly kodu genellikle belirli bir sırayı bekler.
+    // Biz ThreadContext yapısını doğrudan assembly ile senkronize edeceğimizi varsayalım.
+
+    // Yığıta konulacak ilk şey, bağlam değiştirme rutini "geri döndüğünde"
+    // dallanılacak adres olmalıdır (yani entry_point).
+    // Ardından, context switch rutini pop edeceği diğer yazmaçlar.
+    // rdi, rsi, rdx, rcx, r8, r9 (ilk 6 integer argüman SysV ABI'de)
+    // Bizim entry_point'imiz tek argüman alıyor (arg), bu rdi'ye gidecek.
+
+    // Örnek yığıt düzeni (basitten karmaşığa):
+    // 1. Sadece entry_point adresini yığıta koy. Context switch geri dönünce buraya dallanır. (Basit ama argüman geçişi yok)
+    // 2. Çağrı kuralına (ABI) uygun bir stack frame oluştur. (Daha doğru)
+
+    // SysV ABI'ye uygun minimalist stack frame oluşturma
+    // Normal bir fonksiyon çağrısında return adresi yığıta konulur.
+    // Bağlam değiştirme rutini, geri dönerken bu adresi RIP'e yükleyecektir.
+    // entry_point fonksiyonumuzun yığıtın temiz halini beklemesi için,
+    // initial RSP'yi entry_point'in hemen öncesini gösterecek şekilde ayarlayabiliriz.
+
+    let stack_ptr = (stack_top as usize as u64); // Yığıtın başlangıç adresi
+
+    // Entry point'e geçeceğimiz argümanı kaydetmemiz lazım.
+    // Bu, genellikle ThreadContext yapısının bir parçası olmaz,
+    // assembly'deki context switch rutini tarafından entry point'e dallanmadan önce
+    // rdi yazmacına yüklenir.
+
+    // ThreadContext yapısını, context switch assembly kodumuzun yığıta iteceği/alacağı
+    // yazmaçları temsil edecek şekilde dolduralım.
+    // Bu, assembly kodunun implementasyonuna sıkı sıkıya bağlıdır!
+    // Varsayılan olarak 0 ile başlatıyoruz, sadece rip ve rsp'yi doğru ayarlıyoruz.
+    // rdi'yi (argüman) ayarlamak assembly switch fonksiyonunun görevidir.
+
+    let mut initial_context = ThreadContext {
+        regs: [0; 7],
+        rip: entry_point as u64, // İş parçacığı başladığında buraya gidecek
+        rsp: stack_ptr,         // İş parçacığı başladığında yığıt burayı gösterecek
+        cs: 0, // TODO: Doğru kod segmenti seçici (selector)
+        ss: 0, // TODO: Doğru yığıt segmenti seçici (selector)
+    };
+
+    // SysV ABI'de ilk argüman rdi'ye gider.
+    // Bağlam değiştirme rutininiz muhtemelen ThreadContext yapısını yükler,
+    // ardından entry_point'e dallanmadan önce rdi'yi ayarlar.
+    // Bu argümanın ThreadContext içinde saklanması yaygın değildir.
+    // Eğer argümanı context içinde saklamak isteseydiniz, 'regs' dizisine ekleyip
+    // context switch assembly'sini buna göre ayarlamanız gerekirdi.
+     ThreadContext::regs[0] = rdi // olsun derseniz, assembly rdi'yi buradan alır.
+
+    // Basitlik adına, entry point argümanının assembly tarafından rdi'ye yükleneceğini varsayıyoruz.
+    // Yani, create_initial_context fonksiyonu sadece context yapısını dolduruyor,
+    // argümanı kullanıcının sağladığı entry_point fonksiyonuna nasıl ileteceği
+    // context switch assembly fonksiyonunun detayıdır.
+    // Ya da ThreadContext yapısını, argümanı (rdi yazmacını) içerecek şekilde genişletip
+    // regs dizisini 8 elemanlı yapabilirsiniz.
+    // Örnek olarak regs[0] rdi olsun dersek:
+     initial_context.regs[0] = arg; // rdi yazmacına argümanı koy
+
+    // Şu anki ThreadContext tanımına göre, entry_point'e argüman geçişi
+    // bu fonksiyondan bağımsız bir mekanizma gerektirir (örn. context switch assembly'si).
+
+    initial_context
 }
 
-static mut CURRENT_TASK: Option<NonNull<Task>> = None;
-static mut TASKS: [Option<Task>; 2] = [None, None]; // Görevleri tutmak için statik dizi, bu örnek için sabit boyut 2 (Static array to hold tasks, fixed size of 2 for this example)
-
-pub fn init() {
-    unsafe {
-        // İlk görevi başlat (görev 0) (Initialize the first task (task 0))
-        TASKS[0] = Some(Task { stack: [0; 1024], context: TaskContext::default() });
-        // Mevcut görevi ilk göreve ayarla (Set the current task to the first task)
-        CURRENT_TASK = NonNull::new(TASKS[0].as_mut().expect("TASKS[0] için mutable referans alınamadı (Failed to get mutable reference to TASKS[0])"));
-    }
-}
-
-pub fn create_task(entry_point: fn()) {
-    static mut TASK_ID: usize = 1; // Statik görev ID, görev 0 zaten başlatıldığı için 1'den başlar (Static task ID, starts from 1 as task 0 is already initialized)
-    unsafe {
-        // TASK_ID'ye göre görev slotuna mutable referans al (Get a mutable reference to the task slot based on TASK_ID)
-        let task_slot = TASKS.get_mut(TASK_ID).expect("TASK_ID TASKS dizisi sınırları dışında (TASK_ID out of bounds for TASKS array)");
-        // Görev slotunda yeni görev oluştur (Create a new task in the task slot)
-        *task_slot = Some(Task {
-            stack: [0; 1024],
-            context: TaskContext {
-                rip: entry_point as u64, // Görevin giriş noktasını ayarla (Set the entry point of the task)
-                ..Default::default() // Diğer context alanlarını varsayılandan devral (Inherit other context fields from default)
-            }
-        });
-        TASK_ID += 1; // Sonraki görev oluşturma için görev ID'sini artır (Increment task ID for the next task creation)
-    }
-}
-
-#[naked] // Yığın çerçevesi oluşturmayı önler (Prevents stack frame creation)
-#[no_caller_safety] // Çağıranın güvenliğini garanti etmez (Does not guarantee caller safety)
-pub unsafe extern "C" fn switch_task() {
-    // `naked` fonksiyon kullanıldığı için tüm koruma/geri yükleme işlemleri elle yapılmalıdır.
-    // (Since `naked` function is used, all save/restore operations must be done manually.)
-
-    // Mevcut görev context'ini kaydet (Save current task's context)
-    // CURRENT_TASK'dan mevcut görevi al (Get current task from CURRENT_TASK)
-    let current_task_ptr = CURRENT_TASK.expect("CURRENT_TASK is None").as_mut();
-
-    // `rsp`, `rip`, `rbx`, `rflags` ve diğer registerler context'e kaydedilir.
-    // (`rsp`, `rip`, `rbx`, `rflags` and other registers are saved to context.)
-    asm!(
-        "mov %rsp, {rsp}", // Yığın işaretçisini kaydet (Save stack pointer)
-        "mov %rip, {rip}", // Komut işaretçisini kaydet (Save instruction pointer) -  Gerekli olmayabilir, fonksiyon dönüş adresi otomatik kaydediliyor olabilir. (Might not be necessary, function return address might be automatically saved.)
-        "mov %rbx, {rbx}", // RBX kaydet (Save RBX)
-        "pushfq",          // RFLAGS'ı yığına kaydet (Push RFLAGS onto the stack)
-        "pop {rflags}",   // RFLAGS'ı context'e taşı (Pop RFLAGS to context)
-        "mov %rbp, {rbp}",
-        "mov %r12, {r12}",
-        "mov %r13, {r13}",
-        "mov %r14, {r14}",
-        "mov %r15, {r15}",
-
-
-        rsp = inout(reg) current_task_ptr.context.rsp => _,
-        rip = inout(reg) current_task_ptr.context.rip => _, // RIP'i kaydetmek için doğru yol emin değil (Not sure if this is the correct way to save RIP)
-        rbx = inout(reg) current_task_ptr.context.rbx => _,
-        rflags = inout(reg) current_task_ptr.context.rflags => _,
-        rbp = inout(reg) current_task_ptr.context.rbp => _,
-        r12 = inout(reg) current_task_ptr.context.r12 => _,
-        r13 = inout(reg) current_task_ptr.context.r13 => _,
-        r14 = inout(reg) current_task_ptr.context.r14 => _,
-        r15 = inout(reg) current_task_ptr.context.r15 => _,
-
-        options(noreturn) // Fonksiyonun geri dönmeyeceğini belirt (Indicate function will not return normally)
-    );
-
-    // Sonraki görev context'ine geç (Switch to the next task's context)
-    // Basitlik için sonraki görev görev 1 olarak varsayılır (For simplicity, next task is assumed to be task 1)
-    let next_task_ptr = TASKS.get_mut(1).expect("TASKS[1] is None").as_mut().expect("TASKS[1] için mutable referans alınamadı (Failed to get mutable reference to TASKS[1])");
-
-    // CURRENT_TASK'ı sonraki göreve güncelle (Update CURRENT_TASK to the next task)
-    CURRENT_TASK = NonNull::new(next_task_ptr as *mut Task);
-
-    // Sonraki görev context'ini yükle (Load next task's context)
-    asm!(
-        "mov {rsp}, %rsp", // Yığın işaretçisini yükle (Load stack pointer)
-        "mov {rip}, %rip", // Komut işaretçisini yükle (Load instruction pointer) - Gerekli olmayabilir, `ret` komutu RIP'i ayarlıyor olabilir. (Might not be necessary, `ret` instruction might set RIP.)
-        "mov {rbx}, %rbx", // RBX yükle (Load RBX)
-        "push {rflags}",    // RFLAGS'ı yığına yükle (Push RFLAGS onto the stack)
-        "popfq",            // RFLAGS'ı registere taşı (Pop RFLAGS to register)
-        "mov {rbp}, %rbp",
-        "mov {r12}, %r12",
-        "mov {r13}, %r13",
-        "mov {r14}, %r14",
-        "mov {r15}, %r15",
-        "ret",              // Görev giriş noktasına geri dön (Return to task entry point - RIP daha önce context'ten yüklendi varsayımıyla (assuming RIP was loaded from context))
-
-        rsp = in(reg) next_task_ptr.context.rsp,
-        rip = in(reg) next_task_ptr.context.rip, // RIP'i yüklemek için doğru yol emin değil (Not sure if this is the correct way to load RIP)
-        rbx = in(reg) next_task_ptr.context.rbx,
-        rflags = in(reg) next_task_ptr.context.rflags,
-        rbp = in(reg) next_task_ptr.context.rbp,
-        r12 = in(reg) next_task_ptr.context.r12,
-        r13 = in(reg) next_task_ptr.context.r13,
-        r14 = in(reg) next_task_ptr.context.r14,
-        r15 = in(reg) next_task_ptr.context.r15,
-
-        options(noreturn) // Fonksiyonun geri dönmeyeceğini belirt (Indicate function will not return normally)
-    );
-}
-
-
-// Örnek görev giriş noktası (sadece gösteri amaçlı) (Example task entry point (just for demonstration))
-fn task1_entry() {
-    let mut count = 0;
-    loop {
-        count += 1;
-        // Gerçek bir no_std ortamında, gecikmeler için donanım zamanlayıcısı veya benzeri kullanabilirsiniz.
-        // (In a real no_std environment, you might use a hardware timer or similar for delays.)
-        // Bu örnek için basit bir döngü yer tutucu olarak hizmet eder. (For this example, a simple loop serves as a placeholder.)
-        for _ in 0..100000 {
-            // zaman harca (waste time)
-        }
-        unsafe {
-            // Görev geçişini belirtmek için temel çıktı (seri port gibi bir çıktı biçiminin başka bir yerde başlatıldığını varsayarak)
-            // (Basic output to indicate task switching (assuming some form of output like serial is initialized elsewhere))
-            let ptr = 0x80000000 as *mut u32; // Örnek bellek adresi çıktı için (Example memory address for output)
-            ptr.write_volatile(count);
-        }
-    }
-}
-
-// Örnek kullanım (kavramsal main fonksiyon gösteri için) (Example usage (conceptual main function for demonstration))
-fn main() {
-    init(); // Görev yönetimini başlat (Initialize task management)
-
-    create_task(task1_entry); // Görev 1'i oluştur ve giriş noktasını ayarla (Create task 1 and set its entry point)
-
-    // İlk görevi çalıştırmaya başla (görev 0 init'te başlatılır).
-    // (Start running the first task (task 0 is initialized in init).)
-    // Gerçek bir işletim sisteminde, görev 0 başlangıç kurulumunu yapabilir ve ardından görev geçişini başlatabilir.
-    // (In a real OS, task 0 might do initial setup and then start task switching.)
-
-    loop {
-        unsafe {
-            // Gösteri için, görevleri bir döngüde değiştir.
-            // (For demonstration, switch tasks in a loop.)
-            // Gerçek bir sistemde, görev geçişi olaylar tarafından tetiklenir (örneğin, zamanlayıcı kesmesi).
-            // (In a real system, task switching would be triggered by events (e.g., timer interrupt).)
-            switch_task();
-            for _ in 0..200000 { // görev 0'da zaman harca (waste time in task 0)
-                // zaman harca (waste time)
-            }
-            let ptr = 0x80000004 as *mut u32; // Görev 0 için çıktı için örnek bellek adresi (Example memory address for output for task 0)
-            ptr.write_volatile(0); // Görev 0'ın çalıştığını belirt (Indicate task 0 is running)
-        }
-    }
-}
-
-// no_std ortamı için gerekli, panic handler tanımla (Required for no_std environment, define panic handler)
-#[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
-    loop {}
+/// İş Parçacığı Bağlamını Değiştirme Fonksiyonu.
+/// Mevcut iş parçacığının bağlamını kaydeder ve belirtilen yeni iş parçacığının
+/// bağlamını yükler.
+///
+/// Bu fonksiyon genellikle saf Rust'ta yazılamaz ve assembly dilinde implemente edilir.
+/// Karnal64'ün `ktask` modülü bu fonksiyonu çağırarak görevler/iş parçacıkları arasında geçiş yapar.
+///
+/// # Argümanlar
+/// * `old_context`: Mevcut iş parçacığının bağlamının kaydedileceği `ThreadContext` yapısının pointer'ı.
+/// * `new_context`: Geçiş yapılacak yeni iş parçacığının yüklenecek bağlamının `ThreadContext` yapısının pointer'ı.
+///
+/// # Güvenli Olmayan (unsafe)
+/// Bu fonksiyon doğrudan bellek adresleri ve CPU yazmaçları ile etkileşime girdiği için
+/// güvenli değildir ve dikkatli kullanılmalıdır. Çağıranın geçerli pointer'lar sağlaması
+/// beklenir.
+///
+/// NOT: Bu sadece fonksiyon imzasıdır, gerçek implementasyon assembly'de olmalıdır.
+#[no_mangle] // Assembly kodundan çağrılabilmesi için isim düzenlemesi yapılmaz
+pub unsafe extern "C" fn x86_64_context_switch(
+    old_context: *mut ThreadContext,
+    new_context: *const ThreadContext,
+) {   
+    // Şimdilik sadece bir placeholder bırakıyoruz.
+    // Gerçek bir kernelde bu fonksiyonun içi assembly koduyla doldurulacaktır.
+     println!("Karnal64/x86: Bağlam Değiştirme Simülasyonu"); // Çekirdek içi print! gerektirir
 }
