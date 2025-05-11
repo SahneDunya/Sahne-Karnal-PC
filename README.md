@@ -3,7 +3,7 @@ Sahne Karnal is a kernel family developed by Sahne Dünya. Sahne Dünya also dev
 
 # Basic features
 1. Target source file size: In Standard Edition 150 MB
-2. Components that will be in the kernel area: CPU related operations, Basic functions, Karnal64
+2. Components that will be in the kernel area: CPU related operations, Basic functions, Karnal64, Basic hardware
 3. Components that will be in user space: File system, Sound server, Window system, GUI API, Desktop Environment, Mobile Environment, Installation system, Package manager, Library implementation, Init System, Device drivers, Kernel communication API with userspace (via Karnal64 communication)
 4. Is it Unix?: No it is not Unix instead it comes with its own principles
 5. Main programming language used: Rust
