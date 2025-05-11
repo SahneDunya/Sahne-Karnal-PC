@@ -1,115 +1,148 @@
-#![no_std]
+#![no_std] // Bu modül standart kütüphaneye ihtiyaç duymaz
 
-use core::sync::atomic::{AtomicU64, Ordering};
+// Karnal64 API'sından gerekli öğeleri içeri aktaralım.
+// Projenizin module yapısına göre 'karnal64' crate'ini veya kök modülü referans etmeniz gerekir.
+// Bu örnekte, 'karnal64' adında bir crate olduğunu veya kök modülün adının bu olduğunu varsayıyoruz.
+use karnal64::{KError, ResourceProvider, KseekFrom, KResourceStatus};
+// Kaynak yöneticisi (Resource Manager) fonksiyonlarına erişim gerekli.
+use karnal64::kresource;
 
-// Elbrus'a özgü donanım register'ları ve sabitleri
-// !!! DİKKAT: Bu adresler ve değerler örnek olarak verilmiştir. 
-// !!! Elbrus mimarisine uygun gerçek değerler için donanım belgelerine başvurun.
-const ELBRUS_TIMER_BASE: u32 = 0xF000_1000; // Örnek zamanlayıcı temel adresi
-const ELBRUS_TIMER_LOAD: u32 = ELBRUS_TIMER_BASE + 0x00; // Zamanlayıcı yükleme register'ı
-const ELBRUS_TIMER_VALUE: u32 = ELBRUS_TIMER_BASE + 0x04; // Zamanlayıcı değer register'ı (salt okunur)
-const ELBRUS_TIMER_CONTROL: u32 = ELBRUS_TIMER_BASE + 0x08; // Zamanlayıcı kontrol register'ı
-const ELBRUS_TIMER_CLEAR_INT: u32 = ELBRUS_TIMER_BASE + 0x0C; // Kesme bayrağı temizleme register'ı
-const ELBRUS_TIMER_INTERRUPT_NUMBER: u32 = 32; // Örnek zamanlayıcı kesme numarası (genellikle 32'den büyük)
+// Heap tahsisi gerekiyorsa (örneğin Box<dyn ResourceProvider> için)
+// alloc kütüphanesini kullanmak gerekebilir.
+ #[cfg(feature = "alloc")] // Belki bir özellik bayrağı ile etkinleştirilebilir
+extern crate alloc;
+use alloc::boxed::Box;
 
-// Kontrol register bit maskeleri (örnek)
-const TIMER_CONTROL_ENABLE: u32 = 1 << 0;      // Zamanlayıcıyı etkinleştirme biti
-const TIMER_CONTROL_PERIODIC: u32 = 1 << 1;    // Periyodik modu etkinleştirme biti
-const TIMER_CONTROL_INTERRUPT_ENABLE: u32 = 1 << 2; // Kesmeleri etkinleştirme biti
 
-// Zamanlayıcı kesme sayısını tutan atomik değişken
-static TICKS: AtomicU64 = AtomicU64::new(0);
-
-// Yardımcı fonksiyon: Belirtilen adrese 32-bit değer yazma (volatile)
-#[inline(always)]
-unsafe fn write_reg(addr: u32, value: u32) {
-    (addr as *mut u32).write_volatile(value);
+/// Elbrus mimarisine özel zaman kaynağını temsil eden yapı.
+/// Bu yapı, donanıma özel register'lara erişim veya ilgili durumu tutabilir.
+/// Gerçek implementasyon, Elbrus donanım zamanlayıcılarıyla etkileşim içerecektir.
+pub struct ElbrusTimeSource {
+    // TODO: Elbrus donanım zamanlayıcısına erişim için gerekli alanlar (pointer'lar, referanslar)
+    // Örneğin: base_address: usize,
 }
 
-// Yardımcı fonksiyon: Belirtilen adresten 32-bit değer okuma (volatile)
-#[inline(always)]
-unsafe fn read_reg(addr: u32) -> u32 {
-    (addr as *mut u32).read_volatile()
-}
+/// ElbrusTimeSource için Karnal64 ResourceProvider trait'ini implemente et.
+/// Bu sayede bu zaman kaynağı çekirdek içinde standart bir kaynak olarak kullanılabilir.
+impl ResourceProvider for ElbrusTimeSource {
+    /// Zaman kaynağından mevcut zaman/sayaç değerini okur.
+    /// offset: Okumaya başlanacak ofset (zaman kaynağı için anlamı değişebilir, genelde 0).
+    /// buffer: Okunan verinin yazılacağı çekirdek alanı tamponu.
+    ///
+    /// Okunan byte sayısını veya KError döner.
+    fn read(&self, buffer: &mut [u8], offset: u64) -> Result<usize, KError> {
+        // TODO: offset değerini kontrol et (zaman kaynağı için anlamlı mı?)
+        // TODO: buffer'ın zaman değerini tutacak kadar büyük olduğunu kontrol et (örn. u64 için 8 byte).
+        // TODO: Elbrus donanımından güncel zaman/sayaç değerini oku.
+        // Örneğin: let raw_time_value = unsafe { core::ptr::read_volatile((self.base_address + TIMER_VALUE_OFFSET) as *const u64) };
 
+        // Yer Tutucu: Dummy bir zaman değeri (u64) döndürme simülasyonu.
+        let dummy_time_value: u64 = 1678886400000000000; // Örnek bir zaman değeri (örn. Unix Epoch + nanosaniye)
 
-// Zamanlayıcı kesme işleyicisi
-#[no_mangle]
-extern "C" fn elbrus_timer_interrupt_handler() {
-    TICKS.fetch_add(1, Ordering::Relaxed); // Kesme sayısını atomik olarak artır
+        if buffer.len() < core::mem::size_of::<u64>() {
+             return Err(KError::InvalidArgument); // Tampon zaman değerini tutacak kadar büyük değil
+        }
 
-    unsafe {
-        // Elbrus'a özgü kesme bayrağını temizleme
-        // Zamanlayıcı kesme bayrağı, genelde bir register'a değer yazarak temizlenir.
-        write_reg(ELBRUS_TIMER_CLEAR_INT, 0x1); // Örnek: Kesme temizleme register'ına herhangi bir değer yazarak bayrağı temizle
+        // Okunan dummy değeri tampona kopyala
+        buffer[0..core::mem::size_of::<u64>()].copy_from_slice(&dummy_time_value.to_le_bytes());
 
-        // Elbrus'a özgü zamanlayıcıyı yeniden başlatma veya sonraki kesmeyi ayarlama
-        // Periyodik modda zamanlayıcı otomatik olarak yeniden başlayacaktır.
-        // Ancak tek seferlik (one-shot) modda, zamanlayıcıyı yeniden başlatmak veya sonraki kesme değerini ayarlamak gerekebilir.
-        // Aşağıdaki örnek, periyodik modda olduğumuzu varsayarak kontrol register'ını yeniden yazarak zamanlayıcıyı aktif tutar.
-        let control_value = read_reg(ELBRUS_TIMER_CONTROL); // Mevcut kontrol değerini oku
-        write_reg(ELBRUS_TIMER_CONTROL, control_value);      // Kontrol register'ını aynı değerle geri yaz (periyodik mod için yeterli olabilir)
+        Ok(core::mem::size_of::<u64>()) // Okunan byte sayısı (u64)
+    }
 
-        // !!! ÖNEMLİ: Elbrus mimarisinin kesme kontrolcüsü (interrupt controller - PIC veya benzeri) 
-        // !!! üzerindeki kesmeyi de ACK'lemek (onaylamak) gerekebilir. 
-        // !!! Bu kısım tamamen Elbrus donanımına özeldir ve donanım belgelerine bakılarak uygulanmalıdır.
-        // Örnek olarak, genel bir kesme kontrolcüsüne (varsa) EOI (End of Interrupt) sinyali gönderme:
-        // write_reg(ELBRUS_PIC_EOI_REGISTER, INTERRUPT_ACK_VALUE); // Varsayımsal EOI register'ı ve değeri
+    /// Zaman kaynağına veri yazma işlemi.
+    /// Zaman kaynağı için yazma genellikle desteklenmez veya özel bir anlama (örn. alarm zamanı ayarlama) gelebilir.
+    /// Bu implementasyonda yazmayı desteklemediğimizi belirtiyoruz.
+    fn write(&self, buffer: &[u8], offset: u64) -> Result<usize, KError> {
+        // Zaman kaynağına doğrudan yazmak genellikle bir hata veya desteklenmeyen bir işlemdir.
+        Err(KError::NotSupported)
+    }
 
+    /// Zaman kaynağına özel kontrol komutları gönderir (Unix ioctl benzeri).
+    /// Bu komutlar alarm kurma, zaman kaynağı frekansını sorgulama/ayarlama vb. olabilir.
+    ///
+    /// request: Komut kodu.
+    /// arg: Komut argümanı.
+    /// Komuta özel bir sonuç değeri (i64) veya KError döner.
+    fn control(&self, request: u64, arg: u64) -> Result<i64, KError> {
+        // TODO: request değerine göre farklı Elbrus zaman kaynağı komutlarını işle.
+        // Örneğin:
+         const ELBRUS_TIMER_SET_ALARM: u64 = 1;
+         const ELBRUS_TIMER_GET_FREQUENCY: u64 = 2;
+        //
+         match request {
+             ELBRUS_TIMER_SET_ALARM => {
+        //         // arg'yi alarm zamanı olarak kullan
+                 println!("ElbrusTimer: Alarm kuruldu: {}", arg);
+        //         // Donanım register'larına alarm zamanını yaz
+                 Ok(0) // Başarı
+             },
+             ELBRUS_TIMER_GET_FREQUENCY => {
+        //         // Donanımdan frekansı oku
+                 let frequency_hz: u64 = 100_000_000; // Örnek frekans
+                 Ok(frequency_hz as i64)
+             },
+             _ => {
+                 println!("ElbrusTimer: Desteklenmeyen control isteği: {}", request);
+                 Err(KError::InvalidArgument) // Bilinmeyen komut
+             }
+         }
+
+        // Yer Tutucu: Kontrol komutlarını henüz implemente etmedik
+        Err(KError::NotSupported)
+    }
+
+    /// Zaman kaynağında ofset konumunu değiştirme işlemi (seek).
+    /// Zaman kaynağı genellikle seek edilebilir bir kaynak değildir.
+    fn seek(&self, position: KseekFrom) -> Result<u64, KError> {
+        // Zaman kaynağı için seek genellikle anlamsızdır.
+         Err(KError::NotSupported)
+    }
+
+    /// Zaman kaynağının durumunu sorgular (örn. frekans, çalışma durumu, kalan süre).
+    ///
+    /// KResourceStatus yapısını veya KError döner.
+    fn get_status(&self) -> Result<KResourceStatus, KError> {
+        // TODO: Elbrus zaman kaynağının mevcut durumunu donanımdan oku.
+        // Örneğin: Timer'ın aktif olup olmadığı, ayarlanmış frekans vb.
+
+        // Yer Tutucu: Dummy status bilgisi
+        Ok(KResourceStatus {
+             size: 0, // Zaman kaynağı için size genellikle 0 veya anlamsızdır.
+             flags: 0, // TODO: Durum bayrakları (örn. 1 = Alarm aktif)
+        })
     }
 }
 
-// Zamanlayıcıyı başlatma fonksiyonu
-pub fn init() {
-    unsafe {
-        // !!! ÖNEMLİ: Elbrus'a özgü kesme işleyicisini kaydetme
-        // !!! Bu kısım, Elbrus'un kullandığı kesme kontrol mekanizmasına (interrupt controller) bağlıdır.
-        // !!! Genellikle, bir vektör tablosuna (interrupt vector table) fonksiyon işaretçisi yazarak yapılır.
-        // !!! Aşağıdaki örnek, tamamen varsayımsal bir kesme vektör tablosu ve kayıt mekanizmasıdır.
-        // !!! Gerçek uygulama için Elbrus donanım ve yazılım geliştirme belgelerine bakılmalıdır.
+/// Elbrus zaman kaynağını başlatan ve Karnal64 kaynak yöneticisine kaydeden fonksiyon.
+/// Çekirdek boot sürecinde uygun bir noktada (Karnal64 init çağrıldıktan sonra)
+/// bu fonksiyon çağrılmalıdır.
+pub fn init_elbrus_time_source() -> Result<(), KError> {
+    // ElbrusTimeSource instance'ını oluştur
+    // TODO: Donanıma özel başlatma işlemlerini burada yap (örn. register'ları ayarla)
+    let time_source = ElbrusTimeSource {
+        // TODO: Alanları başlat
+    };
 
-        // 1. Kesme Vektör Tablosu Adresi (varsayımsal)
-        const ELBRUS_INTERRUPT_VECTOR_TABLE: u32 = 0xF000_0000;
-        // 2. Zamanlayıcı Kesme Numarası (ELBRUS_TIMER_INTERRUPT_NUMBER sabiti ile aynı olmalı)
-        let interrupt_number = ELBRUS_TIMER_INTERRUPT_NUMBER;
-        // 3. Kesme İşleyici Fonksiyonun Adresi (elbrus_timer_interrupt_handler fonksiyonunun adresi)
-        let interrupt_handler_address = elbrus_timer_interrupt_handler as u32; // Fonksiyon işaretçisini u32'ye cast ediyoruz (RISKY - gerçek adresleme mekanizmasına göre ayarlanmalı)
+    // ResourceProvider trait objesini oluşturmak için Box kullanıyoruz.
+    // Karnal64'ün kaynak yöneticisi, trait objesini alacak şekilde tasarlanmış olmalı.
+    let provider_box: Box<dyn ResourceProvider> = Box::new(time_source);
 
-        // 4. Kesme Vektör Tablosuna İşleyici Adresini Yazma (Örnek: Her vektör girişi 4 byte ise)
-        let vector_entry_address = ELBRUS_INTERRUPT_VECTOR_TABLE + (interrupt_number * 4);
-        write_reg(vector_entry_address, interrupt_handler_address);
+    // Bu zaman kaynağını çekirdek kaynak yöneticisine belirli bir isimle kaydet.
+    // Kullanıcı alanından bu isme (Handle) erişilebilecek.
+    let resource_name = "karnal://device/time/elbrus";
 
-        // !!! ÖNEMLİ: Kesmeleri genel olarak etkinleştirme (CPU seviyesinde)
-        // !!! Elbrus mimarisine özgü komut veya register operasyonu ile genel kesmelerin etkinleştirilmesi gerekebilir.
-        // !!! Örneğin, assembly komutu veya özel bir sistem kontrol register'ı aracılığıyla.
-        // !!! Bu kısım donanıma özeldir.
-        // Örnek: Assembly komutu (varsayımsal) ile genel kesmeleri etkinleştirme
-        // core::arch::asm!("elbrus_enable_interrupts"); // Varsayımsal Elbrus assembly komutu
-
-
-        // Elbrus'a özgü zamanlayıcıyı başlatma ve ilk kesmeyi ayarlama
-        // 1. Zamanlayıcı Yükleme Değerini Ayarlama (Örnek: 1ms periyot için gerekli clock cycle sayısı - DEĞER AYARLANMALI)
-        write_reg(ELBRUS_TIMER_LOAD, 1000); // Örnek yükleme değeri - frekansa ve istenen periyoda göre AYARLANMALIDIR
-
-        // 2. Zamanlayıcı Kontrol Register'ını Ayarlama
-        let control_value = TIMER_CONTROL_ENABLE | TIMER_CONTROL_PERIODIC | TIMER_CONTROL_INTERRUPT_ENABLE;
-        write_reg(ELBRUS_TIMER_CONTROL, control_value);
-
-        // !!! ÖNEMLİ: Zamanlayıcı kesmesini (spesifik olarak) etkinleştirme (kesme kontrolcü seviyesinde)
-        // !!! Kesme kontrolcüsünde (PIC veya benzeri) zamanlayıcı kesmesinin etkinleştirilmesi gerekebilir.
-        // !!! Bu da Elbrus donanımına özel bir işlemdir ve donanım belgelerine bakılmalıdır.
-        // Örnek: Kesme kontrolcüsünde zamanlayıcı kesmesini etkinleştirme (varsayımsal)
-        // write_reg(ELBRUS_PIC_INTERRUPT_ENABLE_REGISTER, 1 << ELBRUS_TIMER_INTERRUPT_NUMBER); // Varsayımsal kesme etkinleştirme register'ı ve bit maskesi
+    // kresource modülündeki register_provider fonksiyonunu çağırarak kaydı yap.
+    // Bu fonksiyonun Karnal64 API'sında public olduğunu varsayıyoruz.
+    match kresource::register_provider(resource_name, provider_box) {
+        Ok(_) => {
+            // Çekirdek içi bir log mekanizması kullanarak başarıyı bildirebilirsiniz.
+             println!("Karnal64: Elbrus Zaman Kaynağı '{}' başarıyla kaydedildi.", resource_name);
+            Ok(())
+        },
+        Err(e) => {
+            // Hata durumunda loglama ve hatayı döndürme.
+             eprintln!("Karnal64: Elbrus Zaman Kaynağı '{}' kaydedilemedi: {:?}", resource_name, e);
+            Err(e)
+        }
     }
-}
-
-// Zamanlayıcı kesme sayısını döndüren fonksiyon
-pub fn ticks() -> u64 {
-    TICKS.load(Ordering::Relaxed)
-}
-
-// Belirli bir süre bekleyen fonksiyon (busy-waiting)
-pub fn delay(ms: u64) {
-    let target_ticks = ticks() + ms;
-    while ticks() < target_ticks {}
 }
