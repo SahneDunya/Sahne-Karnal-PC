@@ -1,150 +1,167 @@
-#![no_std]
-use core::arch::asm;
-use core::sync::atomic::{AtomicU64, Ordering};
+#![no_std] // Bu modül standart Rust kütüphanesine ihtiyaç duymaz, çekirdek alanında çalışır.
 
-// Zamanlayıcı kesme numarası (LoongArch için genellikle 7 veya 3'tür, kontrol edilmesi gerekir)
-const TIMER_INTERRUPT_NUMBER: u64 = 7; // veya 3, mimariye ve yapılandırmaya bağlı
+// Karnal64 API'sından ve modüllerinden gerekli öğeleri içe aktarıyoruz.
+// 'karnal64' projenizin kökü veya bir bağımlılığı olarak eklendiğini varsayıyoruz
+// ve modüllere 'crate::karnal64' şeklinde erişebiliyoruz.
+use crate::karnal64::{
+    KError,
+    KHandle, // Handle'lar bu modülde doğrudan kullanılmasa da, API'nin parçası oldukları için referans alınabilir
+    KResourceStatus,
+    KseekFrom,
+    ResourceProvider, // LoongArch zaman kaynağımızın implemente edeceği trait
+    kresource, // Kaynak yönetimi modülü (kaynakları kaydetmek için)
+    // İhtiyaç duyuldukça diğer Karnal64 modülleri veya tipleri buraya eklenebilir.
+    // Örneğin, bellek yönetimi için kmemory eğer timer register'larına MMIO ile erişiliyorsa.
+};
 
-// Zamanlayıcı frekansı (Hz cinsinden, örneğin 1000 Hz, yani 1ms periyot)
-const TIMER_FREQUENCY: u64 = 1000;
+// Kullanılmayan kod veya argümanlar için izinler (geliştirme aşamasında faydalı olabilir)
+#![allow(dead_code)]
+#![allow(unused_variables)]
 
-// Tick sayacını tutan atomik değişken
-static TICKS: AtomicU64 = AtomicU64::new(0);
 
-// Zamanlayıcı kesme işleyicisi
-#[no_mangle]
-extern "C" fn timer_interrupt_handler() {
-    // Tick sayacını arttır
-    TICKS.fetch_add(1, Ordering::SeqCst);
+/// LoongArch mimarisine özgü donanım zaman kaynağını (timer/sayaç) temsil eden yapı.
+/// Bu yapı, Karnal64'ün ResourceProvider trait'ini implemente ederek
+/// çekirdeğin geri kalanına zaman bilgisini sunar.
+pub struct LoongArchTimeSource;
 
-    // Zamanlayıcı kesme bayrağını temizle (mipi CSR'ını temizleyerek)
+// --- LoongArch Donanımına Özgü Düşük Seviye Erişim ---
+
+/// LoongArch donanımından doğrudan zaman sayacı değerini okur.
+/// Bu fonksiyon mimariye ve kullanılan spesifik timer donanımına (örneğin, mfc0 sayacı, GCR) bağlıdır.
+///
+/// TODO: Buradaki implementasyonu, LoongArch ISA ve hedef donanımınızın
+/// zaman sayacına/register'ına gerçekten erişen düşük seviye kod (örneğin, inline assembly veya
+/// memory-mapped register okuma) ile değiştirin.
+///
+/// # Safety
+/// Bu fonksiyon 'unsafe' bir bağlam gerektirir çünkü doğrudan donanım kaydedicilerine
+/// erişim potansiyeli taşır. Çağıranın güvenli erişimi sağlaması gerekir.
+fn read_loongarch_hardware_timer() -> u64 {
     unsafe {
-        asm!("csrci $csr_mip, {}", const 1 << TIMER_INTERRUPT_NUMBER); // Doğru bit maskesi ile temizle
-    }
+        // BU SADECE BİR YER TUTUCUDUR!
+        // Gerçek LoongArch kodu şöyle bir şey olabilir (örnek, gerçek instruction değil):
+         let value: u64;
+         core::arch::asm!("rdtime.d {0}", out(reg) value); // veya mimariye özel başka bir talimat
+         value
 
-    // Bir sonraki kesme için zamanlayıcıyı ayarla
-    let current_ticks = get_ticks();
-    let next_tick = current_ticks.wrapping_add(TIMER_FREQUENCY / 10); // 100 ms sonra kesme, wrapping_add taşmayı güvenli yönetir
-    set_timer(next_tick);
-}
-
-// Zamanlayıcıyı başlatma fonksiyonu
-pub fn init() {
-    // Kesme işleyicisini ayarla (mtvec CSR'ı ve kesme tablosu kurulumu)
-    set_interrupt_handler(TIMER_INTERRUPT_NUMBER, timer_interrupt_handler);
-
-    // mstatus CSR'ında global kesmeleri etkinleştir
-    unsafe {
-        asm!("csrsi $csr_mstatus, {}", const 0x8); // MIE bitini ayarla (Global Interrupt Enable)
-    }
-
-    // mie CSR'ında zamanlayıcı kesmesini etkinleştir
-    unsafe {
-        asm!("csrsi $csr_mie, {}", const 1 << TIMER_INTERRUPT_NUMBER); // Timer interrupt enable bitini ayarla
-    }
-
-    // İlk kesmeyi ayarla
-    let initial_tick = get_ticks().wrapping_add(TIMER_FREQUENCY / 10);
-    set_timer(initial_tick);
-}
-
-// Geçen zamanı (ticks) döndüren fonksiyon
-pub fn ticks() -> u64 {
-    TICKS.load(Ordering::SeqCst)
-}
-
-// Belirtilen milisaniye kadar gecikme fonksiyonu
-pub fn delay(ms: u64) {
-    let target_ticks = ticks().wrapping_add((ms * TIMER_FREQUENCY) / 1000);
-    while ticks() < target_ticks {}
-}
-
-// Zamanlayıcıyı ayarlayan fonksiyon (mtimecmp CSR'ını kullanır)
-fn set_timer(ticks: u64) {
-    unsafe {
-        asm!("csrw $csr_mtimecmp, {}", in(reg) ticks);
+        // Şimdilik, çekirdek başlatıldığından beri geçen döngüleri simüle eden
+        // basit bir statik değişken kullanalım. GERÇEK ZAMAN TUTMAZ.
+        static mut DUMMY_CYCLE_COUNTER: u64 = 0;
+        DUMMY_CYCLE_COUNTER = DUMMY_CYCLE_COUNTER.wrapping_add(100); // Sayacı artır (simülasyon)
+        DUMMY_CYCLE_COUNTER
     }
 }
 
-// Geçerli zamanı (ticks) okuyan fonksiyon (mtime CSR'ını kullanır)
-fn get_ticks() -> u64 {
-    let ticks: u64;
-    unsafe {
-        asm!("csrr {}, $csr_mtime", out(reg) ticks);
+// --- Karnal64 ResourceProvider Implementasyonu ---
+
+/// LoongArchTimeSource için ResourceProvider trait'ini implemente ediyoruz.
+/// Bu, LoongArch zaman kaynağının Karnal64 kaynak yönetim sistemi tarafından
+/// yönetilebilen standart bir kaynak olmasını sağlar.
+impl ResourceProvider for LoongArchTimeSource {
+    /// Kaynaktan (zaman sayacından) veri okur.
+    /// Genellikle zaman sayacının mevcut 64-bit değerini dönecektir.
+    /// `offset`: Zaman kaynağı için ofset genellikle 0 olmalıdır.
+    /// `buffer`: Okunan 64-bit zaman değerinin byte'larının yazılacağı hedef tampon.
+    ///
+    /// Başarı durumunda yazılan byte sayısını (genellikle 8), hata durumunda KError döner.
+    fn read(&self, buffer: &mut [u8], offset: u64) -> Result<usize, KError> {
+        // Zaman kaynağı genellikle 0 ofsetinde geçerli zaman değerini sağlar.
+        if offset != 0 {
+            // Farklı ofsetlerde okuma desteklenmiyor.
+            return Err(KError::InvalidArgument);
+        }
+
+        // Zaman değeri bir u64'tür (8 byte). Tamponun en az 8 byte olması gerekir.
+        if buffer.len() < core::mem::size_of::<u64>() {
+            return Err(KError::InvalidArgument); // Tampon çok küçük
+        }
+
+        // Donanımdan güncel zaman değerini oku.
+        let current_time_value = read_loongarch_hardware_timer();
+
+        // u64 değerini, hedef mimarinin endian'ına uygun byte dizisine dönüştür.
+        // `.to_ne_bytes()` mimarinin native endian'ını kullanır.
+        let time_bytes = current_time_value.to_ne_bytes();
+
+        // Tampona kopyala (tampon daha büyük olsa bile sadece 8 byte kopyalanır).
+        let bytes_to_copy = core::mem::size_of::<u64>();
+        buffer[..bytes_to_copy].copy_from_slice(&time_bytes);
+
+        Ok(bytes_to_copy) // Okunan byte sayısını döndür (genellikle 8)
     }
-    ticks
+
+    /// Kaynağa veri yazar (zamana yazma genellikle desteklenmez).
+    fn write(&self, buffer: &[u8], offset: u64) -> Result<usize, KError> {
+        // Donanım zaman sayacına doğrudan yazma işlemi genellikle izin verilmez veya desteklenmez.
+        Err(KError::NotSupported)
+    }
+
+    /// Kaynağa özel kontrol komutları gönderir (Unix ioctl benzeri).
+    /// Zaman kaynağı için özel kontrol komutları tanımlanabilir (örn. frekans sorgulama).
+    fn control(&self, request: u64, arg: u64) -> Result<i64, KError> {
+        // TODO: Zaman kaynağına özgü kontrol komutları (örn. frekans bilgisi almak)
+        // Örnek: request 1: Saat frekansını sorgula, arg ignored, Result<i64> olarak frekans döner.
+        // Şu an için desteklenmiyor.
+        Err(KError::NotSupported)
+    }
+
+    /// Kaynak üzerinde pozisyon değiştirir (zaman kaynağı seekable değildir).
+    fn seek(&self, position: KseekFrom) -> Result<u64, KError> {
+        Err(KError::NotSupported)
+    }
+
+    /// Kaynağın mevcut durumunu alır (zaman kaynağı için spesifik durum bilgisi).
+    fn get_status(&self) -> Result<KResourceStatus, KError> {
+        // TODO: LoongArch zamanlayıcısının gerçek durumunu döndür (örn. frekans, hassasiyet).
+        // KResourceStatus'ın zaman kaynağına uygun bilgileri içermesi gerekebilir.
+        // Şimdilik desteklenmiyor.
+        Err(KError::NotSupported)
+    }
+
+    // ResourceProvider trait'ine eklenen supports_mode metodu (karnal64.rs'deki TODO'ya göre)
+    // Çekirdek içindeki register_provider veya acquire fonksiyonu bu metodu çağırarak
+    // talep edilen modun desteklenip desteklenmediğini kontrol edebilir.
+    fn supports_mode(&self, mode: u32) -> bool {
+         // Zaman kaynağı genellikle sadece okuma modunu destekler.
+         // MODE_READ sabiti kresource modülünden gelmeli.
+         mode == kresource::MODE_READ
+    }
 }
 
-// Kesme işleyicisini ayarlayan fonksiyon (basitleştirilmiş örnek, gerçek uygulamada daha karmaşık olabilir)
-fn set_interrupt_handler(interrupt_number: u64, handler: extern "C" fn()) {
-    // Not: Bu örnek çok basitleştirilmiştir ve gerçek bir uygulamada kesme vektör tablosunun doğru şekilde ayarlanması gerekir.
-    //      LoongArch mimarisi, kesme vektör tablosu için genellikle mtvec CSR'ını kullanır.
-    //      Aşağıdaki örnek sadece bir yer tutucudur ve doğru kesme işleme için yeterli DEĞİLDİR.
+// --- Modül Başlatma ---
 
-    // Örnek olarak, sadece handler fonksiyonunun adresini bir yere kaydediyoruz (DOĞRU YÖNTEM DEĞİL).
-    // Gerçek bir uygulamada, mtvec CSR'ını ayarlamanız ve kesme vektör tablosunu doğru şekilde yapılandırmanız gerekir.
-    // Statik bir değişken veya global bir dizi kullanarak kesme işleyicilerini saklayabilirsiniz.
+/// srctime_loongarch modülünü başlatır.
+/// Çekirdek başlatma sürecinde, Karnal64'ün ana init fonksiyonu tarafından çağrılmalıdır.
+/// Bu fonksiyon, LoongArch donanım zamanlayıcısını başlatır (eğer gerekiyorsa)
+/// ve zaman kaynağını Karnal64 kaynak yöneticisine kaydeder.
+pub fn init() -> Result<(), KError> {
+    // TODO: LoongArch donanım zamanlayıcısını burada başlatın (eğer donanım seviyesinde
+    // başlatma/yapılandırma gerekiyorsa, örneğin kesmeleri ayarlama).
 
-    // **UYARI:** Aşağıdaki kod **KESİNLİKLE** üretim ortamı için uygun DEĞİLDİR.
-    //          Sadece konsepti göstermek amacıyla basitleştirilmiştir.
+    // LoongArch zaman kaynağı sağlayıcısının bir instance'ını oluştur.
+    let time_provider = LoongArchTimeSource;
 
-    static mut INTERRUPT_HANDLERS: [Option<extern "C" fn()>; 16] = [None; 16]; // Örnek olarak 16 kesme için yer ayırdık
+    // Zaman sağlayıcısını Karnal64 Kaynak Yöneticisine kaydet.
+    // Ona çekirdek içinde ve kullanıcı alanından erişilebilecek benzersiz bir isim ver.
+    // "karnal://device/clock" yaygın bir konvansiyondur.
+    // kresource::register_provider fonksiyonu Box<dyn ResourceProvider> aldığı için
+    // 'alloc' crate'inin veya statik bir mekanizmanın kullanılabilir olması gerekir.
+    // Box::new(time_provider) kullanımı 'alloc' gerektirir.
+    let registration_result = kresource::register_provider(
+        "karnal://device/clock", // Kaynak adı
+        Box::new(time_provider) // Provider instance'ı (trait objesi olarak)
+    );
 
-    unsafe {
-        if (interrupt_number as usize) < INTERRUPT_HANDLERS.len() {
-            INTERRUPT_HANDLERS[interrupt_number as usize] = Some(handler);
-        } else {
-            // Kesme numarası aralık dışında, hata yönetimi gerekebilir
-            panic!("Kesme numarası aralık dışında");
+    match registration_result {
+        Ok(_) => {
+            // Başarı durumunda (eğer kernelde print! veya loglama varsa)
+             println!("srctime_loongarch: LoongArch Zaman Kaynağı 'karnal://device/clock' olarak kaydedildi.");
+            Ok(())
+        },
+        Err(e) => {
+            // Kayıt sırasında bir hata oluşursa
+             eprintln!("srctime_loongarch: LoongArch Zaman Kaynağı kaydı başarısız: {:?}", e);
+            Err(e)
         }
     }
-
-    // mtvec CSR'ının AYARLANMASI GEREKİR. Bu örnekte mtvec ayarlanmamıştır!
-    // Örnek mtvec ayarı (doğrudan mod için, kesme adresleri mtvec'e göre hesaplanır):
-    // unsafe {
-    //     asm!("csrw $csr_mtvec, {}", in(reg) &INTERRUPT_VECTOR_TABLE as *const _ as u64);
-    // }
-
-    // Kesme vektör tablosu (ÖRNEK, gerçek uygulamaya göre düzenlenmeli)
-    // #[link_section = ".trap.vector"] // veya uygun bir bölüm
-    // static INTERRUPT_VECTOR_TABLE: [extern "C" fn(); 16] = { // Boyut ve içerik mimariye göre ayarlanmalı
-    //     let mut table: [extern "C" fn(); 16] = [default_interrupt_handler; 16]; // Varsayılan işleyici ile doldur
-    //     table[interrupt_number as usize] = handler; // İlgili kesme için handler'ı ayarla
-    //     table
-    // };
 }
-
-// Varsayılan kesme işleyicisi (örnek)
-#[no_mangle]
-extern "C" fn default_interrupt_handler() {
-    // Beklenmeyen bir kesme oluştuğunda yapılacak işlemler (örneğin hata ayıklama çıktısı)
-    panic!("Beklenmeyen kesme oluştu!");
-}
-
-
-// --- ÖRNEK KULLANIM (main.rs veya benzeri bir dosyada) ---
-
-// extern crate panic_halt; // panic durumunda durdurmak için (no_std ortamında gerekebilir)
-
-// #[no_mangle]
-// extern "C" fn _start() -> ! {
-//     main();
-//     loop {}
-// }
-
-// fn main() {
-//     init(); // Zamanlayıcıyı başlat
-
-//     loop {
-//         println!("Ticks: {}", ticks()); // Tick sayısını yazdır (örnek olarak UART veya benzeri bir yöntemle)
-//         delay(1000); // 1 saniye gecikme
-//     }
-// }
-
-
-// Panik işleyicisi (no_std ortamı için gereklidir)
-// use core::panic::PanicInfo;
-// #[panic_handler]
-// fn panic(_info: &PanicInfo) -> ! {
-//     loop {}
-// }
