@@ -1,445 +1,233 @@
-#![no_std] // Standart kütüphaneye ihtiyaç duymuyoruz
-#![allow(dead_code)] // Henüz kullanılmayan kodlar için uyarı vermesin
+#![no_std] // Standart kütüphaneye ihtiyaç duymuyoruz, çekirdek alanında çalışırız
 
-use crate::arch; // Sahne64'e özgü sistem çağrı numaraları
-use crate::SahneError; // Sahne64'e özgü hata türü
+// Geliştirme sırasında kullanılmayan kod veya argümanlar için izinler
+#![allow(dead_code)]
+#![allow(unused_variables)]
 
-/// Farklı konnektör tiplerini temsil eden enum
-#[derive(Debug)]
-pub enum ConnectorType {
-    JST,
-    Molex,
-    BoardToBoard,
-    FPC,
-    Lehim, // Lehim doğrudan bağlantı için
-    USBTypeC,
-    DJBarrelJack,
-    Other(String),
+// Karnal64'ün sağladığı temel tipleri ve traitleri kullanacağız.
+// Gerçek projede, bu 'use' ifadeleri karnal64.rs dosyasının yapısına göre değişebilir.
+// Örneğin: use crate::karnal64::{KError, KHandle}; veya use karnal64::{KError, traits::ResourceProvider};
+// Şimdilik varsayımsal olarak doğrudan kullanıyoruz, gerekirse uygun yolu belirtmelisiniz.
+use core::slice;
+use core::cmp;
+
+// Karnal64 API'sından beklediğimiz temel tipler (karnal64.rs içinde tanımlı olmalılar veya burada tanımlanmalı)
+// Karnal64.rs dosyanızdaki TODO'larda bahsedildiği için, bu tipleri burada tekrar tanımlıyoruz
+// ki bu dosya tek başına derlenebilir (karnal64.rs dosyasını değiştirmeden).
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[repr(i64)]
+pub enum KError {
+    PermissionDenied = -1,
+    NotFound = -2,
+    InvalidArgument = -3,
+    Interrupted = -4,
+    BadHandle = -9,
+    Busy = -11,
+    OutOfMemory = -12,
+    BadAddress = -14,
+    AlreadyExists = -17,
+    NotSupported = -38,
+    NoMessage = -61,
+    InternalError = -255,
 }
 
-/// Konnektör yapısı
-#[derive(Debug)]
-pub struct Connector {
-    connector_type: ConnectorType,
-    pin_count: u32,
-    description: String,
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub struct KHandle(u64);
+
+// ResourceProvider traitini burada varsayımsal olarak tanımlıyoruz,
+// normalde bu Karnal64.rs içinde "pub trait ResourceProvider { ... }" olarak tanımlı olmalı.
+// Karnal64.rs dosyanızdaki TODO'lara göre ek metotları da içeriyor.
+pub trait ResourceProvider {
+    fn read(&self, buffer: &mut [u8], offset: u64) -> Result<usize, KError>;
+    fn write(&self, buffer: &[u8], offset: u64) -> Result<usize, KError>;
+    fn control(&self, request: u64, arg: u64) -> Result<i64, KError>;
+    fn seek(&self, position: KseekFrom) -> Result<u64, KError>;
+    fn get_status(&self) -> Result<KResourceStatus, KError>;
+    // TODO: supports_mode gibi ek metodlar Karnal64 ResourceProvider traitine eklenebilir
+     fn supports_mode(&self, mode: u32) -> bool { ... }
 }
 
-impl Connector {
-    /// Yeni bir konnektör örneği oluşturur.
-    pub fn new(connector_type: ConnectorType, pin_count: u32, description: &str) -> Self {
-        Connector {
-            connector_type,
-            pin_count,
-            description: description.to_string(),
-        }
-    }
+// Karnal64.rs dosyanızdaki TODO'larda bahsedilen KseekFrom ve KResourceStatus tipleri
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum KseekFrom {
+    Start(u64),
+    Current(i64),
+    End(i64),
 }
 
-/// ## 2. Flex Kablolar (FPC - Flex Printed Circuit)
-
-/// FPC yapısı
-#[derive(Debug)]
-pub struct FlexCable {
-    pin_count: u32,
-    length_mm: f32,
-    description: String,
-    connectors: Vec<Connector>, // FPC'nin bağlandığı konnektörler
-}
-
-impl FlexCable {
-    /// Yeni bir FPC örneği oluşturur.
-    pub fn new(pin_count: u32, length_mm: f32, description: &str) -> Self {
-        FlexCable {
-            pin_count,
-            length_mm,
-            description: description.to_string(),
-            connectors: Vec::new(),
-        }
-    }
-
-    /// FPC'ye bir konnektör ekler.
-    pub fn add_connector(&mut self, connector: Connector) {
-        self.connectors.push(connector);
-    }
-}
-
-
-/// ## 3. Lehim Bağlantıları (Solder Joints)
-
-/// Lehim bağlantısı yapısı
-#[derive(Debug)]
-pub struct SolderJoint {
-    description: String,
-    is_power_joint: bool, // Güç bağlantısı mı?
-    is_data_joint: bool,  // Veri bağlantısı mı?
-}
-
-impl SolderJoint {
-    /// Yeni bir lehim bağlantısı örneği oluşturur.
-    pub fn new(description: &str, is_power_joint: bool, is_data_joint: bool) -> Self {
-        SolderJoint {
-            description: description.to_string(),
-            is_power_joint,
-            is_data_joint,
-        }
-    }
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct KResourceStatus {
+    // Genel durum bilgileri (örn: dosya boyutu, cihaz durumu bayrakları)
+    // Pil için buraya özel durumlar da eklenebilir veya ayrı bir kontrol komutu kullanılabilir.
+    pub size: u64, // Pil kaynağı için anlamı olmayabilir, 0 veya maks kapasite olabilir.
+    pub is_readable: bool,
+    pub is_writable: bool,
+    pub is_seekable: bool,
+    // Pil özel durumları - Örnek
+    pub battery_level_percent: u8, // 0-100
+    pub is_charging: bool,
+    pub is_on_ac_power: bool,
 }
 
 
-/// ## 4. Güç Hatları (Power Lines - VCC/GND)
+// --- Güç ve Pil Kaynağı Implementasyonu ---
 
-/// Güç hattı yapısı
-#[derive(Debug)]
-pub struct PowerLine {
-    voltage_level_volts: f32, // Voltaj seviyesi (V)
-    current_capacity_amps: f32, // Akım taşıma kapasitesi (A)
-    line_type: String, // VCC, GND vb.
-    connectors: Vec<Connector>, // Güç hattına bağlı konnektörler
-    solder_joints: Vec<SolderJoint>, // Güç hattındaki lehim bağlantıları
+/// Çekirdek içi Güç ve Pil durumunu temsil eden yapı.
+/// ResourceProvider traitini implemente ederek dışarıya (Karnal64 API aracılığıyla) açılacak.
+pub struct PowerBatteryProvider {
+    // Pilin ve güç durumunun çekirdek içinde tutulan güncel bilgileri
+    // Gerçek bir sistemde, bu bilgiler donanım sensörlerinden veya ACPI gibi arayüzlerden okunur.
+    current_level_percent: u8,
+    is_charging: bool,
+    is_on_ac: bool,
+    // TODO: Başka durum bilgileri (voltaj, sıcaklık, sağlık durumu vb.) eklenebilir.
 }
 
-impl PowerLine {
-    /// Yeni bir güç hattı örneği oluşturur.
-    pub fn new(voltage_level_volts: f32, current_capacity_amps: f32, line_type: &str) -> Self {
-        PowerLine {
-            voltage_level_volts,
-            current_capacity_amps,
-            line_type: line_type.to_string(),
-            connectors: Vec::new(),
-            solder_joints: Vec::new(),
-        }
-    }
-
-    /// Güç hattına bir konnektör ekler.
-    pub fn add_connector(&mut self, connector: Connector) {
-        self.connectors.push(connector);
-    }
-
-    /// Güç hattına bir lehim bağlantısı ekler.
-    pub fn add_solder_joint(&mut self, solder_joint: SolderJoint) {
-        self.solder_joints.push(solder_joint);
-    }
-}
-
-
-/// ## 5. Veri Hatları (Data Lines - SMBus/I2C)
-
-/// Veri yolu protokollerini temsil eden enum
-#[derive(Debug)]
-pub enum DataProtocol {
-    SMBus,
-    I2C,
-    Other(String),
-    None, // Veri protokolü yok
-}
-
-/// Veri hattı yapısı
-#[derive(Debug)]
-pub struct DataLine {
-    protocol: DataProtocol,
-    line_name: String, // SDA, SCL vb.
-    connectors: Vec<Connector>, // Veri hattına bağlı konnektörler
-    solder_joints: Vec<SolderJoint>, // Veri hattındaki lehim bağlantıları
-}
-
-impl DataLine {
-    /// Yeni bir veri hattı örneği oluşturur.
-    pub fn new(protocol: DataProtocol, line_name: &str) -> Self {
-        DataLine {
-            protocol,
-            line_name: line_name.to_string(),
-            connectors: Vec::new(),
-            solder_joints: Vec::new(),
-        }
-    }
-
-    /// Veri hattına bir konnektör ekler.
-    pub fn add_connector(&mut self, connector: Connector) {
-        self.connectors.push(connector);
-    }
-
-    /// Veri hattına bir lehim bağlantısı ekler.
-    pub fn add_solder_joint(&mut self, solder_joint: SolderJoint) {
-        self.solder_joints.push(solder_joint);
-    }
-}
-
-
-/// ## 6. Termistör (Thermistor - TH)
-
-/// Termistör yapısı
-#[derive(Debug)]
-pub struct Thermistor {
-    description: String,
-    connector: Option<Connector>, // Termistör konnektörü (varsa)
-    solder_joint: Option<SolderJoint>, // Termistör lehim bağlantısı (varsa)
-    data_line: Option<DataLine>, // Termistör veri hattı (varsa, örneğin I2C)
-}
-
-impl Thermistor {
-    /// Yeni bir termistör örneği oluşturur.
-    pub fn new(description: &str) -> Self {
-        Thermistor {
-            description: description.to_string(),
-            connector: None,
-            solder_joint: None,
-            data_line: None,
-        }
-    }
-
-    /// Termistöre bir konnektör ekler.
-    pub fn set_connector(&mut self, connector: Connector) {
-        self.connector = Some(connector);
-    }
-
-    /// Termistöre bir lehim bağlantısı ekler.
-    pub fn set_solder_joint(&mut self, solder_joint: SolderJoint) {
-        self.solder_joint = Some(solder_joint);
-    }
-
-    /// Termistöre bir veri hattı ekler.
-    pub fn set_data_line(&mut self, data_line: DataLine) {
-        self.data_line = Some(data_line);
-    }
-
-    /// Termistörden sıcaklık değerini okur (Sahne64'e özgü sistem çağrısı kullanılabilir).
-    pub fn read_temperature_celsius(&self) -> Result<f32, SahneError> {
-        // TODO: Gerçek donanım arayüzü kodları (ADC okuma, direnç-sıcaklık dönüşümü vb.)
-        // Sahne64'e özgü bir sistem çağrısı ile yapılabilir.
-        // Örneğin:
-        // let result = unsafe { syscall(arch::SYSCALL_THERMISTOR_READ, /* termistör ID veya pin bilgisi */ 0, 0, 0, 0, 0) };
-        // if result < 0 {
-        //     Err(SahneError::DeviceError) // Özel bir hata türü tanımlanabilir
-        // } else {
-        //     Ok(result as f32 / 10.0) // Örnek olarak ölçeklenmiş bir değer
-        // }
-        Ok(25.0) // Şimdilik örnek bir değer döndürüyor.
-    }
-}
-
-
-/// ## 7. USB ve DJ Barrel Jack
-
-/// USB Port yapısı
-#[derive(Debug)]
-pub struct USBPort {
-    port_type: ConnectorType, // USB Type-C, Type-A, Micro-USB vb.
-    power_line: PowerLine, // USB güç hattı
-    data_lines: Vec<DataLine>, // USB veri hatları (D+, D- vb.)
-    description: String,
-}
-
-impl USBPort {
-    /// Yeni bir USB portu örneği oluşturur.
-    pub fn new(port_type: ConnectorType, description: &str, power_line: PowerLine) -> Self {
-        USBPort {
-            port_type,
-            power_line,
-            data_lines: Vec::new(),
-            description: description.to_string(),
-        }
-    }
-
-    /// USB portuna bir veri hattı ekler.
-    pub fn add_data_line(&mut self, data_line: DataLine) {
-        self.data_lines.push(data_line);
-    }
-
-    /// USB portundan güç çeker (Sahne64'e özgü sistem çağrısı kullanılabilir).
-    pub fn draw_power_amps(&self) -> Result<f32, SahneError> {
-        // TODO: Gerçek güç çekme kontrolü
-        // Sahne64'e özgü bir sistem çağrısı ile yapılabilir.
-        // Örneğin:
-        // let result = unsafe { syscall(arch::SYSCALL_USB_POWER_DRAW, /* port ID */ 0, 0, 0, 0, 0) };
-        // ...
-        Ok(0.5) // Şimdilik örnek bir değer
-    }
-
-    /// USB portuna güç verir (Sahne64'e özgü sistem çağrısı kullanılabilir).
-    pub fn supply_power_volts(&self) -> Result<f32, SahneError> {
-        // TODO: Gerçek güç verme kontrolü
-        // Sahne64'e özgü bir sistem çağrısı ile yapılabilir.
-        // Örneğin:
-        // let result = unsafe { syscall(arch::SYSCALL_USB_POWER_SUPPLY, /* port ID, voltaj */ 0, 5000 /* mV */, 0, 0, 0) };
-        // ...
-        Ok(5.0) // Şimdilik örnek bir değer
-    }
-}
-
-
-/// DJ Barrel Jack yapısı
-#[derive(Debug)]
-pub struct DJBarrelJack {
-    connector: Connector, // DJ Barrel Jack konnektörü
-    power_line: PowerLine, // DJ Barrel Jack güç hattı
-    description: String,
-}
-
-impl DJBarrelJack {
-    /// Yeni bir DJ Barrel Jack örneği oluşturur.
-    pub fn new(connector: Connector, power_line: PowerLine, description: &str) -> Self {
-        DJBarrelJack {
-            connector,
-            power_line,
-            description: description.to_string(),
-        }
-    }
-
-    /// DJ Barrel Jack'ten güç alır (Sahne64'e özgü sistem çağrısı kullanılabilir).
-    pub fn get_power_volts(&self) -> Result<f32, SahneError> {
-        // TODO: Gerçek güç alma kontrolü
-        // Sahne64'e özgü bir sistem çağrısı ile yapılabilir.
-        // Örneğin:
-        // let result = unsafe { syscall(arch::SYSCALL_DJ_JACK_POWER_GET, /* jack ID */ 0, 0, 0, 0, 0) };
-        // ...
-        Ok(12.0) // Şimdilik örnek bir değer
-    }
-}
-
-
-/// ## Batarya Yönetimi (Battery Management)
-
-/// Batarya yönetimini gerçekleştiren ana yapı
-#[derive(Debug)]
-pub struct BatteryManager {
-    power_lines: Vec<PowerLine>,
-    data_lines: Vec<DataLine>,
-    thermistors: Vec<Thermistor>,
-    usb_ports: Vec<USBPort>,
-    dj_barrel_jacks: Vec<DJBarrelJack>,
-    flex_cables: Vec<FlexCable>,
-    connectors: Vec<Connector>,
-    solder_joints: Vec<SolderJoint>,
-}
-
-impl BatteryManager {
-    /// Yeni bir Batarya Yöneticisi örneği oluşturur.
+impl PowerBatteryProvider {
+    /// Yeni bir PowerBatteryProvider örneği oluşturur.
     pub fn new() -> Self {
-        BatteryManager {
-            power_lines: Vec::new(),
-            data_lines: Vec::new(),
-            thermistors: Vec::new(),
-            usb_ports: Vec::new(),
-            dj_barrel_jacks: Vec::new(),
-            flex_cables: Vec::new(),
-            connectors: Vec::new(),
-            solder_joints: Vec::new(),
+        // Başlangıç durumu (örnek değerler)
+        PowerBatteryProvider {
+            current_level_percent: 100, // Sistem başladığında tam dolu varsayalım
+            is_charging: false,
+            is_on_ac: false,
         }
     }
 
-    /// Sisteme bir güç hattı ekler.
-    pub fn add_power_line(&mut self, power_line: PowerLine) {
-        self.power_lines.push(power_line);
+    /// Pil durumunu simüle eden veya donanımdan okuyan dahili fonksiyon.
+    /// Gerçekte burada donanım/ACPI okumaları yapılır.
+    fn update_status(&mut self) {
+        // TODO: Gerçek donanımdan pil durumunu oku.
+        // Şimdilik simüle edelim: zamanla pil seviyesi düşer, AC takılınca şarj olur.
+        // Bu fonksiyon periyodik bir çekirdek görevi tarafından çağrılmalıdır.
+        // Örnek simülasyon (basitçe)
+        if self.is_on_ac {
+             if self.current_level_percent < 100 {
+                 self.current_level_percent = cmp::min(self.current_level_percent + 1, 100);
+                 self.is_charging = true;
+             } else {
+                 self.is_charging = false;
+             }
+        } else {
+            self.is_charging = false;
+            if self.current_level_percent > 0 {
+                // Her güncellemede %1 düşür (çok basit bir simülasyon)
+                self.current_level_percent = self.current_level_percent.saturating_sub(1);
+            }
+        }
+         // AC durumu da donanımdan okunmalı
+          self.is_on_ac = read_ac_status();
     }
 
-    /// Sisteme bir veri hattı ekler.
-    pub fn add_data_line(&mut self, data_line: DataLine) {
-        self.data_lines.push(data_line);
-    }
-
-    /// Sisteme bir termistör ekler.
-    pub fn add_thermistor(&mut self, thermistor: Thermistor) {
-        self.thermistors.push(thermistor);
-    }
-
-    /// Sisteme bir USB portu ekler.
-    pub fn add_usb_port(&mut self, usb_port: USBPort) {
-        self.usb_ports.push(usb_port);
-    }
-
-    /// Sisteme bir DJ Barrel Jack ekler.
-    pub fn add_dj_barrel_jack(&mut self, dj_barrel_jack: DJBarrelJack) {
-        self.dj_barrel_jacks.push(dj_barrel_jack);
-    }
-
-    /// Sisteme bir flex kablo ekler.
-    pub fn add_flex_cable(&mut self, flex_cable: FlexCable) {
-        self.flex_cables.push(flex_cable);
-    }
-
-    /// Sisteme bir konnektör ekler.
-    pub fn add_connector(&mut self, connector: Connector) {
-        self.connectors.push(connector);
-    }
-
-    /// Sisteme bir lehim bağlantısı ekler.
-    pub fn add_solder_joint(&mut self, solder_joint: SolderJoint) {
-        self.solder_joints.push(solder_joint);
-    }
-
-
-    /// Tüm termistörlerden sıcaklık değerlerini okur (Sahne64'e özgü sistem çağrısı kullanılabilir).
-    pub fn read_all_temperatures(&self) -> Vec<Result<f32, SahneError>> {
-        self.thermistors.iter().map(|th| th.read_temperature_celsius()).collect()
-    }
-
-    /// Sistemdeki toplam güç tüketimini hesaplar (Sahne64'e özgü sistem çağrısı kullanılabilir).
-    pub fn calculate_total_power_consumption(&self) -> Result<f32, SahneError> {
-        // TODO: Gerçek güç tüketimi hesaplama algoritmaları
-        // Bu da Sahne64 üzerinden sensör okuma sistem çağrıları ile yapılabilir.
-        // Örneğin:
-        // let result = unsafe { syscall(arch::SYSCALL_POWER_MONITOR_READ, /* sensör ID */ 0, 0, 0, 0, 0) };
-        // ...
-        Ok(1.5) // Şimdilik örnek bir değer
-    }
-
-    /// Batarya durumunu kontrol eder (Sahne64'e özgü sistem çağrısı kullanılabilir).
-    pub fn check_battery_status(&self) -> Result<u32, SahneError> {
-        // TODO: Gerçek batarya durumu kontrolü ve raporlama
-        // Sahne64'e özgü bir sistem çağrısı ile yapılabilir.
-        // Örneğin:
-        // let result = unsafe { syscall(arch::SYSCALL_BATTERY_STATUS_GET, 0, 0, 0, 0, 0) };
-        // if result < 0 {
-        //     Err(SahneError::BatteryError) // Özel bir hata türü tanımlanabilir
-        // } else {
-        //     Ok(result as u32) // Örnek olarak batarya durumu kodu
-        // }
-        Ok(1) // Şimdilik örnek bir değer (1: İyi, 0: Zayıf vb.)
-    }
+    /// Harici bir olay (örn: AC adaptör takıldı/çıkarıldı) pil durumunu güncelleyebilir.
+     pub fn notify_ac_status_change(&mut self, is_on_ac: bool) {
+         self.is_on_ac = is_on_ac;
+         // Durum güncellendiğinde ilgili bekleyen görevleri uyandırabiliriz (IPC veya Ksync ile)
+     }
 }
 
-// Örnek kullanım (srcconsole.rs içinde bir komut olarak düşünülebilir)
-#[cfg(feature = "std")] // Bu bölüm sadece standart kütüphane ile derlenirken aktif olur
-fn main() {
-    // ... (Önceki örnek main fonksiyonunun içeriği buraya gelebilir,
-    // ancak srcconsole.rs düşük seviyeli bir dosya olduğu için bu kısım
-    // genellikle farklı bir yerde (örneğin kullanıcı arayüzü katmanında) bulunur.)
-    println!("Batarya yöneticisi başlatıldı (Sahne64 konsolu üzerinden erişilebilir).");
-}
+// ResourceProvider traitini PowerBatteryProvider için implemente ediyoruz.
+impl ResourceProvider for PowerBatteryProvider {
+    /// Pil durumu bilgisi okunabilir. Basitçe mevcut durumu string olarak döndürelim.
+    /// Gerçek bir senaryoda daha yapısal (JSON, özel format) veya binary veri döndürülebilir.
+    fn read(&self, buffer: &mut [u8], offset: u64) -> Result<usize, KError> {
+        // Offset'i yok sayalım, her zaman baştan okuma yapar gibi davranalım.
+        if offset > 0 {
+            return Err(KError::InvalidArgument); // Pil kaynağı seekable değil
+        }
 
-#[cfg(not(feature = "std"))]
-mod print {
-    use core::fmt;
-    use core::fmt::Write;
+        let status_string = alloc::format!(
+            "Battery: {}%, Charging: {}, On AC: {}",
+            self.current_level_percent,
+            self.is_charging,
+            self.is_on_ac
+        );
 
-    struct Stdout;
+        let bytes_to_copy = cmp::min(buffer.len(), status_string.as_bytes().len());
+        buffer[..bytes_to_copy].copy_from_slice(&status_string.as_bytes()[..bytes_to_copy]);
 
-    impl fmt::Write for Stdout {
-        fn write_str(&mut self, s: &str) -> fmt::Result {
-            // Gerçek çıktı mekanizmasına (örneğin, UART sürücüsüne) erişim olmalı.
-            // Bu örnekte, çıktı kaybolacaktır çünkü gerçek bir çıktı yok.
-            Ok(())
+        Ok(bytes_to_copy) // Okunan byte sayısı
+    }
+
+    /// Pil kaynağına yazma desteklenmez.
+    fn write(&self, buffer: &[u8], offset: u64) -> Result<usize, KError> {
+        // Pil seviyesini harici yazma ile değiştirmeye izin vermeyelim.
+        Err(KError::PermissionDenied) // veya KError::NotSupported
+    }
+
+    /// Pil kaynağına özel kontrol komutları.
+    /// Örnek: Güç tasarrufu modunu ayarla, pil kalibrasyonu başlat (varsa).
+    fn control(&self, request: u64, arg: u64) -> Result<i64, KError> {
+        // TODO: Karnal64 için belirli kontrol komutu numaralarını tanımla.
+        // Örnek komutlar:
+         SET_POWER_SAVE_MODE // (arg: 0=Off, 1=On)
+         GET_ESTIMATED_TIME_LEFT // (arg: yok, dönüş: saniye cinsinden süre)
+         START_BATTERY_CALIBRATION // (arg: yok, dönüş: başarı/hata)
+
+        match request {
+             1 => { /* Güç tasarrufu modunu ayarla */ Ok(0) }
+             2 => { /* Kalan süreyi hesapla ve döndür */ Ok(tahmini_süre as i64) }
+            _ => Err(KError::NotSupported), // Bilinmeyen komut
         }
     }
 
-    #[macro_export]
-    macro_rules! print {
-        ($($arg:tt)*) => ({
-            let mut stdout = $crate::print::Stdout;
-            core::fmt::write(&mut stdout, core::format_args!($($arg)*)).unwrap();
-        });
+    /// Pil kaynağı seekable değildir (offset kavramı genellikle uygulanamaz).
+    fn seek(&self, position: KseekFrom) -> Result<u64, KError> {
+        Err(KError::NotSupported)
     }
 
-    #[macro_export]
-    macro_rules! println {
-        () => ($crate::print!("\n"));
-        ($($arg:tt)*) => ($crate::print!("{}\n", format_args!($($arg)*)));
+    /// Pil kaynağının durumunu döndürür.
+    fn get_status(&self) -> Result<KResourceStatus, KError> {
+        Ok(KResourceStatus {
+            size: 0, // Anlamsız veya 0
+            is_readable: true,
+            is_writable: false,
+            is_seekable: false,
+            battery_level_percent: self.current_level_percent,
+            is_charging: self.is_charging,
+            is_on_ac_power: self.is_on_ac,
+        })
     }
 }
 
-#[cfg(not(test))]
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    loop {}
+// --- Modül Başlatma ---
+
+// Bu fonksiyon, Karnal64'ün ana init() fonksiyonu tarafından çağrılacaktır.
+// Amacı, PowerBatteryProvider kaynağını oluşturmak ve Karnal64'ün Kaynak Yöneticisine kaydetmektir.
+pub fn init() {
+    // PowerBatteryProvider örneğini oluştur
+    // 'Box' kullanımı heap tahsisi gerektirir. no_std ortamında kendi allocator'ınız olmalı
+    // veya statik/arena tahsis yöntemleri kullanmalısınız.
+    // Karnal64'ünüzde bir allocator olduğunu varsayalım.
+    // TODO: Güvenli heap tahsisi veya statik depolama kullanın.
+    let battery_provider = Box::new(PowerBatteryProvider::new());
+
+    // Karnal64 Kaynak Yöneticisine kaynağı kaydet
+    // Karnal64.rs dosyasındaki 'kresource::register_provider' fonksiyonunu kullanacağız.
+    // Bu fonksiyonun Kaynak Yöneticisinin içindeki bir kayıt mekanizmasını tetiklemesi beklenir.
+    let resource_name = "karnal://device/power/battery";
+
+    // TODO: kresource::register_provider'ı gerçek implementasyonuna göre çağırın.
+    // Başarısız olursa hata yönetimi yapın (kernel panic veya hata loglama).
+    // Varsayımsal olarak şöyle çağırıyoruz:
+     match kresource::register_provider(resource_name, battery_provider) {
+         Ok(handle) => {
+    //         // Başarılı kayıt. Kaydedilen kaynağın handle'ı döndürülebilir,
+    //         // veya bu handle başka bir yerde saklanabilir (örneğin, bir global kaynak tablosunda).
+    //         // Veya register_provider sadece Ok(()) dönebilir.
+             println!("Karnal64: Pil kaynağı '{}' başarıyla kaydedildi.", resource_name);
+    //         // TODO: Pil durumunu periyodik olarak güncellemek için bir görev (task) planla.
+              ktask::schedule_periodic_task(|| { battery_provider.update_status(); }, interval);
+         }
+         Err(err) => {
+    //         // Kayıt başarısız oldu. Muhtemelen ciddi bir çekirdek hatası.
+              println!("Karnal64: Pil kaynağı '{}' kaydedilemedi: {:?}", resource_name, err);
+    //         // TODO: Uygun hata işleme.
+         }
+     }
+
+    // Şimdilik sadece başlatıldığını belirten bir placeholder log mesajı ekleyelim:
+    // TODO: Gerçek kernel loglama mekanizmasını kullanın.
+     println!("Karnal64: Güç/Pil modülü başlatıldı (Yer Tutucu Kayıt).");
 }
