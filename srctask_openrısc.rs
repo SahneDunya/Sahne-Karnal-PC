@@ -1,155 +1,138 @@
-#![no_std]
-use core::ptr::NonNull;
-use core::panic::PanicInfo;
+#![no_std] // Standart kütüphaneye ihtiyaç duymuyoruz, kullanıcı alanında minimal ortamda çalışırız
+#![no_main] // Rust'ın default main fonksiyonunu kullanmıyoruz, kendi giriş noktamızı tanımlayacağız
 
-// Görev durumlarını temsil etmek için Enum
-#[derive(PartialEq, Copy, Clone)]
-pub enum TaskState {
-    Ready,    // Görev çalışmaya hazır
-    Running,  // Görev şu anda çalışıyor
+// Bu dosya kullanıcı alanında çalıştığı için, doğrudan kernel'deki
+// `KError` enum'unu veya `KHandle` struct'ını kullanamayız.
+// Bunun yerine, sistem çağrılarından dönen ham i64 değerleri ile çalışırız
+// veya kullanıcı alanı için tanımlanmış eşdeğerlerini (Sahne64 gibi) kullanırız.
+// Burada basitlik adına ham i64 dönüş değerlerini işleyeceğiz.
+
+// --- Sistem Çağrısı Numaraları (Karnal64'ün handle_syscall ile eşleşmeli) ---
+// Bu numaralar, Karnal64'ün handle_syscall fonksiyonundaki match bloğu ile
+// senkronize olmalıdır. Bunlar Sahne64 gibi bir kullanıcı alanı kütüphanesi
+// tarafından sağlanabilir, biz burada kendimiz tanımlıyoruz.
+const SYSCALL_TASK_EXIT: u64 = 4;
+const SYSCALL_RESOURCE_ACQUIRE: u64 = 5;
+const SYSCALL_RESOURCE_READ: u64 = 6;
+const SYSCALL_RESOURCE_WRITE: u64 = 7;
+const SYSCALL_RESOURCE_RELEASE: u64 = 8;
+
+// --- Kaynak Erişim Modları (Karnal64'ün MODE_* sabitleri ile eşleşmeli) ---
+// Bunlar da kullanıcı alanı kütüphanesi tarafından sağlanabilir.
+const MODE_READ: u32 = 1 << 0;
+const MODE_WRITE: u32 = 1 << 1;
+
+// --- Temel Sistem Çağrısı Sarmalayıcıları (Placeholder) ---
+// Bu fonksiyonlar aslında alt seviye assembly/C kodu ile kernel'in
+// sistem çağrısı giriş noktasına (handle_syscall) zıplayan kısımları temsil eder.
+// Sahne64 gibi bir kütüphane bu sarmalayıcıları sağlayacaktır.
+// Biz burada fonksiyon imzalarını tanımlayıp 'extern "C"' ile dışarıdan geldiğini
+// belirtiyoruz. Gerçek implementasyon linkleme aşamasında sağlanmalıdır.
+
+/// Gerçek sistem çağrısını yapan düşük seviye fonksiyon (örneğin assembly)
+extern "C" {
+    fn syscall(
+        number: u64,
+        arg1: u64,
+        arg2: u64,
+        arg3: u64,
+        arg4: u64,
+        arg5: u64,
+    ) -> i64;
 }
 
-// Görev yapısı, görev durumu eklendi
-pub struct Task {
-    stack: [u8; 1024], // Her görev için 1KB yığın
-    context: TaskContext,
-    state: TaskState,   // Görev durumu
+// --- Kullanıcı Alanı API Fonksiyonları (Sistem Çağrılarını Kullanır) ---
+// Bu fonksiyonlar, yukarıdaki düşük seviye 'syscall' fonksiyonunu kullanarak
+// daha anlamlı bir kullanıcı alanı API'si sunar. Sahne64'ün bir parçası olabilirler.
+
+/// Kaynak edinme sistemi çağrısı sarmalayıcısı.
+/// Başarı durumunda pozitif handle değeri, hata durumunda negatif KError kodu döner.
+fn resource_acquire(resource_id: &str, mode: u32) -> i64 {
+    let ptr = resource_id.as_ptr() as u64;
+    let len = resource_id.len() as u64;
+    syscall(SYSCALL_RESOURCE_ACQUIRE, ptr, len, mode as u64, 0, 0)
 }
 
-#[derive(Default, Copy, Clone)]
-#[repr(C)]
-struct TaskContext{
-    x:[usize; 32], // Genel amaçlı yazmaçlar
-    sstatus: usize, // Süpervizör durum yazmacı
-    sepc: usize,  // Süpervizör istisna program sayacı
+/// Kaynağa yazma sistemi çağrısı sarmalayıcısı.
+/// Başarı durumunda yazılan byte sayısı, hata durumunda negatif KError kodu döner.
+fn resource_write(handle: u64, buffer: &[u8]) -> i64 {
+    let ptr = buffer.as_ptr() as u64;
+    let len = buffer.len() as u64;
+    syscall(SYSCALL_RESOURCE_WRITE, handle, ptr, len, 0, 0)
 }
 
-static mut CURRENT_TASK: Option<NonNull<Task>> = None;
-static mut TASKS: [Option<Task>; 2] = [None, None]; // Görevleri tutmak için statik dizi, bu örnek için sabit boyut 2
-static mut TASK_COUNT: usize = 0; // Toplam görev sayısını takip etmek için
-static mut CURRENT_TASK_ID: usize = 0; // Mevcut görevin ID'sini takip etmek için
+/// Kaynak handle'ını serbest bırakma sistemi çağrısı sarmalayıcısı.
+/// Başarı durumunda 0, hata durumunda negatif KError kodu döner.
+fn resource_release(handle: u64) -> i64 {
+    syscall(SYSCALL_RESOURCE_RELEASE, handle, 0, 0, 0, 0)
+}
 
-pub fn init(){
-    unsafe{
-        // İlk görevi (görev 0) başlat
-        TASKS[0] = Some(Task{
-            stack: [0; 1024],
-            context: TaskContext::default(),
-            state: TaskState::Running, // İlk görev başlangıçta çalışıyor
-        });
-        TASK_COUNT += 1;
-        // Mevcut görevi ilk göreve ayarla
-        CURRENT_TASK = NonNull::new(TASKS[0].as_mut().expect("TASKS[0] için mutable referans alınamadı"));
-        CURRENT_TASK_ID = 0;
+/// Görevden çıkış sistemi çağrısı sarmalayıcısı.
+/// Bu fonksiyon genellikle geri dönmez.
+#[inline(never)] // Optimize edilip yok edilmemesi için
+fn task_exit(code: i32) -> ! {
+    let _ = syscall(SYSCALL_TASK_EXIT, code as u64, 0, 0, 0, 0);
+    loop {} // Sistem çağrısı geri dönmezse buraya gelinmez, ama emin olmak için sonsuz döngü
+}
+
+
+// --- Görev Giriş Noktası ---
+// Bu fonksiyon, çekirdek görevi başlattığında çağrılacak fonksiyondur.
+// #[no_mangle] özniteliği, isminin değiştirilmeden bırakılmasını sağlar ki
+// çekirdek veya bootloader bu fonksiyonu bulup çağırabilsin.
+#[no_mangle]
+pub extern "C" fn _start() -> ! {
+    // Konsol kaynağını edinme (acquire)
+    // Varsayım: "karnal://device/console" çekirdek tarafından kaydedilmiş bir kaynaktır.
+    let console_handle_result = resource_acquire("karnal://device/console", MODE_WRITE);
+
+    let console_handle: u64;
+    if console_handle_result < 0 {
+        // Handle edinilemedi, hata oluştu.
+        // Gerçek bir uygulamada hata kodunu işlemek gerekir.
+        // Burada basitçe hata koduyla çıkıyoruz.
+        task_exit(console_handle_result as i32);
+    } else {
+        // Handle başarıyla edinildi (sonuç pozitif veya sıfırsa handle değeridir)
+        console_handle = console_handle_result as u64;
     }
-}
 
-pub fn create_task(entry_point: fn()){
-    unsafe{
-        if TASK_COUNT >= TASKS.len() {
-            // Maksimum görev sayısına ulaşıldı, daha fazla görev oluşturulamaz
-            return; // Veya uygun bir hata işleme mekanizması
-        }
-        let task_id = TASK_COUNT; // Yeni görev için görev ID'si olarak TASK_COUNT'u kullan
-        // Görev yuvasına mutable referans al
-        let task_slot = TASKS.get_mut(task_id).expect("TASK_ID, TASKS dizisi sınırlarının dışında");
-        // Görev yuvasında yeni görev oluştur
-        *task_slot = Some(Task{
-            stack: [0; 1024],
-            context: TaskContext{
-                sepc: entry_point as usize, // Görevin giriş noktasını ayarla
-                ..Default::default() // Diğer bağlam alanlarını varsayılandan devral
-            },
-            state: TaskState::Ready, // Yeni görev başlangıçta hazır durumda
-        });
-        TASK_COUNT += 1; // Bir sonraki görev oluşturma için görev ID'sini artır
+    // Konsola mesaj yazma
+    let message = b"Merhaba, Karnal64!\n"; // byte slice olarak mesaj
+    let write_result = resource_write(console_handle, message);
+
+    if write_result < 0 {
+         // Yazma başarısız oldu.
+         // Gerçek uygulamada loglama veya hata işleme yapılabilir.
+         // Burada basitçe hata koduyla çıkıyoruz.
+         // Önce handle'ı serbest bırakmayı deneyebiliriz.
+         let _ = resource_release(console_handle); // Serbest bırakma hatasını şimdilik yoksayalım
+         task_exit(write_result as i32);
     }
-}
 
-pub fn switch_task(){
-    unsafe{
-        let current_task_id = CURRENT_TASK_ID;
-        let next_task_id = (CURRENT_TASK_ID + 1) % TASK_COUNT; // Basit round-robin, bir sonraki göreve geç
+    // Kullanılan handle'ı serbest bırakma
+    let release_result = resource_release(console_handle);
 
-        // Mevcut ve bir sonraki görevlere mutable referanslar al
-        let current_task = CURRENT_TASK.expect("CURRENT_TASK is None").as_mut();
-        let next_task = TASKS.get_mut(next_task_id)
-            .expect("TASKS[next_task_id] is None")
-            .as_mut()
-            .expect("TASKS[next_task_id] için mutable referans alınamadı");
-
-        // Eğer mevcut görev hala çalışıyorsa durumunu Hazır'a ayarla (round-robin için)
-        if current_task.state == TaskState::Running {
-            current_task.state = TaskState::Ready;
-        }
-        // Bir sonraki görevin durumunu Çalışıyor'a ayarla
-        next_task.state = TaskState::Running;
-
-        // Mevcut görevin bağlamını kaydet
-        // sstatus yazmacını kaydet
-        asm!("csrr {}, sstatus", out(reg) current_task.context.sstatus);
-        // sepc yazmacını kaydet
-        asm!("csrr {}, sepc", out(reg) current_task.context.sepc);
-        // Yığın işaretçisini kaydet (x[2], RISC-V kuralında tipik olarak yığın işaretçisi olarak kullanılır)
-        asm!("mv {}, sp", out(reg) current_task.context.x[2]);
-
-        // Bir sonraki görevin bağlamına geç
-        // Bir sonraki görevin sstatus yazmacını yükle
-        asm!("csrw sstatus, {}", in(reg) next_task.context.sstatus);
-        // Bir sonraki görevin sepc yazmacını yükle
-        asm!("csrw sepc, {}", in(reg) next_task.context.sepc);
-        // Bir sonraki görevin yığın işaretçisini yükle
-        asm!("mv sp, {}", in(reg) next_task.context.x[2]);
-
-        // CURRENT_TASK'ı bir sonraki göreve güncelle
-        CURRENT_TASK = NonNull::new(next_task as *mut Task);
-        CURRENT_TASK_ID = next_task_id; // Mevcut görev ID'sini güncelle
+    if release_result < 0 {
+        // Serbest bırakma başarısız oldu.
+        // Yine hata işleme yapılabilir.
+        // Hata koduyla çıkış yapalım.
+         task_exit(release_result as i32);
     }
+
+    // Görev başarıyla tamamlandı, çıkış yap
+    task_exit(0);
 }
 
-// Örnek görev giriş noktası (sadece gösteri amaçlı)
-fn task1_entry() {
-    let mut count = 0;
-    loop {
-        count += 1;
-        // Gerçek bir no_std ortamında, gecikmeler için bir donanım zamanlayıcısı veya benzeri kullanabilirsiniz.
-        // Bu örnek için basit bir döngü yer tutucu olarak hizmet vermektedir.
-        for _ in 0..100000 {
-            // zaman harca
-        }
-        unsafe {
-            // Görev geçişini belirtmek için temel çıktı (seri port gibi bir çıktı biçiminin başka bir yerde başlatıldığını varsayarak)
-            let ptr = 0x80000000 as *mut u32; // Çıktı için örnek bellek adresi
-            ptr.write_volatile(count);
-        }
-    }
-}
-
-// Örnek kullanım (gösteri için kavramsal main fonksiyonu)
-fn main() {
-    init(); // Görev yönetimini başlat
-
-    create_task(task1_entry); // Görev 1'i oluştur ve giriş noktasını ayarla
-
-    // İlk görevi çalıştırmaya başla (görev 0 init içinde başlatılır).
-    // Gerçek bir işletim sisteminde, görev 0 başlangıç kurulumunu yapabilir ve ardından görev geçişini başlatabilir.
-
-    loop {
-        unsafe {
-            // Gösteri için, bir döngüde görevleri değiştir.
-            // Gerçek bir sistemde, görev geçişi olaylar tarafından tetiklenir (örneğin, zamanlayıcı kesmesi).
-            switch_task();
-            for _ in 0..200000 { // Görev 0'da zaman harca
-                // zaman harca
-            }
-            let ptr = 0x80000004 as *mut u32; // Görev 0 için örnek bellek adresi çıktı için
-            ptr.write_volatile(0); // Görev 0'ın çalıştığını belirt
-        }
-    }
-}
-
-// no_std ortamı için gerekli, panik işleyicisini tanımla
+// --- Panik İşleyici ---
+// no_std ortamında panik (beklenmedik hata) oluştuğunda ne yapılacağını tanımlar.
+// Çekirdek ortamında genellikle sonsuz döngüye girmek veya hata ayıklama bilgisi
+// yazdırmak gibi basit bir eylem yapılır.
 #[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    // Panik durumunda konsola yazmaya çalışmak risklidir,
+    // çünkü panik genellikle bellek veya thread sorunlarından kaynaklanır.
+    // Güvenli bir şekilde panik bilgisini bir yere loglamak veya
+    // sadece sonsuz döngüye girmek daha yaygındır.
     loop {}
 }
