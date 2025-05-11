@@ -1,175 +1,205 @@
 #![no_std] // Standart kütüphaneye ihtiyaç duymuyoruz
-#![allow(dead_code)] // Henüz kullanılmayan kodlar için uyarı vermesin
 
-// Bağlantı tiplerini temsil eden bir enum
-enum ConnectorType {
-    ATX24Pin,
-    EPS12V8Pin,
-    PCIe6Pin,
-    PCIe8Pin,
-    Molex,
-    VHPWR12, // 12VHPWR
-    DCBarrelJack,
-    USBTypeA,
-    USBTypeC,
-    IECC13_C14,
-    IECC7_C8,
-    // Gerekirse başka bağlantı tipleri eklenebilir
+// Kernel'de bir global ayırıcı kurulu olduğunu varsayar.
+// Box kullanmak için gereklidir.
+extern crate alloc;
+
+use alloc::boxed::Box;
+use core::sync::atomic::{AtomicU64, Ordering};
+use core::cell::RefCell; // Basit simülasyon için, gerçek kernel'de spinlock vb. gerekir
+
+// Karnal64 çekirdek API'sından gerekli bileşenleri içe aktar
+// 'crate::karnal64' çekirdek projenizin ana crate adı ve karnal64 modülünün yeri için ayarlanmalıdır.
+use crate::karnal64::{
+    KError,
+    ResourceProvider,
+    KHandle,
+    // Kresource modülündeki fonksiyonlar ve sabitler
+    kresource::{self, MODE_READ, MODE_WRITE, MODE_CONTROL},
+    // Kmemory modülünden belki gelecekte bellek ayırma gerekebilir
+     kmemory,
+    // Ktask modülünden mevcut görevin ID'si veya sleep gibi şeyler gerekebilir
+    // ktask,
+    // Diğer ihtiyacınız olabilecek Karnal64 tipleri/modülleri
+};
+
+// PSU'ya özgü durum bilgileri için basit bir yapı
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct PsuStatus {
+    voltage_mv: u32, // MilliVolt
+    current_ma: u32, // MilliAmper
+    temperature_c: i16, // Santigrat
+    fan_rpm: u32,
+    is_on: bool,
 }
 
-// Her bir bağlantı için yapı (struct)
-struct Connector {
-    connector_type: ConnectorType,
-    description: String, // Bağlantının açıklaması (isteğe bağlı)
-    is_connected: bool, // Bağlı olup olmadığını gösterir (isteğe bağlı)
-    voltage: Option<f32>, // Bağlantı voltajı (isteğe bağlı)
-    current_capacity: Option<f32>, // Akım kapasitesi (isteğe bağlı)
+// Güç Kaynağı Birimi (PSU) Sürücüsü Yapısı
+// Bu yapı, gerçek PSU donanımıyla etkileşim kuracak mantığı içerecektir.
+// Şimdilik basit simülasyon değerleri tutar.
+pub struct PowerSupplyUnit {
+    // Gerçek bir sürücüde burası donanım register'larına işaretçiler veya
+    // daha karmaşık bir donanım soyutlama katmanı olacaktır.
+    // Simülasyon için basit durum bilgisi ve bir sayaç ekleyelim.
+    status: RefCell<PsuStatus>, // RefCell sadece tek iş parçacığı simülasyonu için, kernel'de lock gerekir!
+    control_counter: AtomicU64, // Kontrol çağrılarını saymak için atomik sayaç
 }
 
-impl Connector {
-    // Yeni bir bağlantı oluşturmak için fonksiyon
-    fn new(connector_type: ConnectorType, description: String) -> Self {
-        Connector {
-            connector_type,
-            description,
-            is_connected: false,
-            voltage: None,
-            current_capacity: None,
+// PowerSupplyUnit için ResourceProvider trait implementasyonu
+impl ResourceProvider for PowerSupplyUnit {
+    // Okuma işlemi: Genellikle PSU'nun durum bilgilerini sağlar
+    // Offset, okunacak belirli bir durumu veya register'ı belirtebilir.
+    // Bu örnekte, offset 0'da genel durumu bir string olarak döndürelim (basitlik için, gerçekte yapısal veri olur).
+    fn read(&self, buffer: &mut [u8], offset: u64) -> Result<usize, KError> {
+        // Offset'in geçerli olduğunu kontrol et (eğer birden fazla "okunabilir" alan varsa)
+        if offset != 0 {
+             return Err(KError::InvalidArgument);
+        }
+
+        // Simülasyon: Mevcut durumu formatla ve tampona yaz
+        let current_status = self.status.borrow();
+        let status_string = alloc::format!(
+            "Voltage: {}mV, Current: {}mA, Temp: {}C, Fan: {}RPM, On: {}",
+            current_status.voltage_mv,
+            current_status.current_ma,
+            current_status.temperature_c,
+            current_status.fan_rpm,
+            current_status.is_on
+        );
+
+        let bytes_to_copy = core::cmp::min(buffer.len(), status_string.as_bytes().len());
+        buffer[..bytes_to_copy].copy_from_slice(&status_string.as_bytes()[..bytes_to_copy]);
+
+        // Gerçek sürücüde: Donanımdan veri oku ve buffer'a kopyala.
+        // Hataları (donanım hatası, I/O hatası) KError'a dönüştür.
+
+        Ok(bytes_to_copy) // Okunan byte sayısını döndür
+    }
+
+    // Yazma işlemi: Genellikle PSU'nun ayarlarını değiştirmek veya komut göndermek için kullanılır
+    // Basit PSU'lar için yazma işlemi ya desteklenmez ya da sadece belirli "register"lara yapılır.
+    // Bu örnekte yazma işlemini desteklemediğimizi varsayalım.
+    fn write(&self, buffer: &[u8], offset: u64) -> Result<usize, KError> {
+        // Gerçek sürücüde: Buffer'daki veriyi alıp donanıma yaz.
+        // Hataları KError'a dönüştür.
+
+        // Simülasyon: Yazmayı desteklemiyoruz
+        Err(KError::NotSupported)
+    }
+
+    // Kontrol işlemi: PSU'ya özel komutlar göndermek için kullanılır (örn: aç/kapat, voltaj ayarla)
+    // request: Komut kodu (örneğin, 1: Aç, 2: Kapat, 3: Voltaj Oku, 4: Akım Oku)
+    // arg: Komutun argümanı (örn: Voltaj Ayarla komutu için voltaj değeri)
+    fn control(&self, request: u64, arg: u64) -> Result<i64, KError> {
+        // Gerçek sürücüde: request ve arg'a göre donanım komutlarını tetikle.
+        // Sonuçları (okunan değer, başarı/hata kodu) i64 olarak döndür.
+
+        self.control_counter.fetch_add(1, Ordering::SeqCst); // Kontrol çağrısını say
+
+        let mut status = self.status.borrow_mut(); // Durumu değiştirmek için mutable borrow
+
+        match request {
+            // Örnek Komut Kodları (Çekirdek/Sürücü tarafından tanımlanır)
+            1 => { // Aç komutu
+                status.is_on = true;
+                // Donanıma açma komutunu gönder
+                println!("PSU: Aç komutu alındı."); // Kernel içi loglama fonksiyonu varsayımı
+                Ok(0) // Başarı
+            },
+            2 => { // Kapat komutu
+                status.is_on = false;
+                 // Donanıma kapatma komutunu gönder
+                println!("PSU: Kapat komutu alındı.");
+                Ok(0)
+            },
+            3 => { // Voltaj oku komutu (control ile okuma yapmanın bir yolu)
+                // Donanımdan voltaj bilgisini oku
+                println!("PSU: Voltaj oku komutu alındı.");
+                Ok(status.voltage_mv as i64) // Okunan voltajı döndür
+            },
+            4 => { // Akım oku komutu
+                // Donanımdan akım bilgisini oku
+                println!("PSU: Akım oku komutu alındı.");
+                Ok(status.current_ma as i64) // Okunan akımı döndür
+            },
+            // TODO: Daha fazla PSU'ya özel komut eklenebilir (voltaj ayarla, fan hızı ayarla vb.)
+            _ => {
+                println!("PSU: Bilinmeyen kontrol komutu: {}", request);
+                Err(KError::InvalidArgument) // Bilinmeyen komut
+            }
         }
     }
 
-    // Bağlantıyı bağlama fonksiyonu
-    fn connect(&mut self) {
-        self.is_connected = true;
-        println!("{:?} bağlantısı bağlandı.", self.connector_type);
+    // Konum ayarlama işlemi: Genellikle dosya veya akış tabanlı kaynaklar için mantıklıdır.
+    // PSU gibi bir cihaz için anlamlı olmayabilir, genellikle desteklenmez.
+    // Ancak ResourceProvider trait'i gerektiriyorsa implement edilmelidir.
+    fn seek(&self, position: crate::karnal64::KseekFrom) -> Result<u64, KError> {
+        // Gerçek sürücüde: Kaynak seekable ise ofseti ayarla ve yeni ofseti döndür.
+        // Hataları KError'a dönüştür.
+
+        // Simülasyon: PSU seekable değil
+        Err(KError::NotSupported)
     }
 
-    // Bağlantıyı kesme fonksiyonu
-    fn disconnect(&mut self) {
-        self.is_connected = false;
-        println!("{:?} bağlantısı kesildi.", self.connector_type);
+    // Durum bilgisi alma işlemi: Kaynağın genel durumu veya meta verileri için kullanılır.
+    // PSU için mevcut durumu (açık/kapalı, hazır olup olmadığı vb.) dönebilir.
+    fn get_status(&self) -> Result<crate::karnal64::KResourceStatus, KError> {
+        // Gerçek sürücüde: Donanımdan durumu sorgula ve KResourceStatus yapısına dönüştür.
+        // Hataları KError'a dönüştür.
+
+        // Simülasyon: Basit bir durum döndür
+        let current_status = self.status.borrow();
+        let status = crate::karnal64::KResourceStatus {
+            size: 0, // PSU boyutu yoktur
+            flags: if current_status.is_on { 1 } else { 0 }, // Örnek flag: bit 0 açık/kapalı durumu
+            // TODO: Diğer durum alanları (izinler, tür vb. eklenebilir)
+        };
+
+        Ok(status)
     }
 
-    // Bağlantı durumunu kontrol etme fonksiyonu
-    fn check_connection_status(&self) {
-        if self.is_connected {
-            println!("{:?} bağlantısı bağlı.", self.connector_type);
-        } else {
-            println!("{:?} bağlantısı bağlı değil.", self.connector_type);
-        }
-    }
+    // TODO: ResourceProvider trait'ine gelecekte eklenebilecek diğer metotlar için yer tutucu.
+    // Örneğin: fn supports_mode(&self, mode: u32) -> bool; // Hangi modları desteklediğini belirtmek için
+     fn supports_mode(&self, mode: u32) -> bool {
+         // Bu PSU kaynağı okuma, yazma (simülasyonda hayır), kontrol ve durum almayı destekler
+         (mode & MODE_READ != 0) || (mode & MODE_CONTROL != 0) || (mode & MODE_GET_STATUS != 0)
+         // Yazma modunu desteklemediğimizi belirtmek için MODE_WRITE kontrolünü dahil etmedik.
+     }
 }
 
-// Güç Kaynağı Ünitesi (PSU) yapısı
-struct PowerSupplyUnit {
-    atx_24pin: Connector,
-    eps_12v_8pin: Connector,
-    pcie_6pin: Connector,
-    pcie_8pin: Connector,
-    molex: Connector,
-    vhpwr_12: Connector,
-    dc_barrel_jack: Connector,
-    usb_type_a: Connector,
-    iec_c13_c14: Connector,
-    iec_c7_c8: Connector,
-    // İstenirse PSU ile ilgili diğer özellikler eklenebilir (güç değeri, verimlilik vb.)
-}
 
-impl PowerSupplyUnit {
-    // Yeni bir Güç Kaynağı Ünitesi oluşturmak için fonksiyon
-    fn new() -> Self {
-        PowerSupplyUnit {
-            atx_24pin: Connector::new(ConnectorType::ATX24Pin, "ATX 24-pin anakart bağlantısı".to_string()),
-            eps_12v_8pin: Connector::new(ConnectorType::EPS12V8Pin, "EPS 12V 8-pin CPU güç bağlantısı".to_string()),
-            pcie_6pin: Connector::new(ConnectorType::PCIe6Pin, "PCIe 6-pin ekran kartı güç bağlantısı".to_string()),
-            pcie_8pin: Connector::new(ConnectorType::PCIe8Pin, "PCIe 8-pin ekran kartı güç bağlantısı".to_string()),
-            molex: Connector::new(ConnectorType::Molex, "Molex çevre birimi güç bağlantısı".to_string()),
-            vhpwr_12: Connector::new(ConnectorType::VHPWR12, "12VHPWR yüksek güç bağlantısı".to_string()),
-            dc_barrel_jack: Connector::new(ConnectorType::DCBarrelJack, "DC Barrel Jak güç girişi".to_string()),
-            usb_type_a: Connector::new(ConnectorType::USBTypeA, "USB Type-A güç çıkışı (5V)".to_string()),
-            iec_c13_c14: Connector::new(ConnectorType::IECC13_C14, "IEC C13/C14 AC güç girişi".to_string()),
-            iec_c7_c8: Connector::new(ConnectorType::IECC7_C8, "IEC C7/C8 AC güç girişi (küçük cihazlar için)".to_string()),
-        }
-    }
+// PSU sürücüsünü çekirdek başlatma sırasında kaydedecek fonksiyon
+pub fn init() -> Result<(), KError> {
+    println!("srcpowerpsu: Başlatılıyor..."); // Kernel içi loglama varsayımı
 
-    // PSU üzerindeki belirli bir bağlantıya erişmek için fonksiyon (örnek)
-    fn get_atx_24pin_connector(&mut self) -> &mut Connector {
-        &mut self.atx_24pin
-    }
+    // PSU kaynağının bir örneğini oluştur
+    let psu_device = PowerSupplyUnit {
+        status: RefCell::new(PsuStatus {
+            voltage_mv: 12000, // Başlangıç voltajı 12V
+            current_ma: 500, // Başlangıç akımı 0.5A
+            temperature_c: 30, // Başlangıç sıcaklığı 30C
+            fan_rpm: 1500, // Başlangıç fan hızı
+            is_on: true, // Başlangıçta açık olduğunu varsayalım
+        }),
+        control_counter: AtomicU64::new(0),
+    };
 
-    // PSU'nun genel durumunu gösteren fonksiyon (örnek)
-    fn display_psu_status(&self) {
-        println!("--- Güç Kaynağı Ünitesi Durumu ---");
-        self.atx_24pin.check_connection_status();
-        self.eps_12v_8pin.check_connection_status();
-        self.pcie_6pin.check_connection_status();
-        self.pcie_8pin.check_connection_status();
-        self.molex.check_connection_status();
-        self.vhpwr_12.check_connection_status();
-        self.dc_barrel_jack.check_connection_status();
-        self.usb_type_a.check_connection_status();
-        self.iec_c13_c14.check_connection_status();
-        self.iec_c7_c8.check_connection_status();
-        println!("----------------------------------");
-    }
-}
+    // ResourceProvider trait objesini Box içine al
+    let psu_provider: Box<dyn ResourceProvider> = Box::new(psu_device);
 
-// Bu kısım, no_std ortamında println! gibi makroların çalışması için gereklidir.
-// Eğer Sahne64 çekirdeğinizde bu makrolar tanımlıysa, bu bölümü eklemenize gerek yoktur.
-#[cfg(not(feature = "std"))]
-mod print {
-    use core::fmt;
-    use core::fmt::Write;
-
-    struct Stdout;
-
-    impl fmt::Write for Stdout {
-        fn write_str(&mut self, s: &str) -> fmt::Result {
-            // Burada gerçek çıktı mekanizmasına (örneğin, bir UART sürücüsüne) erişim olmalı.
-            // Bu örnekte, çıktı kaybolacaktır çünkü gerçek bir çıktı yok.
-            // Gerçek bir işletim sisteminde, bu kısım donanıma özel olacaktır.
+    // Kaynak yöneticisine PSU'yu kaydet
+    // Kaynak adı olarak çekirdek içinde benzersiz bir URI veya isim kullanılır.
+    // TODO: kresource::register_provider implementasyonunun çağrılması.
+    // Bu fonksiyonun geri döndürdüğü KHandle, aslında bu kaynağı kernel içinde takip etmek için kullanılır,
+    // ancak sürücünün kendisi bu handle'ı genellikle doğrudan kullanmaz, çekirdek yöneticileri kullanır.
+    match kresource::register_provider("karnal://device/power/psu0", psu_provider) {
+        Ok(_handle) => {
+            // Başarılı kayıt durumunda Handle alınır (kullanılmıyor ama gösteriliyor)
+            println!("srcpowerpsu: Başarıyla kaydedildi.");
             Ok(())
+        },
+        Err(e) => {
+            println!("srcpowerpsu: Kaydedilirken hata oluştu: {:?}", e);
+            Err(e)
         }
     }
-
-    #[macro_export]
-    macro_rules! print {
-        ($($arg:tt)*) => ({
-            let mut stdout = $crate::print::Stdout;
-            core::fmt::write(&mut stdout, core::format_args!($($arg)*)).unwrap();
-        });
-    }
-
-    #[macro_export]
-    macro_rules! println {
-        () => ($crate::print!("\n"));
-        ($($arg:tt)*) => ($crate::print!("{}\n", format_args!($($arg)*)));
-    }
-}
-
-#[cfg(feature = "std")]
-fn main() {
-    // Yeni bir Güç Kaynağı Ünitesi oluştur
-    let mut psu = PowerSupplyUnit::new();
-
-    // PSU durumunu başlangıçta göster
-    psu.display_psu_status();
-
-    // ATX 24-pin bağlantısını bağla
-    psu.get_atx_24pin_connector().connect();
-
-    // Bağlantıdan sonra PSU durumunu tekrar göster
-    psu.display_psu_status();
-
-    // ATX 24-pin bağlantısını kes
-    psu.get_atx_24pin_connector().disconnect();
-
-    // Bağlantıyı kestikten sonra PSU durumunu son kez göster
-    psu.display_psu_status();
-}
-
-#[cfg(not(feature = "std"))]
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    loop {}
 }
