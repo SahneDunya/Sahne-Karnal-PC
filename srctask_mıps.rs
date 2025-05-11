@@ -1,166 +1,172 @@
-#![no_std]
+#![no_std] // Standart kütüphaneye ihtiyaç duymuyoruz.
 
-use core::ptr::NonNull;
-use core::panic::PanicInfo;
+// Karnal64 API'sından gerekli temel tipleri içe aktar
+// Çekirdeğinizin modül yapısına bağlı olarak 'crate::karnal64' veya 'super::super::karnal64' gibi path değişebilir.
+// Örnek olarak 'crate::karnal64' kullandım, bu karnal64.rs'nin kök seviyede olduğunu varsayar.
+use crate::karnal64::{KTaskId, KThreadId, KError, KHandle};
+// Bellek yönetimi modülünden Task'ın bellek alanını temsil edecek tipi içe aktarabiliriz (varsayımsal)
+use crate::kmemory::TaskMemoryContext; // Karnal64'teki kmemory modülünün bir parçası olduğu varsayılır.
 
-// Basit bir görev yapısı (Simple Task Structure)
-pub struct Task {
-    stack: [u8; 1024], // Her görev için 1KB yığın (1KB stack for each task)
-    context: TaskContext,
+// TODO: MIPS mimarisine özgü register setini tanımlayın.
+// Bağlam değiştirmede (context switching) bu registerların kaydedilmesi ve geri yüklenmesi gerekir.
+#[repr(C)] // C uyumluluğu gerekebilir, mimariye özgü
+#[derive(Debug, Copy, Clone, Default)] // Varsayılan değerler genellikle sıfır olmalı
+pub struct MipsRegisters {
+    // Genel amaçlı registerlar (R0-R31) - MIPS'in konvansiyonlarına göre düzenlenmeli
+    // Örneğin, R1 (at), R2-R3 (v0-v1), R4-R7 (a0-a3), vb.
+    // Bağlam değiştirmede kaydedilmesi gereken s-registerları (s0-s7) ve gp, sp, fp, ra gibi registerlar
+    pub gp: u33, // Global Pointer
+    pub sp: u33, // Stack Pointer
+    pub fp: u33, // Frame Pointer / s8
+    pub ra: u33, // Return Address
+
+    // Saved registers (s0-s7) - Bağlam değiştirmede kaydedilir
+    pub s0: u33,
+    pub s1: u33,
+    pub s2: u33,
+    pub s3: u33,
+    pub s4: u33,
+    pub s5: u33,
+    pub s6: u33,
+    pub s7: u33,
+
+    // Caller-saved registers (a0-a3, t0-t9 vb.) - Çağıran tarafından kaydedilmesi beklenir,
+    // ancak thread bağlamında tutulmaları gerekir.
+    // Tam liste ve sıra MIPS ABI'ye göre ayarlanmalı.
+    pub a0: u33,
+    pub a1: u33,
+    pub a2: u33,
+    pub a3: u33,
+    // ... diğer gerekli registerlar (t0-t9, k0-k1, at, v0-v1, zero, vb.)
+    // CP0 registerları: EPC (Exception Program Counter), Status, Cause vb.
+    pub epc: u33,
+    pub status: u32, // COP0 Status Register
+    pub cause: u32,  // COP0 Cause Register
+    // Diğer gerekli COP0 registerları...
+
+    // Floating Point registers (FPRs) - Eğer FPU destekleniyorsa
+     pub fregs: [f64; 32], // fp0-fp31
+     pub fcsr: u32, // FP Control Status Register
 }
 
-#[derive(Default, Copy, Clone)]
-#[repr(C)]
-struct TaskContext {
-    regs: [u32; 32], // Genel amaçlı yazmaçlar (General purpose registers - MIPS'te 32 adet)
-    sp: u32,        // Yığın işaretçisi (Stack Pointer)
-    ra: u32,        // Dönüş adresi (Return Address)
-    fp: u32,        // Çerçeve işaretçisi (Frame Pointer - s8/fp olarak da bilinir)
-    gp: u32,        // Global işaretçi (Global Pointer)
+// İş Parçacığı Kontrol Bloğu (Thread Control Block - TCB)
+// Kernel'in bir iş parçacığının durumunu izlemek için kullandığı yapı.
+#[derive(Debug)]
+pub struct ThreadControlBlock {
+    pub thread_id: KThreadId,      // Karnal64 tarafından atanan İş Parçacığı ID
+    pub parent_task_id: KTaskId,   // Ait olduğu Görev (Task) ID
+    pub state: ThreadState,        // İş parçacığının mevcut durumu (Running, Blocked, Ready, vb.)
+    pub registers: MipsRegisters,  // Kaydedilmiş CPU registerları (bağlam değiştirmede kullanılır)
+    pub stack_base: *mut u8,       // İş parçacığı yığın (stack) alanının başlangıcı
+    pub stack_size: usize,         // İş parçacığı yığın alanının boyutu
+    pub stack_pointer: u33,        // Yığının mevcut üst noktası (register.sp ile aynı olabilir)
+    // TODO: Zamanlayıcıya özel alanlar (öncelik, kuantum bilgisi vb.)
+    // TODO: Bloklanmışsa beklediği kaynak veya olay bilgisi
+    // TODO: İş parçacığı yerel depolama (Thread Local Storage) bilgisi
 }
 
-static mut CURRENT_TASK: Option<NonNull<Task>> = None;
-static mut TASKS: [Option<Task>; 2] = [None, None]; // Görevleri tutmak için statik dizi, bu örnek için sabit boyut 2 (Static array to hold tasks, fixed size of 2 for this example)
-
-pub fn init() {
-    unsafe {
-        // İlk görevi başlat (görev 0) (Initialize the first task (task 0))
-        TASKS[0] = Some(Task { stack: [0; 1024], context: TaskContext::default() });
-        // Mevcut görevi ilk göreve ayarla (Set the current task to the first task)
-        CURRENT_TASK = NonNull::new(TASKS[0].as_mut().expect("TASKS[0] için mutable referans alınamadı (Failed to get mutable reference to TASKS[0])"));
-        // Yığın işaretçisini ayarla (Initialize stack pointer for task 0 - önemli!)
-        if let Some(task_ref) = &mut TASKS[0] {
-            let task_ptr = task_ref as *mut Task;
-            let stack_top = task_ptr as usize + 1024; // Yığının tepesi (top of the stack)
-            task_ref.context.sp = stack_top as u32; // Yığın işaretçisini yığının tepesine ayarla (Set stack pointer to top of stack)
-        }
-    }
+// Görev Kontrol Bloğu (Task Control Block - TCB) - Genellikle Görev = Adres Alanı
+// Kernel'in bir görevin (genellikle bir proses/uygulama) durumunu izlemek için kullandığı yapı.
+#[derive(Debug)]
+pub struct TaskControlBlock {
+    pub task_id: KTaskId,          // Karnal64 tarafından atanan Görev ID
+    // TODO: Göreve ait iş parçacıklarının listesi (LinkedList, Vec gibi no_std uyumlu bir yapı)
+    // pub threads: Vec<KThreadId>,
+    pub memory_context: TaskMemoryContext, // Görevin sanal bellek haritası/bağlamı (Page Table Base gibi)
+    pub exit_code: Option<i32>,    // Eğer görev sonlandıysa çıkış kodu
+    // TODO: Kaynak handle tablosu veya referansı (göreve ait açık handle'lar)
+    // TODO: IPC (Görevler Arası İletişim) bilgisi (mesaj kuyrukları, portlar vb.)
+    // TODO: Güvenlik bağlamı, kullanıcı/grup ID'leri vb.
 }
 
-pub fn create_task(entry_point: fn()) {
-    static mut TASK_ID: usize = 1; // Statik görev ID, görev 0 zaten başlatıldığı için 1'den başlar (Static task ID, starts from 1 as task 0 is already initialized)
-    unsafe {
-        // TASK_ID'ye göre görev yuvasına mutable referans al (Get a mutable reference to the task slot based on TASK_ID)
-        let task_slot = TASKS.get_mut(TASK_ID).expect("TASK_ID, TASKS dizisi sınırlarının dışında (TASK_ID out of bounds for TASKS array)");
-        // Görev yuvasında yeni bir görev oluştur (Create a new task in the task slot)
-        *task_slot = Some(Task {
-            stack: [0; 1024],
-            context: TaskContext {
-                ra: entry_point as u32, // Görevin giriş noktasını ayarla (Set the entry point of the task - dönüş adresi olarak ayarla)
-                ..Default::default() // Diğer bağlam alanlarını varsayılandan devral (Inherit other context fields from default)
-            }
-        });
-        // Yığın işaretçisini ayarla (Initialize stack pointer for the new task - önemli!)
-        if let Some(task_ref) = task_slot {
-            let task_ptr = task_ref as *mut Task;
-            let stack_top = task_ptr as usize + 1024; // Yığının tepesi (top of the stack)
-            task_ref.context.sp = stack_top as u32; // Yığın işaretçisini yığının tepesine ayarla (Set stack pointer to top of stack)
-        }
-
-        TASK_ID += 1; // Sonraki görev oluşturma için görev ID'sini artır (Increment task ID for the next task creation)
-    }
+// İş Parçacığı Durumları
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum ThreadState {
+    Ready,     // Çalışmaya hazır, zamanlayıcı tarafından seçilmeyi bekliyor
+    Running,   // Şu anda CPU üzerinde çalışıyor (sadece 1 thread/çekirdek aynı anda)
+    Blocked,   // Bir kaynak (kilit, mesaj, I/O vb.) bekliyor
+    Sleeping,  // Belirli bir süre uyuyor
+    Terminated, // Çalışması tamamlandı veya sonlandırıldı
+    // TODO: Diğer durumlar (örn. Suspended)
 }
 
-pub fn switch_task() {
-    unsafe {
-        // Mevcut ve sonraki görevlere mutable referanslar al (görev 1, bu örnekte basitlik için sonraki görev olarak varsayılır) (Get mutable references to current and next tasks (task 1 is assumed to be the next task for simplicity in this example))
-        let current_task = CURRENT_TASK.expect("CURRENT_TASK None değerinde (CURRENT_TASK is None)").as_mut();
-        let next_task = TASKS.get_mut(1).expect("TASKS[1] None değerinde (TASKS[1] is None)").as_mut().expect("TASKS[1] için mutable referans alınamadı (Failed to get mutable reference to TASKS[1])");
+// --- Dahili MIPS Görev/İş Parçacığı Yönetim Fonksiyonları ---
+// Bu fonksiyonlar, karnal64.rs'teki ktask modülünün PUBLIC fonksiyonları tarafından çağırılabilir.
+// Gerçek MIPS donanımıyla etkileşim (register yükleme/kaydetme, bağlam değiştirme) burada olur.
 
-        // Mevcut görevin bağlamını kaydet (Save current task's context)
+/// Yeni bir görev ve başlangıç iş parçacığı oluşturur.
+/// `code_handle`: Çalıştırılacak kodun bulunduğu kaynak handle'ı.
+/// `args_ptr`, `args_len`: Kullanıcı alanından gelen argüman verisi pointer'ı ve uzunluğu (doğrulama çekirdek API katmanında yapılmalı).
+/// Başarı durumunda yeni görevin ID'sini döner.
+pub fn spawn_new_task_mips(
+    code_handle: KHandle,
+    args_ptr: *const u8, // Kullanıcı alanı pointer'ı
+    args_len: usize,
+) -> Result<KTaskId, KError> {
+    // TODO: Bellek yöneticisinden (kmemory) yeni bir adres alanı (TaskMemoryContext) oluştur.
+    // TODO: code_handle'ı kullanarak kod kaynağını oku ve yeni adres alanına yükle.
+    // TODO: Başlangıç yığını için bellek ayır.
+    // TODO: Başlangıç argümanlarını yığına kopyala.
+    // TODO: Yeni bir KTaskId ve KThreadId oluştur (ktask yöneticisinden alınmalı).
+    // TODO: Bir ThreadControlBlock (TCB) oluştur, başlangıç registerlarını ayarla (stack pointer, entry point/ra, a0-a3/argümanlar).
+    // TODO: Bir TaskControlBlock (TSKCB) oluştur, TCB'yi TSKCB'ye ekle.
+    // TODO: Yeni TCB'yi 'Ready' durumuna getir ve zamanlayıcı kuyruğuna ekle.
 
-        // Yığın işaretçisini kaydet ($sp) (Save Stack Pointer ($sp))
-        asm!("move {}, $sp", out(reg) current_task.context.sp);
-        // Dönüş adresini kaydet ($ra) (Save Return Address ($ra))
-        asm!("move {}, $ra", out(reg) current_task.context.ra);
-        // Çerçeve işaretçisini kaydet ($fp - s8) (Save Frame Pointer ($fp - s8))
-        asm!("move {}, $fp", out(reg) current_task.context.fp);
-        // Global işaretçiyi kaydet ($gp) (Save Global Pointer ($gp))
-        asm!("move {}, $gp", out(reg) current_task.context.gp);
-        // s0-s7 yazmaçlarını kaydet (Save s0-s7 registers)
-        asm!("move {}, $s0", out(reg) current_task.context.regs[16]); // s0 - regs[16]
-        asm!("move {}, $s1", out(reg) current_task.context.regs[17]); // s1 - regs[17]
-        asm!("move {}, $s2", out(reg) current_task.context.regs[18]); // s2 - regs[18]
-        asm!("move {}, $s3", out(reg) current_task.context.regs[19]); // s3 - regs[19]
-        asm!("move {}, $s4", out(reg) current_task.context.regs[20]); // s4 - regs[20]
-        asm!("move {}, $s5", out(reg) current_task.context.regs[21]); // s5 - regs[21]
-        asm!("move {}, $s6", out(reg) current_task.context.regs[22]); // s6 - regs[22]
-        asm!("move {}, $s7", out(reg) current_task.context.regs[23]); // s7 - regs[23]
-
-
-        // Sonraki görevin bağlamına geç (Switch to the next task's context)
-
-        // Sonraki görevin yığın işaretçisini yükle ($sp) (Load next task's Stack Pointer ($sp))
-        asm!("move $sp, {}", in(reg) next_task.context.sp);
-        // Sonraki görevin dönüş adresini yükle ($ra) (Load next task's Return Address ($ra))
-        asm!("move $ra, {}", in(reg) next_task.context.ra);
-        // Sonraki görevin çerçeve işaretçisini yükle ($fp - s8) (Load next task's Frame Pointer ($fp - s8))
-        asm!("move $fp, {}", in(reg) next_task.context.fp);
-        // Sonraki görevin global işaretçisini yükle ($gp) (Load next task's Global Pointer ($gp))
-        asm!("move $gp, {}", in(reg) next_task.context.gp);
-        // s0-s7 yazmaçlarını yükle (Load s0-s7 registers)
-        asm!("move $s0, {}", in(reg) next_task.context.regs[16]); // s0 - regs[16]
-        asm!("move $s1, {}", in(reg) next_task.context.regs[17]); // s1 - regs[17]
-        asm!("move $s2, {}", in(reg) next_task.context.regs[18]); // s2 - regs[18]
-        asm!("move $s3, {}", in(reg) next_task.context.regs[19]); // s3 - regs[19]
-        asm!("move $s4, {}", in(reg) next_task.context.regs[20]); // s4 - regs[20]
-        asm!("move $s5, {}", in(reg) next_task.context.regs[21]); // s5 - regs[21]
-        asm!("move $s6, {}", in(reg) next_task.context.regs[22]); // s6 - regs[22]
-        asm!("move $s7, {}", in(reg) next_task.context.regs[23]); // s7 - regs[23]
-
-
-        // CURRENT_TASK'ı sonraki göreve güncelle (Update CURRENT_TASK to the next task)
-        CURRENT_TASK = NonNull::new(next_task as *mut Task);
-    }
+    // Yer tutucu: Dummy ID döndür
+    println!("srctask_mips: Yeni görev oluşturma simülasyonu"); // Kernel içi print! gerektirir
+    let dummy_task_id = KTaskId(100 + core::sync::atomic::AtomicU64::new(0).fetch_add(1, core::sync::atomic::Ordering::SeqCst)); // Basit dummy ID
+    Ok(dummy_task_id)
 }
 
-// Örnek görev giriş noktası (sadece gösteri amaçlı) (Example task entry point (just for demonstration))
-fn task1_entry() {
-    let mut count = 0;
-    loop {
-        count += 1;
-        // Gerçek bir no_std ortamında, gecikmeler için donanım zamanlayıcısı veya benzeri kullanabilirsiniz.
-        // Bu örnek için, basit bir döngü yer tutucu olarak hizmet eder.
-        for _ in 0..100000 {
-            // zaman harca (waste time)
-        }
-        unsafe {
-            // Görev değiştirmenin temel çıktısı (seri gibi bir çıktı biçiminin başka bir yerde başlatıldığını varsayarak)
-            let ptr = 0xbfc00000 as *mut u32; // Çıktı için örnek bellek adresi (Example memory address for output - MIPS MMIO alanı genellikle bu adreste başlar)
-            ptr.write_volatile(count);
-        }
-    }
+/// Mevcut iş parçacığının bağlamını kaydeder ve çalıştırılacak bir sonraki iş parçacığına geçer.
+/// Bu, zamanlayıcı tarafından çağrılan temel bağlam değiştirme işlevidir.
+/// Mevcut iş parçacığının TCB'sini alır, registerlarını kaydeder.
+/// Zamanlayıcıdan bir sonraki TCB'yi alır.
+/// Yeni TCB'nin registerlarını yükler ve o iş parçacığına sıçrar (jump).
+/// NOT: Bu fonksiyon genellikle doğrudan Rust'tan çağrılmaz, mimariye özgü assembly ile birlikte çalışır.
+pub fn switch_context_mips(
+    current_thread: &mut ThreadControlBlock,
+    next_thread: &ThreadControlBlock,
+) {
+    // TODO: Mevcut (current_thread) iş parçacığının CPU registerlarını (MipsRegisters yapısına) kaydet.
+    // Bu kısım genellikle inline assembly veya ayrı bir .S dosyasında MIPS'e özgü komutlarla yapılır.
+    // Örnek (Pseudo-kod/Açıklama):
+    // - Mevcut stack pointer'ı (sp) current_thread.registers.sp'ye kaydet.
+    // - ra, gp, fp, s0-s7 gibi kaydedilmesi gereken diğer registerları current_thread.registers içine kaydet.
+    // - Current_thread'in durumunu uygun şekilde güncelle (örn. Ready veya Blocked).
+
+    // TODO: Bir sonraki (next_thread) iş parçacığının bağlamını yükle.
+    // Bu kısım da assembly gerektirir.
+    // Örnek (Pseudo-kod/Açıklama):
+    // - next_thread.registers.sp değerini CPU'nun sp register'ına yükle.
+    // - next_thread.registers'tan ra, gp, fp, s0-s7 gibi registerları CPU'ya yükle.
+    // - Eğer görev değişiyorsa, bellek bağlamını (page table base register gibi) next_thread.parent_task.memory_context'tan yükle.
+    // - CPU'nun Program Counter'ını (PC) ayarlamak için next_thread.registers.epc veya başka bir giriş noktasına sıçra.
+    // - next_thread'in durumunu 'Running' olarak güncelle.
+
+    // Not: Bu fonksiyonun başarılı dönüşü, artık next_thread'in bağlamında çalışıyor olmak anlamına gelir.
+    println!("srctask_mips: Bağlam değiştirme simülasyonu"); // Kernel içi print! gerektirir
+    // Gerçek implementasyonda buradan dönülmez, yeni iş parçacığına sıçranır.
 }
 
-// Örnek kullanım (gösteri için kavramsal ana fonksiyon) (Example usage (conceptual main function for demonstration))
-fn main() {
-    init(); // Görev yönetimini başlat (Initialize task management)
+ task_exit_mips(task_id: KTaskId, exit_code: i32) -> !
+// Bir görevi ve ona ait tüm iş parçacıklarını sonlandırma mantığı. Kaynakları (bellek, handle'lar) serbest bırakır.
 
-    create_task(task1_entry); // Görev 1'i oluştur ve giriş noktasını ayarla (Create task 1 and set its entry point)
+ thread_exit_mips(thread_id: KThreadId, exit_code: i32) -> !
+// Tek bir iş parçacığını sonlandırma mantığı. Görevdeki son thread ise görevi de sonlandırabilir.
 
-    // İlk görevi çalıştırmaya başla (görev 0 init'te başlatılır).
-    // Gerçek bir işletim sisteminde, görev 0 ilk kurulumu yapabilir ve ardından görev değiştirmeyi başlatabilir.
-    // (Start running the first task (task 0 is initialized in init).
-    // In a real OS, task 0 might do initial setup and then start task switching.)
+ sleep_mips(duration_ms: u64)
+// Mevcut iş parçacığını belirtilen süre uykuya yatırır. Zamanlayıcı ile etkileşim kurar.
 
-    loop {
-        unsafe {
-            // Gösteri için, görevleri bir döngü içinde değiştir.
-            // Gerçek bir sistemde, görev değiştirme olaylarla tetiklenir (örn. zamanlayıcı kesmesi).
-            // (For demonstration, switch tasks in a loop.
-            // In a real system, task switching would be triggered by events (e.g., timer interrupt).)
-            switch_task();
-            for _ in 0..200000 { // Görev 0'da zaman harca (waste time in task 0)
-                // zaman harca (waste time)
-            }
-            let ptr = 0xbfc00004 as *mut u32; // Görev 0 için çıktı için örnek bellek adresi (Example memory address for output for task 0 - MIPS MMIO alanı genellikle bu adreste başlar)
-            ptr.write_volatile(0); // Görev 0'ın çalıştığını göster (Indicate task 0 is running)
-        }
-    }
-}
+ yield_mips()
+// Mevcut iş parçacığını Ready durumuna alıp CPU'yu zamanlayıcıya bırakır.
 
-// no_std ortamı için gerekli, panik işleyicisini tanımla (Required for no_std environment, define panic handler)
-#[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
-    loop {}
-}
+ get_current_task_id_mips() -> KTaskId
+// Şu anda çalışan iş parçacığının ait olduğu görevin ID'sini bulur. Thread Local Storage veya TCB pointerı gerektirir.
+
+ get_current_thread_id_mips() -> KThreadId
+// Şu anda çalışan iş parçacığının ID'sini bulur. Thread Local Storage veya TCB pointerı gerektirir.
+
+// TODO: MIPS kesme/trap işleyicisinden bağlam kaydetme ve zamanlayıcıyı çağırma mantığı.
+// Bu genellikle assembly ve Rust/C karışımı olur.
+ exception_handler(frame: &mut MipsRegisters) { ... save registers to current TCB ... call scheduler ... load registers from next TCB ... return from exception ... }
