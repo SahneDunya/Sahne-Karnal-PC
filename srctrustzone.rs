@@ -1,3 +1,4 @@
+#![no_std]
 use super::{
     kresource::{self, ResourceProvider, KResourceStatus, KseekFrom},
     kmemory, ktask, ksync, kmessaging, kkernel,
