@@ -1,121 +1,274 @@
-#![no_std]
-use core::ptr::NonNull;
-use core::panic::PanicInfo;
+#![no_std] // Bu da bir çekirdek bileşeni olduğu için standart kütüphaneye ihtiyaç duymaz.
+#![allow(dead_code)] // Geliştirme sırasında kullanılmayan kodlar için izin
+#![allow(unused_variables)] // Geliştirme sırasında kullanılmayan değişkenler için izin
 
-// LoongArch için basit görev yapısı
-pub struct Task {
-    stack: [u8; 1024], // Her görev için 1KB yığın
-    context: TaskContext,
+// Karnal64 API'sından temel tipleri içe aktar.
+// Varsayım: Karnal64.rs'teki ilgili tipler 'pub' olarak işaretlenmiştir.
+// 'super::' kullanarak aynı crate içindeki üst modüldeki (varsayımsal olarak karnal64.rs) öğelere erişiyoruz.
+use super::KError;
+use super::KTaskId;
+use super::KThreadId;
+use super::KHandle;
+
+// TODO: LoongArch 64-bit mimarisine özgü register setini tanımla.
+// Bu yapı, bir iş parçacığının veya görevin kaydedilmesi/geri yüklenmesi gereken
+// CPU registerlarının tamamını veya bir kısmını (genellikle kaydedici-çağıran anlaşmasına göre) saklar.
+// Tam register seti ve bunların bellekteki düzeni, LoongArch 64-bit ABI (Application Binary Interface) dokümantasyonuna göre doğru şekilde doldurulmalıdır.
+#[repr(C)] // C uyumluluğu, düşük seviye assembly kodları ile etkileşimde önemlidir.
+#[derive(Debug, Copy, Clone)]
+pub struct LoongArchContext {
+    // --- Genel Amaçlı Registerlar (GPRs) ---
+    // LoongArch'ın 32 adet 64-bit genel amaçlı registerı (r0-r31).
+    // Genellikle r0 sabittir (sıfır), r1 stack pointer (sp) vb.
+    // Bağlam değiştirme sırasında hangilerinin kaydedilip hangilerinin kaydedilmeyeceği ABI'ye bağlıdır.
+    // Çoğu OS çekirdeği, istisna/sistem çağrısı sırasında CPU tarafından kaydedilenlere ek olarak,
+    // zamanlama kesmelerinde tüm GPR'ları kaydetmeyi tercih eder.
+    gprs: [u64; 32], // r0-r31 için yer tutucu
+
+    // --- Kontrol ve Durum Registerları (CSRs) ---
+    // Görev/iş parçacığına özgü olması gereken kritik CSR'lar.
+    csr_era: u64,  // Exception Return Address - İstisna dönüş adresi (sistem çağrısı sonrası veya bağlam değiştirme sonrası devam edilecek adres)
+    csr_crmd: u64, // Current Mode - Mevcut işlem modu (Kernel/User) ve ilgili bayraklar
+    // TODO: LoongArch'a özgü kaydedilmesi gereken diğer kritik CSR'lar (örneğin, MMU ile ilgili, kesmelerle ilgili durumlar)
+
+    // --- FPU/SIMD Registerları (Eğer kullanılıyorsa) ---
+    // Eğer görevler kayan nokta veya SIMD talimatları kullanıyorsa, bu registerlar da kaydedilmelidir.
+    // LoongArch'ın VPU (Vector Processing Unit) registerları.
+     vregs: [u128; 32], // vr0-vr31 için yer tutucu (tam tip ve boyut LoongArch'a göre belirlenmeli)
+     fcsr: u32,        // Floating-point Control and Status Register
+
+    // TODO: Diğer mimariye özgü durumlar veya registerlar
 }
 
-#[derive(Default, Copy, Clone)]
-#[repr(C)]
-struct TaskContext{
-    r:[usize; 32], // Genel amaçlı yazmaçlar (LoongArch r0-r31)
-    csr_statu: usize, // Yönetici durum yazmacı (Tahmini isim, LoongArch dokümantasyonuna göre doğrulanmalı)
-    csr_epc: usize,  // Yönetici istisna program sayacı (Tahmini isim, LoongArch dokümantasyonuna göre doğrulanmalı)
-}
+impl LoongArchContext {
+    /// Yeni bir görev/iş parçacığı için başlangıç yürütme bağlamını (context) oluşturur.
+    /// Bu bağlam, görev ilk kez zamanlandığında CPU'ya yüklenecek register değerlerini içerir.
+    ///
+    /// # Arguments
+    /// * `entry_point`: Görevin çalışmaya başlayacağı sanal adres.
+    /// * `stack_top`: Görevin kullanacağı kullanıcı stack'inin en üst adresi (stack genellikle yukarıdan aşağı doğru büyür).
+    /// * `arg`: Göreve (genellikle ilk argüman olarak) geçirilecek 64-bitlik değer.
+    /// * `is_user`: Bu bağlamın kullanıcı modunda mı (true) yoksa çekirdek modunda mı (false) çalışacağını belirtir.
+    pub fn create_initial_context(
+        entry_point: u64, // LoongArch'ta adres büyüklüğü neyse o kullanılmalı (u64 varsayımı)
+        stack_top: u64,
+        arg: u64,
+        is_user: bool,
+    ) -> Self {
+        // TODO: LoongArch ABI'sine göre başlangıç register değerlerini ayarla.
+        let mut context = Self {
+            gprs: [0; 32], // Tüm GPR'ları sıfırla (veya ABI'ye göre uygun başlangıç değerlerini ver)
+            csr_era: entry_point,
+            csr_crmd: 0, // Varsayılan olarak sıfırla, sonra mod bayraklarını ayarla
+            // Diğer CSR'ları sıfırla veya başlangıç değerlerini ver
+        };
 
-static mut CURRENT_TASK: Option<NonNull<Task>> = None;
-static mut TASKS: [Option<Task>; 2] = [None, None]; // Görevleri tutmak için statik dizi, bu örnek için sabit boyut 2
-
-pub fn init(){
-    unsafe{
-        // İlk görevi (görev 0) başlat
-        TASKS[0] = Some(Task{stack: [0; 1024], context: TaskContext::default()});
-        // Mevcut görevi ilk göreve ayarla
-        CURRENT_TASK = NonNull::new(TASKS[0].as_mut().expect("TASKS[0] için mutable referans alınamadı"));
-    }
-}
-
-pub fn create_task(entry_point: fn()){
-    static mut TASK_ID: usize = 1; // Statik görev ID, görev 0 zaten başlatıldığı için 1'den başlar
-    unsafe{
-        // TASK_ID'ye göre görev yuvasına mutable referans al
-        let task_slot = TASKS.get_mut(TASK_ID).expect("TASK_ID, TASKS dizisi sınırlarının dışında");
-        // Görev yuvasında yeni görev oluştur
-        *task_slot = Some(Task{
-            stack: [0; 1024],
-            context: TaskContext{
-                csr_epc: entry_point as usize, // Görevin giriş noktasını ayarla
-                ..Default::default() // Diğer context alanlarını varsayılandan devral
-            }
-        });
-        TASK_ID += 1; // Sonraki görev oluşturma için görev ID'sini artır
-    }
-}
-
-pub fn switch_task(){
-    unsafe{
-        // Mevcut ve sonraki görevlere mutable referans al (görev 1, bu örnekte basitlik için sonraki görev olarak varsayılır)
-        let current_task = CURRENT_TASK.expect("CURRENT_TASK None").as_mut();
-        let next_task = TASKS.get_mut(1).expect("TASKS[1] None").as_mut().expect("TASKS[1] için mutable referans alınamadı");
-
-        // Mevcut görevin context'ini kaydet
-        // csr_statu yazmacını kaydet
-        asm!("csrrd {}, csr_statu", out(reg) current_task.context.csr_statu); // LoongArch için csrrd (CSR Read) talimatı kullanılıyor (doğrulanmalı)
-        // csr_epc yazmacını kaydet
-        asm!("csrrd {}, csr_epc", out(reg) current_task.context.csr_epc); // LoongArch için csrrd (CSR Read) talimatı kullanılıyor (doğrulanmalı)
-        // Yığın işaretçisini kaydet (LoongArch'ta yığın işaretçisi için 'sp' veya 'r2' kullanılır, burada 'r2' olarak varsayıyoruz)
-        asm!("move {}, $r2", out(reg) current_task.context.r[2]); // LoongArch'ta yığın işaretçisi genellikle r2/sp'dir. 'move' talimatı register kopyalamak için kullanılır.
-
-        // Sonraki görevin context'ine geç
-        // Sonraki görevin csr_statu yazmacını yükle
-        asm!("csrwr csr_statu, {}", in(reg) next_task.context.csr_statu); // LoongArch için csrwr (CSR Write) talimatı kullanılıyor (doğrulanmalı)
-        // Sonraki görevin csr_epc yazmacını yükle
-        asm!("csrwr csr_epc, {}", in(reg) next_task.context.csr_epc); // LoongArch için csrwr (CSR Write) talimatı kullanılıyor (doğrulanmalı)
-        // Sonraki görevin yığın işaretçisini yükle
-        asm!("move $r2, {}", in(reg) next_task.context.r[2]); // LoongArch'ta yığın işaretçisi genellikle r2/sp'dir. 'move' talimatı register kopyalamak için kullanılır.
-
-
-        // CURRENT_TASK'ı sonraki göreve güncelle
-        CURRENT_TASK = NonNull::new(next_task as *mut Task);
-    }
-}
-
-// Örnek görev giriş noktası (sadece gösteri amaçlı)
-fn task1_entry() {
-    let mut count = 0;
-    loop {
-        count += 1;
-        // Gerçek bir no_std ortamında, gecikmeler için bir donanım zamanlayıcısı veya benzeri kullanabilirsiniz.
-        // Bu örnekte, basit bir döngü yer tutucu olarak hizmet eder.
-        for _ in 0..100000 {
-            // zaman harca
+        // Stack Pointer (sp) genellikle r3 veya r4 olarak kullanılır, ABI'ye bakılmalı. Varsayımsal olarak r3.
+        // LoongArch ABI'ye göre sp'nin ilk değeri ayarlanmalı. Stack top'ı kullanıyoruz.
+        if let Some(sp_reg_idx) = LoongArchContext::get_sp_register_index() {
+             context.gprs[sp_reg_idx] = stack_top;
+        } else {
+             // TODO: SP register indeksi bulunamadı, hata durumu veya panic yönetimi
+             panic!("LoongArch SP register index not defined!");
         }
-        unsafe {
-            // Görev değiştirmeyi belirtmek için temel çıktı (seri port gibi bir çıktı biçiminin başka bir yerde başlatıldığı varsayılır)
-            let ptr = 0x90000000 as *mut u32; // LoongArch için örnek bellek adresi (doğrulanmalı)
-            ptr.write_volatile(count);
+
+
+        // Göreve geçirilecek argüman genellikle ilk argüman registerına konur (örn. r4 veya r5, ABI'ye bakılmalı). Varsayımsal olarak r4.
+        if let Some(arg0_reg_idx) = LoongArchContext::get_arg0_register_index() {
+             context.gprs[arg0_reg_idx] = arg;
+        } else {
+             // TODO: Arg0 register indeksi bulunamadı, hata durumu veya panic yönetimi
         }
+
+
+        // Dönüş adresi (ra) genellikle r1 olarak kullanılır, ABI'ye bakılmalı.
+        // Görev ana fonksiyonundan dönüldüğünde çalışacak bir çekirdek fonksiyonunun adresi buraya konulmalıdır
+        // (örneğin görev sonlandırma işleyicisi).
+        if let Some(ra_reg_idx) = LoongArchContext::get_ra_register_index() {
+            // TODO: Gerçek görev sonlandırma çekirdek fonksiyonunun adresini al
+            let task_exit_kernel_handler_address: u64 = 0xTODO_GET_TASK_EXIT_HANDLER_ADDRESS;
+            context.gprs[ra_reg_idx] = task_exit_kernel_handler_address;
+        } else {
+             // TODO: RA register indeksi bulunamadı
+        }
+
+
+        // Ayrıcalık seviyesini ayarla (CSR_CRMD veya benzeri register).
+        // LoongArch'ta kullanıcı modu ve çekirdek modu için uygun bitleri ayarla.
+        // TODO: LoongArch CSR_CRMD (veya ilgili) registerındaki kullanıcı/çekirdek mod bayraklarını ayarla
+        if is_user {
+            // Kullanıcı modu bayraklarını ayarla
+             context.csr_crmd |= LOONGARCH_CRMD_USER_MODE_BITS; // Yer tutucu
+        } else {
+            // Çekirdek modu bayraklarını ayarla (genellikle zaten çekirdek modunda başlarız)
+             context.csr_crmd |= LOONGARCH_CRMD_KERNEL_MODE_BITS; // Yer tutucu
+        }
+
+        // TODO: Kesme durumunu ayarla (genellikle başlangıçta kesmeler kapalı olmalı)
+         context.csr_crmd &= !LOONGARCH_CRMD_INTERRUPT_ENABLE_BIT; // Yer tutucu
+
+        // TODO: Eğer FPU/VPU kullanılıyorsa, ilgili durum registerlarını ayarla
+
+        context
+    }
+
+    /// LoongArch ABI'ye göre SP register indeksini döndürür (Yer Tutucu).
+    #[inline(always)]
+    fn get_sp_register_index() -> Option<usize> {
+        // TODO: LoongArch ABI'ye göre SP register indeksini (0-31 arası) döndür.
+        // LoongArch Dokümantasyonuna bakın (genellikle r3 veya r4).
+         Some(3) // Örnek olarak 3 diyelim, doğru indeksi kontrol edin.
+    }
+
+     /// LoongArch ABI'ye göre RA register indeksini döndürür (Yer Tutucu).
+     #[inline(always)]
+     fn get_ra_register_index() -> Option<usize> {
+         // TODO: LoongArch ABI'ye göre RA register indeksini (0-31 arası) döndür.
+         // LoongArch Dokümantasyonuna bakın (genellikle r1).
+          Some(1) // Örnek olarak 1 diyelim, doğru indeksi kontrol edin.
+     }
+
+     /// LoongArch ABI'ye göre ilk argüman register indeksini döndürür (Yer Tutucu).
+     #[inline(always)]
+     fn get_arg0_register_index() -> Option<usize> {
+         // TODO: LoongArch ABI'ye göre ilk argüman register indeksini (0-31 arası) döndür.
+         // LoongArch Dokümantasyonuna bakın (genellikle r4 veya r5).
+          Some(4) // Örnek olarak 4 diyelim, doğru indeksi kontrol edin.
+     }
+
+
+    // TODO: Gerçek bağlam değiştirme assembly fonksiyonunu dışarıdan tanımla.
+    // Bu fonksiyon, bu dosyanın yanında veya ayrı bir assembly dosyasında (örn. `loongarch_asm.S`) implemente edilir.
+    // Parametreleri, mevcut bağlam yapısının pointer'ı ve geçiş yapılacak bağlam yapısının pointer'ı olmalıdır.
+    // Fonksiyon, mevcut bağlamı ilk parametredeki adrese kaydetmeli, ikinci parametredeki adresten yeni bağlamı yüklemeli
+    // ve yeni bağlamın `csr_era` adresine atlamalıdır.
+    extern "C" {
+        /// LoongArch'a özgü düşük seviye bağlam değiştirme fonksiyonu.
+        /// Mevcut bağlamı `current` pointer'ına kaydeder, `next` pointer'ından yeni bağlamı yükler
+        /// ve yeni bağlama atlar.
+        ///
+        /// # Safety
+        /// Bu fonksiyonun çağrılması **güvenli değildir** ve sadece çekirdek zamanlayıcısı gibi
+        /// düşük seviye kodlardan, sağlanan pointer'ların geçerli `LoongArchContext` yapılarına
+        /// işaret ettiği garanti edildiğinde çağrılmalıdır.
+        fn loongarch_context_switch(current: *mut LoongArchContext, next: *const LoongArchContext);
+
+        /// LoongArch'a özgü düşük seviye kullanıcı moduna geçiş fonksiyonu.
+        /// Çekirdek modundan kullanıcı moduna ilk geçişi yapar.
+        /// Verilen bağlamın stack'ini, entry point'ini ve ayrıcalık seviyesini kurar ve o adrese atlar.
+        /// Bu fonksiyon geri dönmez (`!` dönüş tipi).
+        ///
+        /// # Safety
+        /// Bu fonksiyonun çağrılması **güvenli değildir** ve sadece çekirdek görev başlatma
+        /// kodu gibi düşük seviye kodlardan çağrılmalıdır. Bağlamın doğru kurulduğundan,
+        /// MMU'nun doğru ayarlandığından (eğer sanal adres kullanılıyorsa) emin olunmalıdır.
+        fn loongarch_enter_user_mode(initial_context: *const LoongArchContext) -> !;
     }
 }
 
-// Örnek kullanım (gösteri için kavramsal main fonksiyonu)
-fn main() {
-    init(); // Görev yönetimini başlat
 
-    create_task(task1_entry); // Görev 1'i oluştur ve giriş noktasını ayarla
+// --- Çekirdek Ktask Modülü Tarafından Kullanılan LoongArch Spesifik Fonksiyonlar ---
+// Bu fonksiyonlar, karnal64.rs içindeki ktask modülünün (veya genel görev yöneticisinin)
+// mimariye bağımlı işlemleri gerçekleştirmek için çağıracağı arayüzü oluşturur.
 
-    // İlk görevi çalıştırmaya başla (görev 0 init'te başlatılır).
-    // Gerçek bir işletim sisteminde, görev 0 başlangıç kurulumunu yapabilir ve ardından görev değiştirmeyi başlatabilir.
+/// Yeni bir LoongArch görev/iş parçacığı için başlangıç bağlamını hazırlar.
+/// Genel görev yöneticisi bu fonksiyonu çağırır.
+///
+/// # Arguments
+/// * `entry_point`: Görev kodunun başlayacağı sanal adres.
+/// * `stack_base`: Görev stack'inin ayrıldığı bellek alanının başlangıcı.
+/// * `stack_size`: Görev stack'inin boyutu.
+/// * `arg`: Göreve geçirilecek argüman.
+/// * `is_user`: Kullanıcı (true) veya çekirdek (false) görevi mi olduğunu belirtir.
+///
+/// # Returns
+/// Başarılı olursa ilk `LoongArchContext` yapısını, hata durumunda `KError` döner.
+pub fn arch_create_task_context(
+    entry_point: u64,
+    stack_base: u64,
+    stack_size: usize,
+    arg: u64,
+    is_user: bool,
+) -> Result<LoongArchContext, KError> {
+    // TODO: stack_base ve stack_size'ın geçerli bellek alanlarını temsil ettiğini doğrula?
+    // Bu doğrulama genellikle bellek yöneticisi (kmemory) veya daha üst katmanda yapılır.
+    // TODO: entry_point adresinin geçerli ve yürütülebilir bir alanda olduğunu doğrula?
 
-    loop {
-        unsafe {
-            // Gösteri için, görevleri bir döngü içinde değiştir.
-            // Gerçek bir sistemde, görev değiştirme olaylarla tetiklenir (örneğin, zamanlayıcı kesmesi).
-            switch_task();
-            for _ in 0..200000 { // görev 0'da zaman harca
-                // zaman harca
-            }
-            let ptr = 0x90000004 as *mut u32; // LoongArch için örnek bellek adresi (doğrulanmalı)
-            ptr.write_volatile(0); // Görev 0'ın çalıştığını belirt
-        }
-    }
+    let stack_top = stack_base.checked_add(stack_size as u64) // Stack yukarıdan aşağı büyüyorsa son adresi
+        .ok_or(KError::InvalidArgument)?; // Taşma kontrolü
+
+    // Stack pointer genellikle stack top'a veya biraz altına ayarlanır.
+    // ABI'ye göre tam başlangıç değeri belirlenmelidir.
+    // LoongArchContext::create_initial_context stack_top'ı bekliyor.
+
+    Ok(LoongArchContext::create_initial_context(entry_point, stack_top, arg, is_user))
 }
 
-// no_std ortamı için gerekli, panik işleyicisini tanımla
-#[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
-    loop {}
+/// İki LoongArch görevi/iş parçacığı arasında bağlam değiştirmeyi gerçekleştirir.
+/// Genel zamanlayıcı tarafından, hangi görevin durdurulup hangisinin çalıştırılacağına karar verildikten sonra çağrılır.
+///
+/// # Arguments
+/// * `current_context`: Mevcut (ayrılacak) görevin `LoongArchContext` yapısının mutable pointer'ı.
+///                                                    Mevcut görev durdurulduğunda registerlar bu adrese kaydedilecektir.
+/// * `next_context`: Çalıştırılacak görevin `LoongArchContext` yapısının immutable pointer'ı.
+///                                                    Yeni görev başladığında registerlar buradan yüklenecektir.
+///
+/// # Safety
+/// Bu fonksiyon **güvenli değildir**. Çağıran kod, sağlanan pointer'ların geçerli,
+/// tahsis edilmiş ve doğru `LoongArchContext` yapılarına işaret ettiğinden ve bu yapılara
+/// eş zamanlı erişim sorunları olmayacağından emin olmalıdır (genellikle zamanlayıcı kilitleri altında çalışır).
+#[inline] // Bağlam değiştirme kritik yol olduğu için inlining faydalı olabilir
+pub unsafe fn arch_switch_context(
+    current_context: *mut LoongArchContext,
+    next_context: *const LoongArchContext,
+) {
+    // TODO: Düşük seviye assembly bağlam değiştirme fonksiyonunu çağır.
+    // loongarch_context_switch fonksiyonu ayrı bir assembly dosyasında implemente edilmelidir.
+    // Bu çağrı, mevcut görev bağlamını kaydeder ve yeni görev bağlamını yükleyip yeni göreve atlar.
+    loongarch_context_switch(current_context, next_context);
+
+    // Bu noktaya sadece bir başka görev (daha önce durdurulan 'current_context' görevi)
+    // bu fonksiyona yapılan bir çağrı ile geri döndüğünde ulaşılır.
 }
+
+// TODO: İlk görev başlatılırken kullanılan özel fonksiyon.
+// Normal bağlam değiştirmeden farklı olabilir çünkü çekirdek stack'inden
+// kullanıcı stack'ine ve çekirdek modundan kullanıcı moduna geçiş içerir.
+/// İlk kez bir görevi çalıştırmak için LoongArch donanım bağlamını kurar ve kullanıcı moduna geçer.
+/// Bu fonksiyon çekirdek zamanlayıcısı tarafından, ilk defa bir kullanıcı görevini başlatırken çağrılır.
+///
+/// # Arguments
+/// * `initial_context`: Çalıştırılacak görevin `arch_create_task_context` ile hazırlanmış ilk bağlam yapısı.
+///
+/// # Safety
+/// Bu fonksiyon **güvenli değildir**. Çekirdekten kullanıcı alanına son derece dikkatli bir geçiş yapar.
+/// Bağlam yapısının doğruluğu, MMU ayarları (varsa), ayrıcalık seviyesinin doğru ayarlanması ve
+/// kesme/istisna vektörlerinin doğru kurulmuş olması kritiktir. Yanlış implementasyonlar güvenlik açıklarına yol açar.
+pub unsafe fn arch_enter_user_mode(
+    initial_context: LoongArchContext // Bağlamı değer olarak alıyoruz, çünkü assembly fonksiyonuna pointer'ını vereceğiz
+) -> ! // Bu fonksiyon başarılı olursa geri dönmez
+{
+    // TODO: Düşük seviye assembly kullanıcı moduna geçiş fonksiyonunu çağır.
+    // loongarch_enter_user_mode fonksiyonu ayrı bir assembly dosyasında implemente edilmelidir.
+    // Bu fonksiyon, sağlanan bağlamdaki stack, entry point ve CSR'ları kullanarak
+    // kullanıcı moduna geçişi ve ilk talimata atlamayı yapar.
+    loongarch_enter_user_mode(&initial_context as *const LoongArchContext);
+
+    // Bu noktaya asla ulaşılmamalıdır. Eğer ulaşılırsa bir hata var demektir.
+     panic!("arch_enter_user_mode returned!"); // Geliştirme sırasında hata ayıklama için eklenebilir
+}
+
+
+// TODO: Diğer LoongArch spesifik task/thread yönetimi fonksiyonları (gereksinime göre eklenebilir)
+// - `arch_get_current_thread_id() -> KThreadId`: Mevcut LoongArch Thread ID'sini döndürür.
+// - `arch_setup_kernel_thread_context(...) -> LoongArchContext`: Çekirdek modunda çalışan bir iş parçacığı için bağlam hazırlar.
+// - `arch_setup_syscall_stack(...)`: Sistem çağrısı sırasında kullanıcı stack'inin çekirdek stack'ine nasıl kaydedileceğini veya erişileceğini yönetir.
+// - `arch_restore_syscall_stack(...)`: Sistem çağrısı dönüşünde stack'i geri yükler.
+// - `arch_yield()`: Mevcut iş parçacığının bilerek CPU'yu bırakmasını sağlar (zamanlayıcıyı çağırır).
+// - Kesme işleyicileri içinde bağlam kaydetme/geri yükleme fonksiyonları.
+
+// --- Yardımcı Sabitler (LoongArch ABI'ye göre doldurulmalı) ---
+// TODO: LoongArch CRMD registerındaki bit bayrakları gibi mimariye özgü sabitler
+ pub const LOONGARCH_CRMD_USER_MODE_BITS: u64 = ...;
+ pub const LOONGARCH_CRMD_KERNEL_MODE_BITS: u64 = ...;
+ pub const LOONGARCH_CRMD_INTERRUPT_ENABLE_BIT: u64 = ...;
