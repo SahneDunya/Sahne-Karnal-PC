@@ -192,7 +192,7 @@ fn set_interrupt_handler(interrupt_number: usize, handler: extern "C" fn()) {
     // **Alternatif GIC Yaklaşımı (örnek olarak - vektör tablosu yerine, bazı GIC'lerde işleyici doğrudan ayarlanabilir):**
     // **Bu örnek kod **tamamen varsayımsaldır** ve gerçek GIC'lerde bu şekilde işleyici ayarlamak mümkün olmayabilir.**
     // **Vektör tablosu yaklaşımı daha genel ve yaygın bir yöntemdir.**
-    /*
+    
     fn set_interrupt_handler_gic_example(interrupt_number: usize, handler: extern "C" fn()) {
         let gicc_base: usize = 0x...; // GIC CPU arayüzü base adresi (platforma göre değişir!)
         let interrupt_id = interrupt_number as u32;
@@ -204,6 +204,5 @@ fn set_interrupt_handler(interrupt_number: usize, handler: extern "C" fn()) {
             let gicc_ihr_addr = gicc_base + gicc_ihr_offset as usize + interrupt_id as usize * 4; // Her kesme için ayrı register varsayımı
             core::ptr::write_volatile(gicc_ihr_addr as *mut u32, handler_address);
         }
-    }
-    */
+    }   
 }
