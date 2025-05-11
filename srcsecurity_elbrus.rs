@@ -1,173 +1,153 @@
-#![no_std]
+#![no_std] // Standart kütüphaneye ihtiyaç duymayan, çekirdek alanında çalışacak güvenlik modülü
 
-use core::arch::asm;
+// Geliştirme sırasında kullanılmayan kod veya argümanlar için izinler (geçici olarak açık bırakıldı)
+#![allow(dead_code)]
+#![allow(unused_variables)]
 
-// *** DİKKAT: Bu kod ELBRUS mimarisi için kavramsal bir örnektir ve birebir çalışmayabilir. ***
-// *** Elbrus mimarisine özgü register ve komutlar varsayımsal olarak temsil edilmektedir. ***
-// *** Gerçek Elbrus donanımında çalışacak kod için Elbrus mimarisi referanslarına başvurulmalıdır. ***
+// karnal64.rs dosyasında tanımlanan temel çekirdek tiplerini ve traitlerini içeri aktar.
+// Bu modül, Karnal64'ün iç API'sını ve veri tiplerini kullanarak güvenlik kontrollerini yapar.
+use karnal64::{KError, KTaskId, KThreadId, KHandle};
+// ResourceProvider modları gibi sabitlere de ihtiyacımız olabilir, onları da içeri aktaralım:
+ use karnal64::kresource::{MODE_READ, MODE_WRITE, ...}; // Karnal64 modüllerinden de import gerekebilir.
 
-// Yetenek (Capability) Haklarını daha okunabilir hale getiren sabitler (Kavramsal)
-const CAP_RIGHT_READ: u32 = 0b0001;    // Okuma Hakkı
-const CAP_RIGHT_WRITE: u32 = 0b0010;   // Yazma Hakkı
-const CAP_RIGHT_EXECUTE: u32 = 0b0100; // Çalıştırma Hakkı
-const CAP_RIGHT_NONE: u32 = 0b0000;    // Erişim Yok
+// TODO: Bu güvenlik modülünün ihtiyaç duyabileceği diğer çekirdek içi yönetim modüllerine erişim tanımlamaları.
+// Örneğin, bir görevin güvenlik bağlamını öğrenmek için `ktask` modülüne,
+// bir kaynağın meta verisini sorgulamak için `kresource` modülüne erişim gerekebilir.
+// Gerçek implementasyonda bu erişim şekli (fonksiyon çağrıları, trait objeleri vb.) belirlenmelidir.
+// Şimdilik bu etkileşimlerin olacağını belirten yorumlar bırakalım.
+ mod ktask_internal { /* Yer tutucu */ pub fn get_security_context(id: KTaskId) -> Option<u64> { None } }
+ mod kresource_internal { /* Yer tutucu */ pub fn get_security_metadata(handle: KHandle) -> Option<u64> { None } }
 
-// Yetenek (Capability) yapısı (Kavramsal - Elbrus'a özgü yapı farklı olabilir)
-#[repr(C)] // C-tipi layout ile temsil et (donanım seviyesine yakınlık için)
-#[derive(Debug, Copy, Clone)] // Debug özelliği, kopyalanabilir ve klonlanabilir yap
-pub struct Capability {
-    address: usize, // Bellek bölgesi adresi
-    rights: u32,   // Erişim hakları (yukarıdaki sabitlerden)
+
+/// Elbrus güvenlik modülünün çekirdek içi durumunu, yapılandırmasını veya politikalarını tutan yapı.
+/// Bu yapı, güvenlik kararları verirken kullanılacak kuralları veya veriyi barındırır.
+struct ElbrusSecurityManager {
+    // TODO: Güvenlik politikası kuralları, güvenlik etiketleri, denetim ayarları gibi alanlar eklenecek.
+     policy_rules: Spinlock<PolicyRuleSet>, // Mutex veya Spinlock ile korunmalı
+     audit_log: Spinlock<AuditLogBuffer>,
 }
 
-impl Capability {
-    // Yeni bir yetenek oluşturma fonksiyonu (Kavramsal)
-    pub const fn new(address: usize, rights: u32) -> Self {
-        Capability { address, rights }
-    }
-}
+// Çekirdeğin tek bir güvenlik yöneticisi instance'ına sahip olması yaygın bir desendir.
+// 'no_std' ortamında global mutable state yönetimi (başlatma, senkronizasyon) dikkat gerektirir.
+// Bir 'once' mekanizması veya basit bir 'Option' ve 'unsafe' başlangıçta kullanılabilir.
+static mut ELBRUS_SECURITY_MANAGER: Option<ElbrusSecurityManager> = None;
 
-// Global Yetenek Tablosu (GCT) veya benzeri bir yapı için varsayımsal adres (Elbrus'ta farklı olabilir)
-const GLOBAL_CAPABILITY_TABLE_ADDRESS: usize = 0xFFE00000; // Örnek adres
-
-// Yetenek Kayıtlarını (Capability Registers - CR) ayarlamak için fonksiyon (Kavramsal)
-// Elbrus mimarisinde yeteneklerin yüklenmesi ve kullanılma mekanizması farklı olabilir.
-pub fn load_capability(index: usize, cap: &Capability) {
-    if index >= 8 { // Varsayımsal olarak 8 yetenek kaydı olduğunu düşünelim (Elbrus'ta farklı olabilir)
-        panic!("Geçersiz Yetenek Kayıt İndeksi: {}", index);
-    }
-
-    unsafe {
-        // *** DİKKAT: Aşağıdaki assembly kodu TAMAMEN KAVRAMSALDIR ve ELBRUS için GEÇERLİ DEĞİLDİR. ***
-        // *** Elbrus mimarisinin GERÇEK komutları ve registerları kullanılmalıdır. ***
-        // *** Bu sadece YETENEK KAVRAMINI göstermek için bir örnektir. ***
-
-        // Varsayımsal Elbrus komutları ile yetenek kaydına yükleme (Kavramsal)
-        asm!(
-            // Örneğin: "loadcap cr{}, {}",  (cr: capability register)
-            "mov r1, {}", // Adresi r1 register'ına taşı (varsayımsal)
-            "mov r2, {}", // Hakları r2 register'ına taşı (varsayımsal)
-            "// varsayımsal capability yükleme komutu (örnek)",
-            "// loadcap cr{}, r1, r2", // cr{}: hedef yetenek kaydı, r1: adres, r2: haklar (varsayımsal)
-            index,
-            in(reg) cap.address,
-            in(reg) cap.rights,
-            options(nostack, nomem)
-        );
-    }
-}
-
-// Yetenek ile korunan belleğe erişim fonksiyonu (Kavramsal)
-// Gerçek Elbrus uygulamasında bellek erişimi yetenekler üzerinden otomatik olarak yapılır.
-// Bu fonksiyon sadece kavramsal olarak yetenek kullanımını göstermektedir.
-pub fn access_memory_with_capability(cap_index: usize, address: usize, value: usize, is_write: bool) -> Result<usize, &'static str> {
-    if cap_index >= 8 { // Geçerli yetenek kaydı indeksi kontrolü
-        return Err("Geçersiz Yetenek Kayıt İndeksi");
-    }
-
-    unsafe {
-        // *** DİKKAT: Aşağıdaki assembly kodu TAMAMEN KAVRAMSALDIR ve ELBRUS için GEÇERLİ DEĞİLDİR. ***
-        // *** Elbrus mimarisinin GERÇEK bellek erişim mekanizmaları kullanılmalıdır. ***
-        // *** Bu sadece YETENEK KAVRAMINI göstermek için bir örnektir. ***
-
-        // Varsayımsal Elbrus komutları ile yetenek kullanarak belleğe erişim (Kavramsal)
-        let result: usize;
-        if is_write {
-            asm!(
-                // Örneğin: "store_cap cr{}, {}, {}", (cr: capability register)
-                "mov r3, {}", // Değeri r3 register'ına taşı (varsayımsal)
-                "// varsayımsal capability ile yazma komutu (örnek)",
-                "// store_cap cr{}, {}, r3", // cr{}: yetenek kaydı, {}: hedef adres, r3: değer (varsayımsal)
-                cap_index,
-                in(reg) address,
-                in(reg) value,
-                out("r0") result, // Sonucu r0'a (örnek) yaz
-                options(nostack, nomem)
-            );
-            Ok(result) // Yazma genellikle değer döndürmez, 0 dönebilir (isteğe bağlı)
-        } else {
-            asm!(
-                // Örneğin: "load_cap cr{}, {}, r0", (cr: capability register, r0: hedef register)
-                "// varsayımsal capability ile okuma komutu (örnek)",
-                "// load_cap cr{}, {}, r0", // cr{}: yetenek kaydı, {}: kaynak adres, r0: hedef register (varsayımsal)
-                cap_index,
-                in(reg) address,
-                out("r0") result, // Okunan değeri r0'a (örnek) yaz
-                options(nostack, nomem)
-            );
-            Ok(result) // Okunan değeri döndür
+/// Elbrus güvenlik modülünü başlatır.
+/// Bu fonksiyon, çekirdek boot sürecinin başlarında,
+/// `karnal64::init()` içinde veya onun tarafından çağrılmalıdır.
+pub fn init() {
+    // TODO: Güvenlik yöneticisinin gerçek başlatma mantığı.
+    // Politikaların yüklenmesi, iç veri yapılarının oluşturulması gibi adımlar burada yapılır.
+    unsafe { // Global mutable statik değişkene erişim 'unsafe' gerektirir.
+        if ELBRUS_SECURITY_MANAGER.is_none() {
+            ELBRUS_SECURITY_MANAGER = Some(ElbrusSecurityManager {
+                // TODO: ElbrusSecurityManager alanları başlatılacak
+            });
+            // Güvenlik modülünün başarıyla başlatıldığını belirten bir çekirdek mesajı (varsayılan print!)
+            #[cfg(feature = "kernel_debug_print")] // Debug buildlerde aktif olabilir
+            println!("Elbrus Güvenlik Modülü Başlatıldı.");
         }
     }
 }
 
+/// Bir görevin (Task) yeni bir görev başlatma (spawn) yetkisini güvenlik politikasına göre kontrol eder.
+/// Bu fonksiyon, `ktask` modülündeki görev yaratma mantığı tarafından veya
+/// `karnal64::task_spawn` API fonksiyonu içinde, spawn işlemi gerçekleşmeden önce çağrılmalıdır.
+///
+/// # Argümanlar
+/// * `spawner_task_id`: Yeni görevi başlatmaya çalışan mevcut görevin kimliği.
+/// * `code_resource_handle`: Çalıştırılacak kodun bulunduğu kaynağın handle'ı.
+///
+/// # Dönüş Değeri
+/// İşleme izin veriliyorsa `Ok(())`, güvenlik politikası engelliyorsa `Err(KError::PermissionDenied)`.
+pub fn check_task_spawn(spawner_task_id: KTaskId, code_resource_handle: KHandle) -> Result<(), KError> {
+    // TODO: Gerçek görev başlatma yetki kontrol mantığı implemente edilecek.
+    // - `spawner_task_id`'nin güvenlik bağlamını al (ktask modülü üzerinden).
+    // - `code_resource_handle`'ın güvenlik etiketini/özelliklerini al (kresource modülü üzerinden).
+    // - Yüklü güvenlik politikası kurallarına göre bu işleme izin verilip verilmediğini kontrol et.
+    // - Gerekirse denetim kaydı (audit log) oluştur.
 
-// Yetenek yapılandırmasını başlatmak için fonksiyon (Kavramsal örnek)
-pub fn init_capabilities() {
-    // Çekirdek (Kernel) bellek bölgesi tanımları (Örnek adresler)
-    let kernel_start = 0x10000;        // Çekirdek kodunun başlangıç adresi (Örnek)
-    let kernel_size = 0x2000;         // Çekirdek kodunun boyutu (8KB = 0x2000 bayt - Örnek)
-    let kernel_end = kernel_start + kernel_size; // Çekirdek kodunun bitiş adresi (Üst Sınır - Örnek)
+    #[cfg(feature = "kernel_debug_print")]
+    println!("Elbrus Güvenlik: Görev {} tarafından handle {} ile spawn kontrolü yapılıyor...",
+             spawner_task_id.0, code_resource_handle.0);
 
-    // Çekirdek yığını (Kernel Stack) bellek bölgesi tanımları (Örnek adresler)
-    let kernel_stack_start = kernel_end;    // Çekirdek yığınının başlangıç adresi (çekirdek kodundan hemen sonra - Örnek)
-    let kernel_stack_size = 0x1000;       // Çekirdek yığınının boyutu (4KB = 0x1000 bayt - Örnek)
-    let kernel_stack_end = kernel_stack_start + kernel_stack_size; // Çekirdek yığınının bitiş adresi (Üst Sınır - Örnek)
-
-
-    // 1. Yetenek: Çekirdek kodu için (Okuma ve Çalıştırma - Read & Execute)
-    // Yetenek Kayıt İndeksi 0'a yükle (Örnek)
-    let kernel_code_cap = Capability::new(kernel_start as usize, CAP_RIGHT_READ | CAP_RIGHT_EXECUTE);
-    load_capability(0, &kernel_code_cap);
-    // Açıklama: Yetenek Kayıt 0, kernel_start - kernel_end adres aralığını (8KB çekirdek kodu - örnek)
-    // Okuma ve Çalıştırma erişimine izin verir.
-
-    // Belleğe erişim örneği (çekirdek kodunu okuma - kavramsal)
-    match access_memory_with_capability(0, kernel_start as usize, 0, false) {
-        Ok(value) => {
-            //println!("Çekirdek kodundan okunan değer: {:X}", value); // Eğer yazdırma aktifse
-        },
-        Err(e) => {
-            panic!("Çekirdek koduna erişim hatası: {}", e);
-        }
+    // Geçici Yer Tutucu Mantığı: Basit bir kural uygulayalım.
+    // Örneğin, sadece belirli bir handle'daki kodun spawn edilmesine izin verelim.
+    if code_resource_handle.0 == 0xCAFEBABE { // Örnek: "Güvenilir Kod" handle'ı
+        #[cfg(feature = "kernel_debug_print")]
+        println!("Elbrus Güvenlik: Spawn işlemi İZİN VERİLDİ (Güvenilir Kod).");
+        Ok(()) // İzin verildi
+    } else {
+        #[cfg(feature = "kernel_debug_print")]
+        println!("Elbrus Güvenlik: Spawn işlemi REDDEDİLDİ (Güvenilir Olmayan Kod).");
+        Err(KError::PermissionDenied) // İzin reddedildi
     }
-
-
-    // 2. Yetenek: Çekirdek yığını için (Okuma ve Yazma - Read & Write)
-    // Yetenek Kayıt İndeksi 1'e yükle (Örnek)
-    let kernel_stack_cap = Capability::new(kernel_stack_start as usize, CAP_RIGHT_READ | CAP_RIGHT_WRITE);
-    load_capability(1, &kernel_stack_cap);
-    // Açıklama: Yetenek Kayıt 1, kernel_stack_start - kernel_stack_end adres aralığını (4KB çekirdek yığını - örnek)
-    // Okuma ve Yazma erişimine izin verir.
-
-    // Belleğe erişim örneği (çekirdek yığınına yazma - kavramsal)
-    match access_memory_with_capability(1, kernel_stack_start as usize, 0x12345678, true) {
-        Ok(_) => {
-            //println!("Çekirdek yığınına yazma başarılı"); // Eğer yazdırma aktifse
-        },
-        Err(e) => {
-            panic!("Çekirdek yığınına erişim hatası: {}", e);
-        }
-    }
-
-
-    // 3. Yetenek: "Her şeyi engelle" (Default Deny) yeteneği (Kavramsal - Tüm adres uzayını kapsar)
-    // Yetenek Kayıt İndeksi 2'ye yükle (Örnek)
-    let default_deny_cap = Capability::new(0x0, CAP_RIGHT_NONE); // 0 adresi ve erişim yok hakkı (Kavramsal)
-    load_capability(2, &default_deny_cap);
-    // Açıklama: Yetenek Kayıt 2, 0x0 adresinden başlayan bölge için Erişim Yok hakkı verir (Kavramsal).
-    // Gerçek Elbrus mimarisinde "default deny" farklı mekanizmalarla sağlanabilir.
-
-    // Belleğe erişim örneği (izin verilmeyen bölgeye erişim denemesi - kavramsal)
-    match access_memory_with_capability(2, 0x0 as usize, 0, false) { // 0x0 adresine erişim denemesi
-        Ok(_) => {
-            panic!("HATA: İzin verilmeyen bölgeye erişim BAŞARILI olmamalıydı!"); // Hata durumu
-        },
-        Err(e) => {
-            //println!("İzin verilmeyen bölgeye erişim ENGELENDİ (beklendiği gibi): {}", e); // Eğer yazdırma aktifse
-        }
-    }
-
-
-    // Diğer Yetenek Kayıtlarını gerektiği gibi yapılandırın... (Örnek: çevre birimleri, farklı görevler vb.)
-    // Yetenek kayıt indeksleri 3'ten 7'ye kadar (varsayımsal 8 kayıt varsayımıyla) kullanılabilir.
 }
+
+/// Bir görevin veya iş parçacığının belirli bir kaynağa (Resource) belirli bir modda
+/// (okuma, yazma, kontrol vb.) erişim yetkisini güvenlik politikasına göre kontrol eder.
+/// Bu fonksiyon, `kresource` modülündeki ilgili erişim fonksiyonları (`read`, `write`, `control`) veya
+/// `karnal64::resource_read/write/control` gibi API fonksiyonları içinde, erişim işlemi öncesinde çağrılmalıdır.
+///
+/// # Argümanlar
+/// * `accessor_id`: Kaynağa erişmeye çalışan görevin veya iş parçacığının kimliği (KTaskId veya KThreadId olabilir).
+/// * `resource_handle`: Erişilmek istenen kaynağın handle'ı.
+/// * `requested_mode`: Talep edilen erişim modu bayrakları (Örn: `karnal64::kresource::MODE_READ`).
+///
+/// # Dönüş Değeri
+/// İşleme izin veriliyorsa `Ok(())`, güvenlik politikası engelliyorsa `Err(KError::PermissionDenied)`.
+// Not: accessor_id için KTaskId ve KThreadId ayrı ayrı ele alınabilir veya bir enum kullanılabilir.
+// Şimdilik KTaskId üzerinden ilerleyelim.
+pub fn check_resource_access(accessor_task_id: KTaskId, resource_handle: KHandle, requested_mode: u32) -> Result<(), KError> {
+    // TODO: Gerçek kaynak erişim yetki kontrol mantığı implemente edilecek.
+    // - `accessor_task_id`'nin güvenlik bağlamını al.
+    // - `resource_handle`'ın güvenlik etiketini, sahibini veya türünü al.
+    // - Talep edilen `requested_mode`'un (READ, WRITE vb.), kullanıcının bağlamı ve kaynağın özelliklerine göre
+    //   politika tarafından izinli olup olmadığını kontrol et.
+    // - Denetim kaydı oluştur.
+
+    #[cfg(feature = "kernel_debug_print")]
+    println!("Elbrus Güvenlik: Görev {} tarafından handle {} (Mod: {}) erişim kontrolü yapılıyor...",
+             accessor_task_id.0, resource_handle.0, requested_mode);
+
+    // Geçici Yer Tutucu Mantığı: Basit bir kural uygulayalım.
+    // Örneğin, sadece "admin" güvenlik bağlamına sahip görevlerin yazma izni olsun.
+    // Görevin bağlamını almak için ktask modülüne ihtiyacımız var.
+     let task_context = ktask_internal::get_security_context(accessor_task_id);
+
+    // Varsayım: TaskID 1001 "admin" bağlamına sahip
+    if accessor_task_id.0 == 1001 {
+         // Admin her şeye yazabilir varsayalım
+         #[cfg(feature = "kernel_debug_print")]
+         println!("Elbrus Güvenlik: Admin görevi (Task {}) erişim İZİN VERİLDİ.", accessor_task_id.0);
+         Ok(()) // İzin verildi
+    } else {
+        // Admin olmayanlar sadece okuyabilir varsayalım (basit örnek)
+        // Karnal64'teki MODE_WRITE gibi sabitlere erişim gerek
+         if requested_mode == karnal64::kresource::MODE_WRITE {
+             #[cfg(feature = "kernel_debug_print")]
+             println!("Elbrus Güvenlik: Admin olmayan görev (Task {}) yazma erişimi REDDEDİLDİ.", accessor_task_id.0);
+             Err(KError::PermissionDenied) // Yazma izni yok
+         } else {
+            #[cfg(feature = "kernel_debug_print")]
+            println!("Elbrus Güvenlik: Admin olmayan görev (Task {}) erişim İZİN VERİLDİ (Yazma değilse).", accessor_task_id.0);
+            Ok(()) // Yazma dışında izin verildi varsayalım
+         }
+    }
+}
+
+// TODO: Bellek erişimi, IPC (görevler arası iletişim), ağ işlemleri gibi diğer güvenlik kontrolleri için
+// benzer `check_*` fonksiyonları eklenecektir.
+ pub fn check_memory_access(task_id: KTaskId, address: u64, size: usize, permissions: u32) -> Result<(), KError> { ... }
+ pub fn check_ipc_message(sender_id: KTaskId, receiver_id: KTaskId, message_data: &[u8]) -> Result<(), KError> { ... }
+
+
+// TODO: Güvenlik bağlamlarını ayarlamak, denetim kaydı yazmak gibi çekirdek içi yardımcı fonksiyonlar.
+ pub fn set_task_security_context(task_id: KTaskId, context: SecurityContext) { ... }
+ pub fn audit_event(event: AuditEvent) { ... }
+
+
+// --- İç Yardımcı Fonksiyonlar (Gerekirse) ---
+// Güvenlik politikası lookup'ı, etiket karşılaştırmaları gibi detaylar burada implemente edilebilir.
+ fn lookup_policy_rule(...) -> ... { ... }
+ fn compare_security_labels(...) -> ... { ... }
