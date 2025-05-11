@@ -1,138 +1,205 @@
-#![no_std]
+#![no_std] // Standart kütüphaneye ihtiyaç duymuyoruz, çekirdek alanında çalışırız
 
-use core::arch::asm;
+// SPARC mimarisi için güvenlik ve düşük seviye donanım etkileşimleri
 
-// SPARC için bellek erişim kontrol sabitleri (mimariye özgü)
-// Not: SPARC mimarisi, RISC-V PMP gibi doğrudan bir PMP mekanizmasına sahip olmayabilir.
-// Aşağıdaki sabitler ve fonksiyonlar kavramsal ve örnek amaçlıdır.
-// Gerçek bir SPARC sisteminde MMU (Memory Management Unit) veya benzeri birimler
-// bellek koruma için kullanılabilir. Bu örnek, SPARC mimarisindeki olası
-// güvenlik mekanizmalarını yüksek seviyede temsil etmeyi amaçlar.
+// Karnal64 çekirdek API'sından gerekli tipleri ve modülleri kullan
+// (karnal64 çekirdeğin ana modülü veya crate'i olarak kabul ediliyor)
+use karnal64::{KError, KHandle, KTaskId}; // Temel tipler
+// Kavramsal olarak, mimariye özel güvenlik kodu şu Karnal64 alt sistemleriyle etkileşebilir:
+use karnal64::kmemory; // Bellek yönetimi işlemleri için (örneğin sayfa tablosu yönetimi)
+use karnal64::ktask;   // Görev/iş parçacığı bağlamı ve durum yönetimi için
+// Diğer Karnal64 modülleri de gerekirse kullanılabilir (ksync, kmessaging vb.)
 
-// Bellek Bölgesi Erişim Hakları (Örnek Sabitler)
-const SPARC_MEM_ACCESS_NONE: u32 = 0b000; // Erişim Yok
-const SPARC_MEM_ACCESS_READ: u32 = 0b001; // Sadece Okuma
-const SPARC_MEM_ACCESS_WRITE: u32 = 0b010; // Sadece Yazma
-const SPARC_MEM_ACCESS_RW: u32 = 0b011;  // Okuma ve Yazma
-const SPARC_MEM_ACCESS_EXECUTE: u32 = 0b100; // Çalıştırma
-const SPARC_MEM_ACCESS_RX: u32 = 0b101;  // Okuma ve Çalıştırma
-const SPARC_MEM_ACCESS_RWX: u32 = 0b111; // Okuma, Yazma ve Çalıştırma
+// Geliştirme sırasında kullanılmayan kod veya argümanlar için izinler
+#![allow(dead_code)]
+#![allow(unused_variables)]
 
-// Bellek Bölgesi Özellikleri (Örnek Sabitler)
-const SPARC_MEM_REGION_KERNEL: u32 = 0b001; // Çekirdek Bölgesi
-const SPARC_MEM_REGION_USER: u32 = 0b010;   // Kullanıcı Bölgesi
-const SPARC_MEM_REGION_PERIPHERAL: u32 = 0b100; // Çevre Birimi Bölgesi
-const SPARC_MEM_REGION_LOCKED: u32 = 0b1000; // Kilitli Bölge (değiştirilemez)
+// --- SPARC Mimariye Özgü Kayıtlar ve Sabitler (Yer Tutucular) ---
+// Bunlar gerçek SPARC mimarisine göre detaylandırılmalıdır.
+// Örneğin: Processor State Register (PSR), Trap Table Base Register (TTBR), MMU kontrol kayıtları.
 
-
-// Bellek bölgesi yapılandırma fonksiyonu (kavramsal - SPARC'e özgü registerlara erişim)
-// Not: Bu fonksiyon SPARC mimarisindeki gerçek registerlara doğrudan erişimi temsil etmez.
-// SPARC mimarisine ve kullanılan güvenlik mekanizmasına (MMU vb.) bağlı olarak
-// gerçek yapılandırma yöntemi değişiklik gösterecektir.
-pub fn configure_memory_region(start_addr: usize, end_addr: usize, access_flags: u32, region_flags: u32) {
-    // Adres aralığı ve bayrak kontrolleri (isteğe bağlı)
-    if start_addr >= end_addr {
-        panic!("Geçersiz adres aralığı: başlangıç >= bitiş");
-    }
-    if access_flags > 0b111 { // Örnek erişim bayrakları için kontrol
-        panic!("Geçersiz erişim bayrakları");
-    }
-    if region_flags > 0b1111 { // Örnek bölge bayrakları için kontrol
-        panic!("Geçersiz bölge bayrakları");
-    }
-
-    unsafe {
-        // **Kavramsal SPARC Bellek Kontrol Registerlarına Yazma İşlemi**
-        // Gerçek SPARC sistemlerinde bellek koruma mekanizmaları (MMU, vb.)
-        // farklı registerlar ve yöntemler kullanılarak yapılandırılır.
-        // Aşağıdaki assembly kodları sadece örnek ve temsilidir, gerçek bir SPARC sisteminde
-        // doğrudan çalışmayabilir. Mimariye özgü referans kılavuzlarına başvurulmalıdır.
-
-        // Örnek: Bellek Bölgesi Başlangıç Adresini Ayarlama (Kavramsal Register)
-        asm!(
-            "mov {}, %r10", // Örnek SPARC komutu: değeri register'a taşı
-            in(reg) start_addr,
-            options(nostack, nomem)
-        );
-
-        // Örnek: Bellek Bölgesi Bitiş Adresini Ayarlama (Kavramsal Register)
-        asm!(
-            "mov {}, %r11", // Örnek SPARC komutu: değeri register'a taşı
-            in(reg) end_addr,
-            options(nostack, nomem)
-        );
-
-        // Örnek: Erişim Haklarını ve Bölge Özelliklerini Ayarlama (Kavramsal Register)
-        asm!(
-            "or {}, {}, %r12", // Örnek SPARC komutu: OR işlemi ile bayrakları birleştir
-            in(reg) access_flags,
-            in(reg) region_flags,
-            options(nostack, nomem)
-        );
-
-        // Örnek: Bellek Bölgesi Yapılandırma Register'ına Yazma (Kavramsal Register)
-        asm!(
-            "wr %r12, %asr", // Örnek SPARC komutu: Register'ı Adres Alanı Register'ına yaz
-            options(nostack, nomem)
-        );
-
-        // Not: Yukarıdaki assembly kodları tamamen kavramsal ve örnek amaçlıdır.
-        // Gerçek SPARC mimarisinde bellek koruma yapılandırması farklı mekanizmalar
-        // ve registerlar aracılığıyla yapılabilir. Bu örnek sadece genel bir fikir vermek için tasarlanmıştır.
-        // Lütfen hedef SPARC mimarisinin ve kullanılan bellek yönetim biriminin (MMU)
-        // teknik dokümantasyonuna başvurun.
-    }
+#[repr(C)] // C uyumluluğu gerekebilir
+pub struct SparcRegisters {
+    // Genel amaçlı kayıtlar (g0-g7, o0-o7, l0-l7, i0-i7)
+    // Pencere yönetimi için CWP (Current Window Pointer) gibi.
+    // PSR, TTBR gibi durum kayıtları.
+    // ... gerçek SPARC kayırları buraya eklenecek ...
+    placeholder: u64, // Yer tutucu
 }
 
-// Güvenlik yapılandırmasını başlatma fonksiyonu (SPARC için örnek)
-pub fn init_security() {
-    // Çekirdek (Kernel) bellek bölgesi tanımları (örnek adresler)
-    let kernel_start_sparc = 0x40000000; // Örnek çekirdek başlangıç adresi
-    let kernel_size_sparc = 0x4000;    // Örnek çekirdek boyutu (16KB)
-    let kernel_end_sparc = kernel_start_sparc + kernel_size_sparc;
+// SPARC Trap Vektörleri ile ilgili sabitler (Yer Tutucular)
+const SPARC_TRAP_TYPE_SYSCALL: u66 = 0x10; // Örnek trap tipi, gerçek değere bakılmalı
+// ... diğer trap tipleri ...
 
-    // 1. Bellek Bölgesi: Çekirdek kodu için (Okuma ve Çalıştırma - RX, Çekirdek Bölgesi, Kilitli)
-    configure_memory_region(
-        kernel_start_sparc,
-        kernel_end_sparc,
-        SPARC_MEM_ACCESS_RX,
-        SPARC_MEM_REGION_KERNEL | SPARC_MEM_REGION_LOCKED,
-    );
+// --- Karnal64 Tarafından Çağrılacak Mimariye Özel Güvenlik Fonksiyonları ---
+// Bu fonksiyonlar, Karnal64'ün genel başlatma, görev yönetimi veya istisna işleme
+// mantığı tarafından çağrılabilir.
 
-    // Çekirdek yığını (Kernel Stack) bellek bölgesi tanımları (örnek adresler)
-    let kernel_stack_start_sparc = kernel_end_sparc; // Çekirdek yığını başlangıcı (çekirdek kodundan sonra)
-    let kernel_stack_size_sparc = 0x2000;   // Örnek çekirdek yığını boyutu (8KB)
-    let kernel_stack_end_sparc = kernel_stack_start_sparc + kernel_stack_size_sparc;
+/// SPARC mimarisine özel güvenlik ve donanım bileşenlerini başlatır.
+/// Çekirdeğin genel init() fonksiyonu tarafından çağrılmalıdır.
+pub fn init_security() -> Result<(), KError> {
+    println!("security_sparc: SPARC Güvenlik Başlatılıyor..."); // Kernel içi print! varsayımı
 
-    // 2. Bellek Bölgesi: Çekirdek yığını için (Okuma ve Yazma - RW, Çekirdek Bölgesi, Kilitli)
-    configure_memory_region(
-        kernel_stack_start_sparc,
-        kernel_stack_end_sparc,
-        SPARC_MEM_ACCESS_RW,
-        SPARC_MEM_REGION_KERNEL | SPARC_MEM_REGION_LOCKED,
-    );
+    // TODO: SPARC MMU'yu başlangıç durumu için yapılandır (sayfa tablolarını kurma, etkinleştirme vb.)
+    // Bu adım, kmemory modülünün düşük seviye desteğini veya callback'lerini gerektirebilir.
+    setup_mmu()?;
 
-    // 3. Bellek Bölgesi: Çevre Birimleri (Peripherals) için (Örnek - Okuma/Yazma, Çevre Birimi Bölgesi)
-    let peripheral_start_sparc = 0x80000000; // Örnek çevre birimleri başlangıç adresi
-    let peripheral_size_sparc = 0x10000;  // Örnek çevre birimleri boyutu (64KB)
-    let peripheral_end_sparc = peripheral_start_sparc + peripheral_size_sparc;
+    // TODO: SPARC Trap Vektör Tablosunu ayarla.
+    // Sistemin trap'ları (sistem çağrıları, page faultlar, donanım kesmeleri)
+    // nasıl işleyeceğini belirler.
+    setup_trap_table()?;
 
-    configure_memory_region(
-        peripheral_start_sparc,
-        peripheral_end_sparc,
-        SPARC_MEM_ACCESS_RW,
-        SPARC_MEM_REGION_PERIPHERAL, // Kilitli değil - çevre birimleri yapılandırması değişebilir
-    );
+    // TODO: Başlangıç privilege seviyelerini ayarla (Kernel/Supervisor mode)
+    // Çekirdeğin doğru privilege seviyesinde çalıştığından emin ol.
 
-    // 4. Bellek Bölgesi: "Her şeyi engelle" (Default Deny) bölgesi - Kalan adres alanı (Örnek)
-    // Not: SPARC mimarisine ve kullanılan bellek koruma mekanizmasına göre
-    // "her şeyi engelle" bölgesi yapılandırması farklılık gösterebilir.
-    configure_memory_region(
-        0x0,                  // Örnek başlangıç adresi - tüm alt adresleri kapsar
-        0x1000,               // Örnek bitiş adresi - düşük bir aralık (gerçek sistemde ayarlanmalı)
-        SPARC_MEM_ACCESS_NONE,
-        0, // Genel bölge (kilitli değil - isteğe bağlı olarak ayarlanabilir)
-    );
+    println!("security_sparc: SPARC Güvenlik Başlatıldı.");
+    Ok(())
+}
 
-    // Diğer bellek bölgeleri ve güvenlik yapılandırmaları eklenebilir...
+/// Bir görev için SPARC'a özel başlangıç bağlamını (kayıtlar, stack pointer) oluşturur.
+/// ktask::task_spawn gibi fonksiyonlar tarafından çağrılabilir.
+/// `entry_point`: Görevin başlayacağı sanal adres.
+/// `stack_top`: Göreve tahsis edilen stack'in en üst adresi (genellikle stack aşağı doğru büyür).
+/// `arg`: Göreve iletilen argüman değeri veya pointer'ı.
+/// Döndürülen değer, zamanlayıcının kullanacağı bağlam yapısı olabilir.
+pub fn create_initial_task_context(
+    entry_point: u64,
+    stack_top: u64,
+    arg: u64,
+) -> Result<SparcRegisters, KError> {
+    println!("security_sparc: Yeni Görev Bağlamı Oluşturuluyor...");
+
+    // TODO: Başlangıç SPARC kayıt değerlerini ayarla.
+    // - Program Sayacı (PC) entry_point'e ayarlanmalı.
+    // - Stack Pointer (SP) stack_top'a ayarlanmalı.
+    // - Argüman(lar) uygun kayıt(lar)a (örn. o0) yerleştirilmeli.
+    // - Privilege seviyesi kullanıcı modu (User mode) olarak ayarlanmalı (PSR kaydında).
+    // - Pencere durumu ayarlanmalı.
+    let mut initial_regs: SparcRegisters = unsafe { core::mem::zeroed() };
+
+    // Örnek yer tutucu atamalar (gerçek kayıt isimleri SPARC modeline göre değişir)
+     initial_regs.pc = entry_point;
+     initial_regs.sp = stack_top;
+     initial_regs.o0 = arg;
+     initial_regs.psr = // Kullanıcı modu bitleri ayarlanacak
+
+    println!("security_sparc: Görev Bağlamı Oluşturuldu.");
+    Ok(initial_regs)
+}
+
+/// Görev veya iş parçacığı bağlamını değiştirmek için SPARC'a özel mantık.
+/// ktask zamanlayıcısı tarafından çağrılabilir.
+/// `old_regs`: Mevcut (ayrılacak) görev/iş parçacığının kayıtları.
+/// `new_regs`: Yeni (girilecek) görev/iş parçacığının kayıtları.
+/// Güvenlik Notu: Kayıt pencerelerinin yönetimi kritik öneme sahiptir.
+pub fn switch_context(old_regs: &mut SparcRegisters, new_regs: &SparcRegisters) {
+    // println!("security_sparc: Bağlam Değiştiriliyor..."); // Bu kritik yolda çok sık çağrılır, dikkatli loglama
+
+    // TODO: Mevcut SPARC kayıtlarını (özellikle pencereleri) old_regs içine kaydet.
+    // TODO: Yeni SPARC kayıtlarını new_regs'ten donanıma yükle.
+    // Bu genellikle düşük seviye assembly gerektirir.
+    unsafe {
+        // Örnek: Kayıt penceresini kaydetme ve geri yükleme ile ilgili assembly çağrıları
+         asm!("save %sp, -96, %sp", options(nostack, nomem)); // Örnek SAVE
+        // ... kayıtları kaydetme ...
+        // ... kayıtları yükleme ...
+         asm!("restore %g0, %g0, %g0", options(nostack, nomem)); // Örnek RESTORE
+    }
+
+    // println!("security_sparc: Bağlam Değiştirildi.");
+}
+
+/// SPARC mimarisine özel trap (kesme, istisna, sistem çağrısı) işleyicisi.
+/// SPARC trap vektör tablosu tarafından çağrılacak düşük seviyeli giriş noktası.
+/// `trap_frame_ptr`: Trap anındaki mimariye özel kayıtları içeren yapının pointer'ı.
+/// Çekirdeğin genel trap işleme mantığına (örneğin sistem çağrıları için handle_syscall'a) yönlendirme yapar.
+#[no_mangle] // Düşük seviyeli işleyici tarafından çağrılabilmesi için isim düzenlemesi yapılmaz
+pub extern "C" fn sparc_trap_handler(trap_frame_ptr: *mut SparcRegisters) {
+     println!("security_sparc: Trap Yakalandı!"); // Dikkatli loglama
+
+    // TODO: Trap frame pointer'ının geçerli olduğunu doğrula.
+    if trap_frame_ptr.is_null() {
+        // Kritik hata: Geçersiz trap frame! Sistemi durdur?
+        println!("security_sparc: HATA: Geçersiz trap frame pointer!");
+        // TODO: Kurtarılamaz hata işleme mekanizması
+        loop {}
+    }
+
+    let trap_frame = unsafe { &mut *trap_frame_ptr };
+
+    // TODO: Trap tipini trap frame'den veya ilgili donanım kaydından belirle.
+     let trap_type = get_sparc_trap_type(trap_frame);
+
+    match trap_type { // Varsayımsal trap_type değişkeni
+        SPARC_TRAP_TYPE_SYSCALL => {
+            // Sistem çağrısı trapi
+            println!("security_sparc: Sistem Çağrısı Trapi!");
+
+            // TODO: Sistem çağrısı numarasını ve argümanlarını trap frame'den veya kayıtlardan al.
+            // SPARC'ta sistem çağrısı argümanları genellikle belirli kayıtlarda bulunur (o0, o1, vb.).
+             Let syscall_number = trap_frame.g1; // Örnek: g1'de syscall no olduğunu varsayalım
+             Let arg1 = trap_frame.o0;
+            // ... diğer argümanlar ...
+
+            // Karnal64'ün genel sistem çağrısı işleyicisini çağır.
+            // Bu fonksiyon, syscall numarasını ve ham argümanları alır.
+            // handle_syscall, karnal64.rs içinde tanımlanan fonksiyon.
+            let result = karnal64::handle_syscall(
+                syscall_number,
+                arg1,
+                arg2, // Varsayımsal diğer argümanlar
+                arg3,
+                arg4,
+                arg5,
+            );
+
+            // TODO: Sistem çağrısı sonucunu (result) trap frame'deki uygun kayıt(lar)a yaz.
+            // Kullanıcı alanına dönecek değer genellikle o0 kaydına konur.
+            // Hata durumunda (negatif i64) bu da uygun şekilde işaretlenir/işlenir.
+            // trap_frame.o0 = result as u64; // Başarı değeri
+            // Eğer hata ise, bir flag kaydı veya başka bir mekanizma kullanılabilir.
+        }
+        // TODO: Diğer trap tipleri için işleyiciler:
+        // - Page Fault (Bellek hatası): kmemory modülünün fault işleyicisini çağırabilir.
+        // - Illegal Instruction (Geçersiz komut): Süreci sonlandırabilir veya sinyal gönderebilir.
+        // - Alignment Error (Hizalama hatası):
+        // - Hardware Interrupt (Donanım kesmesi): Aygıt sürücülerinin veya çekirdek kesme işleyicisini çağırabilir.
+        _ => {
+            // Bilinmeyen veya işlenmeyen trap tipi
+            println!("security_sparc: İşlenmeyen Trap Tipi: {}", trap_type);
+            // TODO: Hata raporlama ve belki görev sonlandırma
+            loop {} // Geçici olarak sistemi durdur
+        }
+    }
+
+    // Trap işleyiciden çıkış. Donanım, trap frame'deki duruma göre kullanıcı alanına dönecektir.
+    // Kayıt pencerelerinin doğru yönetimi burada kritiktir.
+}
+
+// --- Yardımcı Fonksiyonlar ve Dahili Implementasyonlar (Yer Tutucular) ---
+
+/// SPARC MMU'yu başlangıç için yapılandırır.
+fn setup_mmu() -> Result<(), KError> {
+    println!("security_sparc: MMU yapılandırılıyor...");
+    // TODO: SPARC MMU'ya özel kayıtları ayarla (örneğin, Page Table Base Register'ı).
+    // TODO: Başlangıç sayfa tablolarını oluştur (çekirdek kodu/verisi, boot stack'i vb. için).
+    // Bu adım, kmemory modülünün fiziksel bellek ayırıcısından sayfa çerçeveleri
+    // tahsis etmeyi gerektirebilir.
+     let kernel_page_table = kmemory::create_kernel_page_table()?; // Varsayımsal Karnal64 çağrısı
+
+    println!("security_sparc: MMU yapılandırması tamamlandı.");
+    Ok(())
+}
+
+/// SPARC Trap Vektör Tablosunu ayarlar.
+fn setup_trap_table() -> Result<(), KError> {
+    println!("security_sparc: Trap Tablosu ayarlanıyor...");
+    // TODO: sparc_trap_handler fonksiyonunun adresini al.
+    // TODO: Bu adresi SPARC'ın Trap Table Base Register (TTBR) kaydına yaz.
+    // Tüm trap'lar artık sparc_trap_handler'a yönlendirilecektir.
+    let handler_address = sparc_trap_handler as *const ();
+     write_sparc_ttbr(handler_address as u64); // Varsayımsal donanım yazma fonksiyonu
+
+    println!("security_sparc: Trap Tablosu ayarlandı.");
+    Ok(())
 }
