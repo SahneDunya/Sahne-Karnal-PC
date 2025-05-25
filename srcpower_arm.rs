@@ -1,196 +1,259 @@
-#![no_std] // Standart kütüphaneye ihtiyaç duymuyoruz, çekirdek alanında çalışırız
+#![no_std]
+#![allow(dead_code)]
+#![allow(unused_variables)]
 
-// Geliştirme sırasında kullanılmayan kod veya argümanlar için izinler
- #![allow(dead_code)] // Artık bu dosyanın kullanılması bekleniyor
-#![allow(unused_variables)] // Argümanlar henüz tam kullanılmıyor olabilir
-
-// Karnal64 API'sından gerekli bileşenleri içe aktar
-// Proje yapınıza bağlı olarak 'crate::karnal64' yerine 'super::karnal64' veya başka bir yol olabilir.
-use crate::karnal64::{
-    KError,
-    KHandle,
-    ResourceProvider, // Güç yöneticisini bir kaynak olarak göstermek için
-    KseekFrom, // ResourceProvider trait'i gerektiriyorsa
-    KResourceStatus, // ResourceProvider trait'i gerektiriyorsa
-    kresource, // Kaynak yöneticisi modülü
-};
-
-// ARM mimarisine özgü düşük seviye fonksiyonlar veya inline assembly için modül
-mod arm_low_level {
-    // Bu modül, ARM'ın 'Wait For Interrupt (WFI)' veya 'Wait For Event (WFE)' gibi
-    // düşük güç komutlarını içeren assembly kodlarını veya intrinsics'lerini barındıracaktır.
-    // Örnek: WFI için bir intrinsic fonksiyonu (varsayımsal)
-    #[inline(always)]
-    pub fn arm_wfi() {
-        // TODO: Gerçek ARM WFI assembly komutunu buraya ekle
-        unsafe { asm!("wfi"); } // rust-lang/asm projesini gerektirir
-        // Şimdilik bir yer tutucu:
-        #[cfg(target_arch = "aarch64")] // ARM64 için örnek
-        unsafe {
-             core::arch::asm!("wfi");
-        }
-         #[cfg(target_arch = "arm")] // ARM32 için örnek
-        unsafe {
-             core::arch::asm!("wfi");
-        }
-         #[cfg(not(any(target_arch = "aarch64", target_arch = "arm")))]
-         // Eğer ARM/ARM64 derlemiyorsak, bu fonksiyon bir şey yapmasın veya hata versin
-         {
-             println!("WARNING: arm_wfi called on non-ARM arch!"); // Kernel print! gerektirir
-         }
-    }
-
-    // TODO: Diğer güç yönetimiyle ilgili ARM'a özgü fonksiyonlar (örn. CPU frekans ayarı, cache temizleme vb.)
+// --- Güç Yönetimi Standartları Enum'u ---
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum PowerStandard {
+    Acpi,
+    Scmi,
+    Psci,
+    Bsa,
+    Bbr,
 }
 
-
-// Güç yönetimi için özel kontrol komut kodları
-// Karnal64'ün ResourceProvider::control metodu için kullanılacak komutlar
-pub const POWER_REQ_SLEEP: u64 = 1; // Basit uyku moduna geçme isteği
-pub const POWER_REQ_DEEP_SLEEP: u64 = 2; // Derin uyku moduna geçme isteği (TODO: implementasyon detayları)
-// TODO: Diğer güç yönetimi komutları (örn. CPU frekansını ayarla, belirli bir süre uyu)
-
-
-/// ARM mimarisine özgü güç yönetimi kaynağını temsil eden yapı.
-/// Karnal64'ün ResourceProvider trait'ini implemente edecek.
-pub struct ArmPowerManager {
-    // TODO: Güç yöneticisinin iç durumu (örn. desteklenen modlar, mevcut durum vb.)
-    // Belki bir referans sayacı veya kilit mekanizması gerekebilir?
+// --- Güç Durumları ---
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum PowerState {
+    Sleep,
+    Hibernate,
+    PowerOff,
+    Performance,
+    Powersave,
 }
 
-impl ArmPowerManager {
-    /// Yeni bir ArmPowerManager instance'ı oluşturur.
-    pub fn new() -> Self {
-        // TODO: İç durumu başlat
-        ArmPowerManager {
-            // TODO: alanları başlat
+// --- Hata Türü ---
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[repr(i64)]
+pub enum PowerError {
+    NotSupported = -1,
+    InternalError = -2,
+    InvalidState = -3,
+}
+
+// --- Karnal64 Sistem Çağrı Numaraları (çekirdek ile uyumlu olmalı) ---
+pub const SYSCALL_RESOURCE_ACQUIRE: u64 = 5;
+pub const SYSCALL_RESOURCE_RELEASE: u64 = 8;
+pub const SYSCALL_RESOURCE_WRITE: u64 = 7;
+
+// --- Kaynak Adı ---
+const RESOURCE_POWER: &[u8] = b"karnal://power";
+
+// --- ACPI Güç Yönetimi ---
+pub struct AcpiManager;
+
+impl AcpiManager {
+    pub fn set_power_state(&self, state: PowerState) -> Result<(), PowerError> {
+        let handle = sys_resource_acquire(RESOURCE_POWER, 0)?;
+        let cmd = match state {
+            PowerState::Sleep => b"acpi_sleep" as &[u8],
+            PowerState::Hibernate => b"acpi_hibernate" as &[u8],
+            PowerState::PowerOff => b"acpi_poweroff" as &[u8],
+            PowerState::Performance => b"acpi_performance" as &[u8],
+            PowerState::Powersave => b"acpi_powersave" as &[u8],
+        };
+        let result = sys_resource_write(handle, cmd);
+        let _ = sys_resource_release(handle);
+        result.map(|_| ())
+    }
+}
+
+// --- SCMI Güç Yönetimi ---
+pub struct ScmiManager;
+
+impl ScmiManager {
+    pub fn set_power_state(&self, state: PowerState) -> Result<(), PowerError> {
+        let handle = sys_resource_acquire(RESOURCE_POWER, 0)?;
+        let cmd = match state {
+            PowerState::Sleep => b"scmi_sleep" as &[u8],
+            PowerState::Hibernate => b"scmi_hibernate" as &[u8],
+            PowerState::PowerOff => b"scmi_poweroff" as &[u8],
+            PowerState::Performance => b"scmi_performance" as &[u8],
+            PowerState::Powersave => b"scmi_powersave" as &[u8],
+        };
+        let result = sys_resource_write(handle, cmd);
+        let _ = sys_resource_release(handle);
+        result.map(|_| ())
+    }
+}
+
+// --- PSCI Güç Yönetimi ---
+pub struct PsciManager;
+
+impl PsciManager {
+    pub fn set_power_state(&self, state: PowerState) -> Result<(), PowerError> {
+        let handle = sys_resource_acquire(RESOURCE_POWER, 0)?;
+        let cmd = match state {
+            PowerState::Sleep => b"psci_suspend" as &[u8],
+            PowerState::Hibernate => b"psci_hibernate" as &[u8],
+            PowerState::PowerOff => b"psci_poweroff" as &[u8],
+            PowerState::Performance => b"psci_performance" as &[u8],
+            PowerState::Powersave => b"psci_powersave" as &[u8],
+        };
+        let result = sys_resource_write(handle, cmd);
+        let _ = sys_resource_release(handle);
+        result.map(|_| ())
+    }
+}
+
+// --- BSA Güç Yönetimi ---
+pub struct BsaManager;
+
+impl BsaManager {
+    pub fn set_power_state(&self, state: PowerState) -> Result<(), PowerError> {
+        let handle = sys_resource_acquire(RESOURCE_POWER, 0)?;
+        let cmd = match state {
+            PowerState::Sleep => b"bsa_sleep" as &[u8],
+            PowerState::Hibernate => b"bsa_hibernate" as &[u8],
+            PowerState::PowerOff => b"bsa_poweroff" as &[u8],
+            PowerState::Performance => b"bsa_performance" as &[u8],
+            PowerState::Powersave => b"bsa_powersave" as &[u8],
+        };
+        let result = sys_resource_write(handle, cmd);
+        let _ = sys_resource_release(handle);
+        result.map(|_| ())
+    }
+}
+
+// --- BBR Güç Yönetimi ---
+pub struct BbrManager;
+
+impl BbrManager {
+    pub fn set_power_state(&self, state: PowerState) -> Result<(), PowerError> {
+        let handle = sys_resource_acquire(RESOURCE_POWER, 0)?;
+        let cmd = match state {
+            PowerState::Sleep => b"bbr_sleep" as &[u8],
+            PowerState::Hibernate => b"bbr_hibernate" as &[u8],
+            PowerState::PowerOff => b"bbr_poweroff" as &[u8],
+            PowerState::Performance => b"bbr_performance" as &[u8],
+            PowerState::Powersave => b"bbr_powersave" as &[u8],
+        };
+        let result = sys_resource_write(handle, cmd);
+        let _ = sys_resource_release(handle);
+        result.map(|_| ())
+    }
+}
+
+// --- ARM Güç Yöneticisi Seçici ---
+pub struct ArmPowerController {
+    acpi: Option<AcpiManager>,
+    scmi: Option<ScmiManager>,
+    psci: Option<PsciManager>,
+    bsa: Option<BsaManager>,
+    bbr: Option<BbrManager>,
+}
+
+impl ArmPowerController {
+    pub fn new(enable_acpi: bool, enable_scmi: bool, enable_psci: bool, enable_bsa: bool, enable_bbr: bool) -> Self {
+        Self {
+            acpi: if enable_acpi { Some(AcpiManager) } else { None },
+            scmi: if enable_scmi { Some(ScmiManager) } else { None },
+            psci: if enable_psci { Some(PsciManager) } else { None },
+            bsa: if enable_bsa { Some(BsaManager) } else { None },
+            bbr: if enable_bbr { Some(BbrManager) } else { None },
         }
     }
 
-    /// Çekirdeğin ana init fonksiyonu tarafından çağrılarak güç yöneticisini başlatır.
-    pub fn init() -> Result<(), KError> {
-        // Güç yöneticisi kaynağını oluştur
-        let power_manager_provider = Box::new(ArmPowerManager::new()); // 'alloc' veya statik yönetim gerekir
-
-        // Bu kaynağı Karnal64 Kaynak Yöneticisine kaydet
-        // 'karnal://device/power/arm' gibi bir isim kullanabiliriz.
-        // Karnal64'ün register_provider fonksiyonu bir Handle dönebilir,
-        // bu handle'ı çekirdek içinde tutmak isteyebiliriz.
-        let _power_handle = kresource::register_provider("karnal://device/power/arm", power_manager_provider)?;
-
-        // TODO: Belki güç yöneticisi için bir arka plan görevi başlatılabilir? (Eğer aktif yönetim gerekiyorsa)
-         ktask::task_spawn(...);
-
-        Ok(())
-    }
-
-    /// CPU'yu düşük güç (uyku) moduna sokar.
-    /// Bu fonksiyon ARM'ın WFI komutunu kullanır ve bir kesme gelene kadar bloklar.
-    fn enter_sleep_mode(&self) -> Result<(), KError> {
-        // TODO: Uykuya girmeden önce yapılması gerekenler (örn. kesmeleri yapılandırma, bağlamı kaydetme?)
-        // Scheduler ile etkileşim gerekebilir.
-
-        // Gerçek ARM uyku komutunu çağır
-        arm_low_level::arm_wfi();
-
-        // TODO: Uyandıktan sonra yapılması gerekenler (örn. kesmeleri devre dışı bırakma, bağlamı geri yükleme?)
-
-        Ok(())
-    }
-
-    // TODO: enter_deep_sleep_mode gibi diğer güç modları için fonksiyonlar
-    // Bunlar enter_sleep_mode'dan daha karmaşık olabilir (cihazları kapatma vb.).
-}
-
-
-// ArmPowerManager için ResourceProvider trait implementasyonu
-// Diğer çekirdek bileşenlerinin veya sistem çağrısı işleyicisinin
-// bu kaynağı standart ResourceProvider arayüzü üzerinden kullanmasını sağlar.
-impl ResourceProvider for ArmPowerManager {
-    // Güç yönetimi kaynağı genellikle 'read' veya 'write' için kullanılmaz,
-    // ancak trait gerektiriyorsa temel implementasyonları ekleyelim.
-    fn read(&self, buffer: &mut [u8], offset: u64) -> Result<usize, KError> {
-        // Güç kaynağı okuma desteklemez.
-        Err(KError::NotSupported)
-    }
-
-    fn write(&self, buffer: &[u8], offset: u64) -> Result<usize, KError> {
-        // Güç kaynağı yazma desteklemez.
-        Err(KError::NotSupported)
-    }
-
-    /// Güç yönetimi komutlarını işler (kontrol mesajları).
-    /// `request`: Güç yönetimi komut kodu (örn. POWER_REQ_SLEEP).
-    /// `arg`: Komut argümanı (komuta özel anlamı olabilir, örn. uyku süresi ipucu).
-    fn control(&self, request: u64, arg: u64) -> Result<i64, KError> {
-        match request {
-            POWER_REQ_SLEEP => {
-                // Basit uyku moduna geçme isteği
-                // arg değeri gelecekte bir timeout gibi kullanılabilir.
-                self.enter_sleep_mode()?;
-                Ok(0) // Başarıyı belirtmek için 0 döndür
-            }
-            POWER_REQ_DEEP_SLEEP => {
-                // TODO: Derin uyku modu implementasyonu
-                 self.enter_deep_sleep_mode(arg)?;
-                Err(KError::NotSupported) // Şimdilik desteklenmiyor
-            }
-            // TODO: Diğer komutları buraya ekle
-
-            _ => {
-                // Bilinmeyen komut
-                Err(KError::InvalidArgument)
-            }
+    pub fn set_power_state(&self, standard: PowerStandard, state: PowerState) -> Result<(), PowerError> {
+        match standard {
+            PowerStandard::Acpi => self.acpi.as_ref().map(|m| m.set_power_state(state)).unwrap_or(Err(PowerError::NotSupported)),
+            PowerStandard::Scmi => self.scmi.as_ref().map(|m| m.set_power_state(state)).unwrap_or(Err(PowerError::NotSupported)),
+            PowerStandard::Psci => self.psci.as_ref().map(|m| m.set_power_state(state)).unwrap_or(Err(PowerError::NotSupported)),
+            PowerStandard::Bsa => self.bsa.as_ref().map(|m| m.set_power_state(state)).unwrap_or(Err(PowerError::NotSupported)),
+            PowerStandard::Bbr => self.bbr.as_ref().map(|m| m.set_power_state(state)).unwrap_or(Err(PowerError::NotSupported)),
         }
     }
-
-    // ResourceProvider trait'inin diğer gerekli metodları (eğer eklendiyse karnal64.rs'e)
-    // Karnal64'teki trait tanımınıza göre bunları ekleyin veya kaldırın.
-     fn seek(&self, position: KseekFrom) -> Result<u64, KError> {
-         Err(KError::NotSupported)
-     }
-
-     fn get_status(&self) -> Result<KResourceStatus, KError> {
-         // Güç kaynağının durumu (açık/kapalı gibi temel bilgiler) döndürülebilir.
-         // TODO: KResourceStatus yapısını karnal64.rs'te tanımlayın ve durum bilgisini sağlayın.
-         Err(KError::NotSupported) // Şimdilik durum bilgisi desteklenmiyor
-     }
-
-    // TODO: supports_mode gibi ResourceProvider'a eklenen diğer metodlar varsa buraya implemente et.
-    // Şu anki karnal64.rs taslağınızda yok ama eklenirse gerekir.
-    
-    fn supports_mode(&self, mode: u32) -> bool {
-        // Güç yöneticisi genellikle sadece kontrol modunu destekler.
-        mode == 0 // Kontrol için genellikle özel bir mode bayrağı olmaz veya 0'dır
-    }
-    
 }
 
-// Bu dosya, 'ArmPowerManager::init()' fonksiyonunu dış dünyaya (çekirdek ana init'ine) açmalıdır.
-// 'pub use' ile dışa aktarılabilir veya doğrudan 'pub fn init()' şeklinde tanımlanabilir.
-// Ana çekirdek init fonksiyonu (karnal64::init veya ayrı bir boot.rs) bu fonksiyonu çağırmalıdır.
-
-// Örnek Kullanım (Başka bir çekirdek modülünden veya test kodundan)
-// Bu kod bu dosyada yer almayacak, sadece konsepti göstermek için.
-
-use crate::karnal64::{kresource, POWER_REQ_SLEEP, KError}; // İlgili importlar
-
-fn example_sleep_call() -> Result<(), KError> {
-    // Güç kaynağı handle'ını edin (muhtemelen sadece çekirdek içi erişime açık olabilir)
-    // Karnal64'ün 'lookup_provider_by_name' veya benzeri bir iç fonksiyonu ile elde edilir.
-    // Kullanıcı alanından gelseydi resource_acquire kullanılırdı.
-    // Varsayım: Kernel içi bir handle elde etme mekanizması var.
-    let power_handle = kresource::lookup_provider_by_name("karnal://device/power/arm")?;
-
-    // Güç kaynağı üzerinde 'control' çağrısı yaparak uyku isteği gönder
-    let result = power_handle.control(POWER_REQ_SLEEP, 0)?; // Arg 0 (timeout yok veya varsayılan)
-
-    // Sonucu kontrol et
-    if result == 0 {
-        println!("System entered and exited sleep mode successfully."); // Kernel print!
-        Ok(())
+// --- Karnal64 Sistem Çağrılarını Kullanma (unsafe, platform bağımlı) ---
+fn sys_resource_acquire(resource_id: &[u8], mode: u32) -> Result<u64, PowerError> {
+    let id_ptr = resource_id.as_ptr();
+    let id_len = resource_id.len();
+    let ret: i64;
+    unsafe {
+        // ARM64 Linux ABI: x0, x1, x2 = args, x8 = syscall no, svc #0, return in x0
+        core::arch::asm!(
+            "mov x0, {0}",
+            "mov x1, {1}",
+            "mov x2, {2}",
+            "mov x8, {3}",
+            "svc #0",
+            "mov {4}, x0",
+            in(reg) id_ptr,
+            in(reg) id_len,
+            in(reg) mode,
+            const SYSCALL_RESOURCE_ACQUIRE,
+            lateout(reg) ret,
+            out("x0") _,
+            out("x1") _,
+            out("x2") _,
+            out("x8") _,
+            options(nostack)
+        );
+    }
+    if ret < 0 {
+        Err(PowerError::InternalError)
     } else {
-        println!("Sleep request returned unexpected result: {}", result); // Kernel print!
-        Err(KError::InternalError) // Veya daha spesifik bir hata
+        Ok(ret as u64)
     }
+}
+
+fn sys_resource_write(handle: u64, buf: &[u8]) -> Result<usize, PowerError> {
+    let ptr = buf.as_ptr();
+    let len = buf.len();
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "mov x0, {0}",
+            "mov x1, {1}",
+            "mov x2, {2}",
+            "mov x8, {3}",
+            "svc #0",
+            "mov {4}, x0",
+            in(reg) handle,
+            in(reg) ptr,
+            in(reg) len,
+            const SYSCALL_RESOURCE_WRITE,
+            lateout(reg) ret,
+            out("x0") _,
+            out("x1") _,
+            out("x2") _,
+            out("x8") _,
+            options(nostack)
+        );
+    }
+    if ret < 0 {
+        Err(PowerError::InternalError)
+    } else {
+        Ok(ret as usize)
+    }
+}
+
+fn sys_resource_release(handle: u64) -> Result<(), PowerError> {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "mov x0, {0}",
+            "mov x8, {1}",
+            "svc #0",
+            "mov {2}, x0",
+            in(reg) handle,
+            const SYSCALL_RESOURCE_RELEASE,
+            lateout(reg) ret,
+            out("x0") _,
+            out("x8") _,
+            options(nostack)
+        );
+    }
+    if ret < 0 {
+        Err(PowerError::InternalError)
+    } else {
+        Ok(())
+    }
+}
+
+// --- Kullanım örneği ---
+pub fn set_arm_power(standard: PowerStandard, state: PowerState) -> Result<(), PowerError> {
+    let mgr = ArmPowerController::new(true, true, true, true, true);
+    mgr.set_power_state(standard, state)
 }
