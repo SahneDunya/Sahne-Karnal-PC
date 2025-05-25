@@ -1,97 +1,177 @@
-#![no_std] // Standart kütüphaneye ihtiyaç duymuyoruz, çekirdek alanında çalışırız
-#![allow(dead_code)] // Geliştirme sırasında kullanılmayan kod veya argümanlar için izinler
-#![allow(unused_variables)] // Geliştirme sırasında kullanılmayan değişkenler için izinler
+#![no_std]
+#![allow(dead_code)]
+#![allow(unused_variables)]
 
-// Karnal64'ün temel tiplerini (KError gibi) içeri aktar
-// Not: Crate yapınıza göre 'crate::' yolu değişebilir.
-use crate::KError; // Varsayım: karnal64 ana crate'i KError'ı dışa aktarıyor
-
-/// Bellek erişim izin bayrakları (Karnal64'ün ResourceProvider modundakilere benzer olabilir,
-/// ancak burada bellek erişimi için özel anlamı vardır).
-pub const PERMISSION_READ: u32 = 1 << 0;
-pub const PERMISSION_WRITE: u32 = 1 << 1;
-pub const PERMISSION_EXECUTE: u32 = 1 << 2; // Yürütme izni
-
-/// ARM mimarisine özel güvenlik ile ilgili fonksiyonları içeren modül.
-pub mod security_arm {
-    use super::*; // Üst scope'tan KError ve PERMISSION_* sabitlerini kullan
-
-    /// Güvenlik alt sistemini başlatır (ARM'e özel ayarlar yapılabilir).
-    pub fn init() {
-        // TODO: ARM MMU (Memory Management Unit) ayarlarını yap,
-        // temel sayfa tablolarını kur veya doğrula.
-        // Çekirdek ve kullanıcı alanı bellek segmentlerini tanımla.
-        // İstisna/kesme vektör tablolarını güvenli handler'lara yönlendir.
-        println!("Karnal64: ARM Güvenlik Alt Sistemi Başlatıldı (Yer Tutucu)"); // Çekirdek içi print! gerektirir
-    }
-
-    /// Kullanıcı alanından gelen bir pointer'ın geçerli ve erişilebilir olup olmadığını doğrular.
-    /// Bu fonksiyon, sistem çağrısı işleyicisi (`handle_syscall`) tarafından,
-    /// kullanıcı pointer'ları Karnal64 API fonksiyonlarına geçirilmeden önce çağrılmalıdır.
-    ///
-    /// `ptr`: Kullanıcı alanındaki başlangıç bellek adresi.
-    /// `size`: Erişilmek istenen alanın boyutu (byte cinsinden).
-    /// `required_permissions`: Gereken izinler (PERMISSION_READ, PERMISSION_WRITE gibi bayraklar).
-    ///
-    /// Başarılı olursa Ok(()), hata durumunda KError döndürür.
-    ///
-    /// Güvenlik Notu: Bu, ARM'e özel sayfa tablosu yürüyüşü (page table walk) veya
-    /// TLB (Translation Lookaside Buffer) sorgulama gibi donanımsal özellikleri
-    /// kullanarak pointer'ı doğrulamayı gerektirir. Gerçek implementasyon,
-    /// çekirdeğin bellek yönetimi (kmemory) modülü ile yakın çalışır.
-    pub fn validate_user_pointer(
-        ptr: *const u8,
-        size: usize,
-        required_permissions: u32,
-    ) -> Result<(), KError> {
-        // Sıfır boyutlu erişim genellikle her zaman geçerlidir.
-        if size == 0 {
-            return Ok(());
-        }
-
-        // TODO: ptr'nin geçerli bir kullanıcı alanı bellek aralığında olup olmadığını kontrol et.
-        // Çekirdek bellek aralığı ile çakışmamalı.
-        // ARM'e özel: Kullanıcının mevcut MMU bağlamını (sayfa tablosu) kullanarak
-        // ptr + size - 1 adresine kadar olan aralığı kontrol et.
-
-        // TODO: İstenen bellek aralığı için gereken izinlerin (required_permissions)
-        // kullanıcının sayfa tablosunda tanımlı olup olmadığını kontrol et.
-        // ARM'e özel: Sayfa tablosundaki her sayfanın erişim bayraklarını kontrol et.
-        // Eğer bir sayfa yoksa (mapping yoksa) veya izinler yetersizse hata dön.
-
-        // --- Yer Tutucu Doğrulama Mantığı (Gerçek ARM MMU kontrolü burada yapılacak) ---
-
-        // Güvenlik açığı: Gerçek doğrulama olmadan her zaman başarı döndürmek
-        // çok tehlikelidir ve çekirdeği istismara açık hale getirir.
-        // Aşağıdaki satır, gerçek doğrulama implemente edilene kadar YORUM SATIRI YAPILMALIDIR
-        // veya sadece geliştirme aşamasında kullanılmalıdır.
-         Ok(()) // YER TUTUCU: Pointer doğrulaması başarılı varsayıldı
-
-        // TODO: Gerçek ARM MMU kontrol mantığını buraya ekle.
-        // Geçici olarak her pointer'ı geçersiz sayalım veya belirli bir aralık dışında olanları...
-        // Bu sadece bir taslak, gerçek MMU kontrolü karmaşıktır.
-        let is_valid_address = true; // Gerçek ARM MMU kontrolünün sonucu
-
-        if !is_valid_address {
-             // TODO: validate_user_pointer'ın neden başarısız olduğunu daha spesifik belirle:
-             // Adres geçerli kullanıcı alanında değil mi? (KError::BadAddress)
-             // İzinler yetersiz mi? (KError::PermissionDenied)
-            println!("Karnal64: ARM Güvenlik: Kullanıcı pointer doğrulaması başarısız!"); // Hata ayıklama çıktısı
-            Err(KError::BadAddress) // Veya uygun KError kodu
-        } else {
-            // TODO: Başarılı durumda yapılacak ek işlemler (örneğin TLB yönetimi).
-            Ok(()) // Doğrulama başarılı
-        }
-    }
-
-    // TODO: Diğer ARM'e özel güvenlik fonksiyonları buraya eklenebilir:
-    // - Privilege seviyeleri arası geçişin güvenli yönetimi
-    // - Güvenli istisna işleme (sync/async abort, IRQ, FIQ handler'ları)
-    // - Belirli donanımsal güvenlik özelliklerinin (örneğin TrustZone) kullanımı
+// --- Güvenlik Mekanizması Enum'u ---
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum SecurityMechanism {
+    TrustZone,
 }
 
-// Bu dosya, Karnal64'ün bir parçası olarak build edildiğinde
-// 'security_arm' modülünü dışa aktarabilir, böylece Karnal64'ün diğer kısımları
-// (özellikle sistem çağrısı işleyicisi) onu kullanabilir.
- pub use security_arm::validate_user_pointer; // Örnek dışa aktarım
- pub use security_arm::init; // Başlatma fonksiyonunu dışa aktarma
+// --- Hata Türü ---
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[repr(i64)]
+pub enum SecurityError {
+    NotSupported = -1,
+    InternalError = -2,
+    InvalidOperation = -3,
+}
+
+// --- Karnal64 Sistem Çağrı Numaraları ---
+pub const SYSCALL_RESOURCE_ACQUIRE: u64 = 5;
+pub const SYSCALL_RESOURCE_RELEASE: u64 = 8;
+pub const SYSCALL_RESOURCE_WRITE: u64 = 7;
+pub const SYSCALL_RESOURCE_READ: u64 = 6;
+
+// --- Kaynak Adı ---
+const RESOURCE_SECURITY: &[u8] = b"karnal://security";
+
+// --- ARM TrustZone Güvenlik Yöneticisi ---
+pub struct ArmSecurityManager;
+
+impl ArmSecurityManager {
+    /// TrustZone'u etkinleştir veya devre dışı bırak
+    pub fn set_trustzone(&self, enable: bool) -> Result<(), SecurityError> {
+        let handle = sys_resource_acquire(RESOURCE_SECURITY, 0)?;
+        let cmd = if enable { b"enable_trustzone" } else { b"disable_trustzone" };
+        let result = sys_resource_write(handle, cmd);
+        let _ = sys_resource_release(handle);
+        result.map(|_| ())
+    }
+
+    /// TrustZone etkin mi?
+    pub fn is_trustzone_enabled(&self) -> Result<bool, SecurityError> {
+        let handle = sys_resource_acquire(RESOURCE_SECURITY, 0)?;
+        let cmd = b"query_trustzone";
+        let _ = sys_resource_write(handle, cmd);
+        let mut status: u8 = 0;
+        let read_result = sys_resource_read(handle, &mut status as *mut u8, 1);
+        let _ = sys_resource_release(handle);
+        match read_result {
+            Ok(1) => Ok(status != 0),
+            _ => Err(SecurityError::InternalError),
+        }
+    }
+}
+
+// --- Karnal64 Sistem Çağrılarını Kullanma (ARM64 Linux ABI) ---
+fn sys_resource_acquire(resource_id: &[u8], mode: u32) -> Result<u64, SecurityError> {
+    let id_ptr = resource_id.as_ptr();
+    let id_len = resource_id.len();
+    let ret: i64;
+    unsafe {
+        // ARM64: x0, x1, x2 = args, x8 = syscall no, svc #0, return x0
+        core::arch::asm!(
+            "mov x0, {0}",
+            "mov x1, {1}",
+            "mov x2, {2}",
+            "mov x8, {3}",
+            "svc #0",
+            "mov {4}, x0",
+            in(reg) id_ptr,
+            in(reg) id_len,
+            in(reg) mode,
+            const SYSCALL_RESOURCE_ACQUIRE,
+            lateout(reg) ret,
+            out("x0") _, out("x1") _, out("x2") _, out("x8") _,
+            options(nostack)
+        );
+    }
+    if ret < 0 {
+        Err(SecurityError::InternalError)
+    } else {
+        Ok(ret as u64)
+    }
+}
+
+fn sys_resource_write(handle: u64, buf: &[u8]) -> Result<usize, SecurityError> {
+    let ptr = buf.as_ptr();
+    let len = buf.len();
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "mov x0, {0}",
+            "mov x1, {1}",
+            "mov x2, {2}",
+            "mov x8, {3}",
+            "svc #0",
+            "mov {4}, x0",
+            in(reg) handle,
+            in(reg) ptr,
+            in(reg) len,
+            const SYSCALL_RESOURCE_WRITE,
+            lateout(reg) ret,
+            out("x0") _, out("x1") _, out("x2") _, out("x8") _,
+            options(nostack)
+        );
+    }
+    if ret < 0 {
+        Err(SecurityError::InternalError)
+    } else {
+        Ok(ret as usize)
+    }
+}
+
+fn sys_resource_read(handle: u64, buf: *mut u8, len: usize) -> Result<usize, SecurityError> {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "mov x0, {0}",
+            "mov x1, {1}",
+            "mov x2, {2}",
+            "mov x8, {3}",
+            "svc #0",
+            "mov {4}, x0",
+            in(reg) handle,
+            in(reg) buf,
+            in(reg) len,
+            const SYSCALL_RESOURCE_READ,
+            lateout(reg) ret,
+            out("x0") _, out("x1") _, out("x2") _, out("x8") _,
+            options(nostack)
+        );
+    }
+    if ret < 0 {
+        Err(SecurityError::InternalError)
+    } else {
+        Ok(ret as usize)
+    }
+}
+
+fn sys_resource_release(handle: u64) -> Result<(), SecurityError> {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "mov x0, {0}",
+            "mov x8, {1}",
+            "svc #0",
+            "mov {2}, x0",
+            in(reg) handle,
+            const SYSCALL_RESOURCE_RELEASE,
+            lateout(reg) ret,
+            out("x0") _, out("x8") _,
+            options(nostack)
+        );
+    }
+    if ret < 0 {
+        Err(SecurityError::InternalError)
+    } else {
+        Ok(())
+    }
+}
+
+// --- Kullanım örnekleri ---
+pub fn enable_trustzone() -> Result<(), SecurityError> {
+    let mgr = ArmSecurityManager;
+    mgr.set_trustzone(true)
+}
+
+pub fn disable_trustzone() -> Result<(), SecurityError> {
+    let mgr = ArmSecurityManager;
+    mgr.set_trustzone(false)
+}
+
+pub fn is_trustzone_enabled() -> Result<bool, SecurityError> {
+    let mgr = ArmSecurityManager;
+    mgr.is_trustzone_enabled()
+}
