@@ -1,140 +1,198 @@
-#![no_std] // Kernel kodu, standart kütüphaneye ihtiyaç duymaz
+#![no_std]
+#![allow(dead_code)]
+#![allow(unused_variables)]
 
-// Karnal64'ten temel tipleri import et
-// Çekirdeğinizin crate yapısına göre KError'ın yolu değişebilir.
-// Genellikle ya crate kökünde (crate::KError) ya da eğer security_mips
-// main.rs/lib.rs ile aynı seviyedeyse super::KError şeklinde olur.
-// Bu örnekte crate::KError olduğunu varsayalım.
-use crate::KError;
+// --- Güvenlik Mekanizması Enum'u ---
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum SecurityMechanism {
+    SecureBoot,
+    SecureMonitor,
+    NxBit,
+    Tpm,
+    CryptoAccel,
+}
 
-// Belki bellek yönetim modülünden de bazı fonksiyonlar çağrılması gerekebilir
-// (örneğin, sayfa tablosunu sorgulamak için)
- use crate::kmemory;
+// --- Hata Türü ---
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[repr(i64)]
+pub enum SecurityError {
+    NotSupported = -1,
+    InternalError = -2,
+    InvalidOperation = -3,
+}
 
-// Güvenlikle ilgili sabitler veya bayraklar tanımlanabilir
-// Bunlar kresource modülündeki MODE_* bayraklarıyla eşleşebilir veya onlara ek olabilir.
-pub const USER_PERM_READ: u32 = 1 << 0;
-pub const USER_PERM_WRITE: u32 = 1 << 1;
-pub const USER_PERM_EXECUTE: u32 = 1 << 2;
+// --- Karnal64 Sistem Çağrı Numaraları ---
+pub const SYSCALL_RESOURCE_ACQUIRE: u64 = 5;
+pub const SYSCALL_RESOURCE_RELEASE: u64 = 8;
+pub const SYSCALL_RESOURCE_WRITE: u64 = 7;
+pub const SYSCALL_RESOURCE_READ: u64 = 6;
 
+// --- Kaynak Adı ---
+const RESOURCE_SECURITY: &[u8] = b"karnal://security";
 
-/// MIPS mimarisine özgü güvenlik kontrollerini ve fonksiyonlarını içerir.
-/// Bu modül, sistem çağrısı işleyicisi (`handle_syscall`) veya bellek yöneticisi
-/// (kmemory) gibi diğer çekirdek bileşenleri tarafından çağrılabilir.
-pub mod security_mips {
-    use super::*; // Üst kapsamdaki importları ve sabitleri kullan
+// --- MIPS Güvenlik Yöneticisi ---
+pub struct MipsSecurityManager;
 
-    /// Güvenlik modülünü başlatır.
-    /// Çekirdek başlatma sürecinde Karnal64'ün ana init fonksiyonu tarafından
-    /// çağrılması beklenen fonksiyondur.
-    pub fn init() {
-        // TODO: MIPS'e özgü güvenlik donanımı veya kayıtları başlatma (örneğin MMU/TLB ayarları)
-        // Çekirdek içi print! makrosu varsa debug çıktısı eklenebilir.
-         println!("Karnal64: MIPS Güvenlik Modülü Başlatılıyor...");
-        // Yer Tutucu: Başlatma tamamlandı
-         println!("Karnal64: MIPS Güvenlik Modülü Başlatıldı.");
+impl MipsSecurityManager {
+    /// Güvenlik mekanizmasını etkinleştir veya devre dışı bırak
+    pub fn set_mechanism(&self, mech: SecurityMechanism, enable: bool) -> Result<(), SecurityError> {
+        let handle = sys_resource_acquire(RESOURCE_SECURITY, 0)?;
+        let cmd = match (mech, enable) {
+            (SecurityMechanism::SecureBoot, true) => b"enable_secureboot" as &[u8],
+            (SecurityMechanism::SecureBoot, false) => b"disable_secureboot" as &[u8],
+            (SecurityMechanism::SecureMonitor, true) => b"enable_smon" as &[u8],
+            (SecurityMechanism::SecureMonitor, false) => b"disable_smon" as &[u8],
+            (SecurityMechanism::NxBit, true) => b"enable_nxbit" as &[u8],
+            (SecurityMechanism::NxBit, false) => b"disable_nxbit" as &[u8],
+            (SecurityMechanism::Tpm, true) => b"enable_tpm" as &[u8],
+            (SecurityMechanism::Tpm, false) => b"disable_tpm" as &[u8],
+            (SecurityMechanism::CryptoAccel, true) => b"enable_crypto" as &[u8],
+            (SecurityMechanism::CryptoAccel, false) => b"disable_crypto" as &[u8],
+        };
+        let result = sys_resource_write(handle, cmd);
+        let _ = sys_resource_release(handle);
+        result.map(|_| ())
     }
 
-    /// Kullanıcı alanından gelen bir pointer adresinin geçerli ve istenen
-    /// izinlere sahip olup olmadığını MIPS mimarisi bağlamında doğrular.
-    ///
-    /// Bu fonksiyon, sistem çağrısı işleyicisi (`handle_syscall`) tarafından
-    /// kullanıcıdan gelen pointer argümanlarını Karnal64 API fonksiyonlarına
-    /// geçirmeden önce çağrılmalıdır.
-    ///
-    /// # Argümanlar
-    /// * `ptr`: Kullanıcı alanındaki başlangıç adresi (ham pointer).
-    /// * `len`: Kontrol edilecek bellek bloğunun uzunluğu (byte cinsinden).
-    /// * `required_permissions`: İstenen izinleri belirten bayraklar (USER_PERM_*).
-    ///
-    /// # Dönüş Değeri
-    /// İşlem başarılıysa `Ok(())` döner.
-    /// Doğrulama başarısız olursa (geçersiz adres, izinsizlik vb.) ilgili `KError` döner.
-    ///
-    /// # Güvenlik Notu
-    /// Bu fonksiyonun gerçek implementasyonu, MIPS'in Bellek Yönetim Birimi (MMU)
-    /// veya Çeviri Bakma Tamponu (TLB) ile etkileşim kurarak (genellikle sanal
-    /// bellek yönetim modülü - `kmemory` aracılığıyla) o anki görevin sanal bellek
-    /// haritasını kontrol etmeyi gerektirir. Bu taslakta gerçek MMU/TLB etkileşimi
-    /// yerine yer tutucu mantık bulunmaktadır.
-    pub fn validate_user_pointer(
-        ptr: *const u8,
-        len: usize,
-        required_permissions: u32,
-    ) -> Result<(), KError> {
-        // Güvenlik: Sıfır uzunluktaki bir blok genellikle geçerli kabul edilebilir, pointer null olabilir.
-        if len == 0 {
-             println!("Güvenlik: Sıfır uzunluklu pointer doğrulaması geçildi.");
-             return Ok(());
-        }
-
-        // Güvenlik: Null pointer kontrolü (uzunluk > 0 ise)
-        if ptr.is_null() {
-            println!("Güvenlik Hatası: Null pointer argümanı, uzunluk > 0.");
-            return Err(KError::InvalidArgument); // veya KError::BadAddress
-        }
-
-        // Adres aralığının taşma yapıp yapmadığını kontrol et
-        let start_addr = ptr as usize;
-        let end_addr = match start_addr.checked_add(len) {
-            Some(end) => end,
-            None => {
-                println!("Güvenlik Hatası: Pointer + uzunluk taşması.");
-                return Err(KError::InvalidArgument); // Geçersiz adres/uzunluk kombinasyonu
-            }
+    /// Mekanizmanın etkin olup olmadığını sorgula (örnek)
+    pub fn query_mechanism(&self, mech: SecurityMechanism) -> Result<bool, SecurityError> {
+        let handle = sys_resource_acquire(RESOURCE_SECURITY, 0)?;
+        let cmd = match mech {
+            SecurityMechanism::SecureBoot => b"query_secureboot",
+            SecurityMechanism::SecureMonitor => b"query_smon",
+            SecurityMechanism::NxBit => b"query_nxbit",
+            SecurityMechanism::Tpm => b"query_tpm",
+            SecurityMechanism::CryptoAccel => b"query_crypto",
         };
+        let _ = sys_resource_write(handle, cmd);
+        let mut status: u8 = 0;
+        let read_result = sys_resource_read(handle, &mut status as *mut u8, 1);
+        let _ = sys_resource_release(handle);
+        match read_result {
+            Ok(1) => Ok(status != 0),
+            _ => Err(SecurityError::InternalError),
+        }
+    }
+}
 
-        // TODO: GERÇEK MIPS Güvenlik Doğrulama Mantığı Başlangıcı
-        // Burası, MIPS mimarisine özgü sayfa tablosu yürüyüşü (page table walk) veya
-        // TLB sorgulama mantığının çağrılacağı yerdir.
-        // Bu mantık, şu kontrolleri yapmalıdır:
-        // 1. `start_addr`'dan `end_addr`'a kadar olan tüm adres aralığı,
-        //    o anki *kullanıcı görevinin* sanal bellek haritasında geçerli mi?
-        // 2. Geçerliyse, bu aralıktaki belleğe erişim için istenen `required_permissions` (okuma/yazma/çalıştırma)
-        //    izinleri var mı? (Bu izinler sayfa tablosundaki bayraklardan gelir).
+// --- Karnal64 Sistem Çağrılarını Kullanma (MIPS ABI, platforma göre özelleştirilebilir) ---
+fn sys_resource_acquire(resource_id: &[u8], mode: u32) -> Result<u64, SecurityError> {
+    let id_ptr = resource_id.as_ptr() as usize;
+    let id_len = resource_id.len();
+    let ret: isize;
+    unsafe {
+        // MIPS Linux ABI: $a0, $a1, $a2 = args; $v0 = syscall no; syscall; return $v0
+        core::arch::asm!(
+            "move $a0, {0}",
+            "move $a1, {1}",
+            "move $a2, {2}",
+            "li $v0, {3}",
+            "syscall",
+            "move {4}, $v0",
+            in(reg) id_ptr,
+            in(reg) id_len,
+            in(reg) mode,
+            const SYSCALL_RESOURCE_ACQUIRE,
+            lateout(reg) ret,
+            out("$a0") _, out("$a1") _, out("$a2") _, out("$v0") _,
+            options(nostack)
+        );
+    }
+    if ret < 0 {
+        Err(SecurityError::InternalError)
+    } else {
+        Ok(ret as u64)
+    }
+}
 
-        // Bu taslakta, gerçek MMU/TLB etkileşimi yerine sadece kavramsal bir yer tutucu vardır.
-        // Gerçek bir çekirdekte, bu genellikle `kmemory` modülündeki mimariye özgü
-        // bellek yönetim fonksiyonlarını çağırmayı içerir.
+fn sys_resource_write(handle: u64, buf: &[u8]) -> Result<usize, SecurityError> {
+    let ptr = buf.as_ptr() as usize;
+    let len = buf.len();
+    let ret: isize;
+    unsafe {
+        core::arch::asm!(
+            "move $a0, {0}",
+            "move $a1, {1}",
+            "move $a2, {2}",
+            "li $v0, {3}",
+            "syscall",
+            "move {4}, $v0",
+            in(reg) handle,
+            in(reg) ptr,
+            in(reg) len,
+            const SYSCALL_RESOURCE_WRITE,
+            lateout(reg) ret,
+            out("$a0") _, out("$a1") _, out("$a2") _, out("$v0") _,
+            options(nostack)
+        );
+    }
+    if ret < 0 {
+        Err(SecurityError::InternalError)
+    } else {
+        Ok(ret as usize)
+    }
+}
 
-         println!(
-        //     "Güvenlik: Kullanıcı pointer doğrulaması yapılıyor (yer tutucu): {:p}, uzunluk: {}, İzinler: {}",
-             ptr, len, required_permissions
-         );
+fn sys_resource_read(handle: u64, buf: *mut u8, len: usize) -> Result<usize, SecurityError> {
+    let ret: isize;
+    unsafe {
+        core::arch::asm!(
+            "move $a0, {0}",
+            "move $a1, {1}",
+            "move $a2, {2}",
+            "li $v0, {3}",
+            "syscall",
+            "move {4}, $v0",
+            in(reg) handle,
+            in(reg) buf,
+            in(reg) len,
+            const SYSCALL_RESOURCE_READ,
+            lateout(reg) ret,
+            out("$a0") _, out("$a1") _, out("$a2") _, out("$v0") _,
+            options(nostack)
+        );
+    }
+    if ret < 0 {
+        Err(SecurityError::InternalError)
+    } else {
+        Ok(ret as usize)
+    }
+}
 
-        // --- Yer Tutucu / Simülasyon Doğrulama Mantığı ---
-        // Bu kısım SADECE taslağı göstermek içindir, GERÇEK MMU/TLB etkileşimi DEĞİLDİR.
-
-        // Basit bir adres aralığı kontrolü (GERÇEK DEĞİL!)
-         const MIPS_USER_SPACE_START_SIMULATED: usize = 0x40000000; // Örnek MIPS kullanıcı alanı başlangıcı
-         const MIPS_USER_SPACE_END_SIMULATED: usize = 0x80000000;   // Örnek MIPS kullanıcı alanı sonu (segmentlere göre değişir)
-
-         if start_addr < MIPS_USER_SPACE_START_SIMULATED || end_addr > MIPS_USER_SPACE_END_SIMULATED || end_addr < start_addr {
-             println!("Güvenlik Hatası: Adres simüle edilmiş kullanıcı alanı dışında: {:p}", ptr);
-             return Err(KError::BadAddress);
-         }
-
-        // İzin kontrolü (Bu da yer tutucu - gerçekte sayfa giriş bayraklarına bakılır)
-         if required_permissions & USER_PERM_WRITE != 0 {
-        //     // Yazma izni gerekiyorsa, burada yazma izninin doğrulanması gerekir.
-              println!("Güvenlik Notu: Yazma izni kontrolü yer tutucu.");
-        //     // Eğer izin yoksa: return Err(KError::PermissionDenied);
-         }
-         if required_permissions & USER_PERM_READ != 0 {
-        //     // Okuma izni gerekiyorsa...
-              println!("Güvenlik Notu: Okuma izni kontrolü yer tutucu.");
-        //     // Eğer izin yoksa: return Err(KError::PermissionDenied);
-         }
-         if required_permissions & USER_PERM_EXECUTE != 0 {
-        //     // Çalıştırma izni gerekiyorsa...
-              println!("Güvenlik Notu: Çalıştırma izni kontrolü yer tutucu.");
-             return Err(KError::PermissionDenied);
-         }
-
-        // --- Yer Tutucu / Simülasyon Doğrulama Mantığı Sonu ---
-
-        // Eğer tüm kontroller geçtiyse (yer tutucu simülasyon veya gerçek implementasyon), başarılı dön.
-        println!("Güvenlik: Kullanıcı pointer doğrulama başarılı (yer tutucu).");
+fn sys_resource_release(handle: u64) -> Result<(), SecurityError> {
+    let ret: isize;
+    unsafe {
+        core::arch::asm!(
+            "move $a0, {0}",
+            "li $v0, {1}",
+            "syscall",
+            "move {2}, $v0",
+            in(reg) handle,
+            const SYSCALL_RESOURCE_RELEASE,
+            lateout(reg) ret,
+            out("$a0") _, out("$v0") _,
+            options(nostack)
+        );
+    }
+    if ret < 0 {
+        Err(SecurityError::InternalError)
+    } else {
         Ok(())
     }
+}
+
+// --- Kullanım örnekleri ---
+pub fn enable_security_mechanism(mech: SecurityMechanism) -> Result<(), SecurityError> {
+    let mgr = MipsSecurityManager;
+    mgr.set_mechanism(mech, true)
+}
+
+pub fn disable_security_mechanism(mech: SecurityMechanism) -> Result<(), SecurityError> {
+    let mgr = MipsSecurityManager;
+    mgr.set_mechanism(mech, false)
+}
+
+pub fn is_security_mechanism_enabled(mech: SecurityMechanism) -> Result<bool, SecurityError> {
+    let mgr = MipsSecurityManager;
+    mgr.query_mechanism(mech)
 }
