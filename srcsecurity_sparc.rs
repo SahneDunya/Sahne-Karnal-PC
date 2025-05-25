@@ -1,205 +1,208 @@
-#![no_std] // Standart kütüphaneye ihtiyaç duymuyoruz, çekirdek alanında çalışırız
-
-// SPARC mimarisi için güvenlik ve düşük seviye donanım etkileşimleri
-
-// Karnal64 çekirdek API'sından gerekli tipleri ve modülleri kullan
-// (karnal64 çekirdeğin ana modülü veya crate'i olarak kabul ediliyor)
-use karnal64::{KError, KHandle, KTaskId}; // Temel tipler
-// Kavramsal olarak, mimariye özel güvenlik kodu şu Karnal64 alt sistemleriyle etkileşebilir:
-use karnal64::kmemory; // Bellek yönetimi işlemleri için (örneğin sayfa tablosu yönetimi)
-use karnal64::ktask;   // Görev/iş parçacığı bağlamı ve durum yönetimi için
-// Diğer Karnal64 modülleri de gerekirse kullanılabilir (ksync, kmessaging vb.)
-
-// Geliştirme sırasında kullanılmayan kod veya argümanlar için izinler
+#![no_std]
 #![allow(dead_code)]
 #![allow(unused_variables)]
 
-// --- SPARC Mimariye Özgü Kayıtlar ve Sabitler (Yer Tutucular) ---
-// Bunlar gerçek SPARC mimarisine göre detaylandırılmalıdır.
-// Örneğin: Processor State Register (PSR), Trap Table Base Register (TTBR), MMU kontrol kayıtları.
-
-#[repr(C)] // C uyumluluğu gerekebilir
-pub struct SparcRegisters {
-    // Genel amaçlı kayıtlar (g0-g7, o0-o7, l0-l7, i0-i7)
-    // Pencere yönetimi için CWP (Current Window Pointer) gibi.
-    // PSR, TTBR gibi durum kayıtları.
-    // ... gerçek SPARC kayırları buraya eklenecek ...
-    placeholder: u64, // Yer tutucu
+// --- Güvenlik Mekanizması Enum'u ---
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum SecurityMechanism {
+    SecureBoot,
+    SecureMonitor,
+    NxBit,
+    Tpm,
+    CryptoAccel,
 }
 
-// SPARC Trap Vektörleri ile ilgili sabitler (Yer Tutucular)
-const SPARC_TRAP_TYPE_SYSCALL: u66 = 0x10; // Örnek trap tipi, gerçek değere bakılmalı
-// ... diğer trap tipleri ...
-
-// --- Karnal64 Tarafından Çağrılacak Mimariye Özel Güvenlik Fonksiyonları ---
-// Bu fonksiyonlar, Karnal64'ün genel başlatma, görev yönetimi veya istisna işleme
-// mantığı tarafından çağrılabilir.
-
-/// SPARC mimarisine özel güvenlik ve donanım bileşenlerini başlatır.
-/// Çekirdeğin genel init() fonksiyonu tarafından çağrılmalıdır.
-pub fn init_security() -> Result<(), KError> {
-    println!("security_sparc: SPARC Güvenlik Başlatılıyor..."); // Kernel içi print! varsayımı
-
-    // TODO: SPARC MMU'yu başlangıç durumu için yapılandır (sayfa tablolarını kurma, etkinleştirme vb.)
-    // Bu adım, kmemory modülünün düşük seviye desteğini veya callback'lerini gerektirebilir.
-    setup_mmu()?;
-
-    // TODO: SPARC Trap Vektör Tablosunu ayarla.
-    // Sistemin trap'ları (sistem çağrıları, page faultlar, donanım kesmeleri)
-    // nasıl işleyeceğini belirler.
-    setup_trap_table()?;
-
-    // TODO: Başlangıç privilege seviyelerini ayarla (Kernel/Supervisor mode)
-    // Çekirdeğin doğru privilege seviyesinde çalıştığından emin ol.
-
-    println!("security_sparc: SPARC Güvenlik Başlatıldı.");
-    Ok(())
+// --- Hata Türü ---
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[repr(i64)]
+pub enum SecurityError {
+    NotSupported = -1,
+    InternalError = -2,
+    InvalidOperation = -3,
 }
 
-/// Bir görev için SPARC'a özel başlangıç bağlamını (kayıtlar, stack pointer) oluşturur.
-/// ktask::task_spawn gibi fonksiyonlar tarafından çağrılabilir.
-/// `entry_point`: Görevin başlayacağı sanal adres.
-/// `stack_top`: Göreve tahsis edilen stack'in en üst adresi (genellikle stack aşağı doğru büyür).
-/// `arg`: Göreve iletilen argüman değeri veya pointer'ı.
-/// Döndürülen değer, zamanlayıcının kullanacağı bağlam yapısı olabilir.
-pub fn create_initial_task_context(
-    entry_point: u64,
-    stack_top: u64,
-    arg: u64,
-) -> Result<SparcRegisters, KError> {
-    println!("security_sparc: Yeni Görev Bağlamı Oluşturuluyor...");
+// --- Karnal64 Sistem Çağrı Numaraları ---
+pub const SYSCALL_RESOURCE_ACQUIRE: u64 = 5;
+pub const SYSCALL_RESOURCE_RELEASE: u64 = 8;
+pub const SYSCALL_RESOURCE_WRITE: u64 = 7;
+pub const SYSCALL_RESOURCE_READ: u64 = 6;
 
-    // TODO: Başlangıç SPARC kayıt değerlerini ayarla.
-    // - Program Sayacı (PC) entry_point'e ayarlanmalı.
-    // - Stack Pointer (SP) stack_top'a ayarlanmalı.
-    // - Argüman(lar) uygun kayıt(lar)a (örn. o0) yerleştirilmeli.
-    // - Privilege seviyesi kullanıcı modu (User mode) olarak ayarlanmalı (PSR kaydında).
-    // - Pencere durumu ayarlanmalı.
-    let mut initial_regs: SparcRegisters = unsafe { core::mem::zeroed() };
+// --- Kaynak Adı ---
+const RESOURCE_SECURITY: &[u8] = b"karnal://security";
 
-    // Örnek yer tutucu atamalar (gerçek kayıt isimleri SPARC modeline göre değişir)
-     initial_regs.pc = entry_point;
-     initial_regs.sp = stack_top;
-     initial_regs.o0 = arg;
-     initial_regs.psr = // Kullanıcı modu bitleri ayarlanacak
+// --- SPARC Güvenlik Yöneticisi ---
+pub struct SparcSecurityManager;
 
-    println!("security_sparc: Görev Bağlamı Oluşturuldu.");
-    Ok(initial_regs)
+impl SparcSecurityManager {
+    /// Güvenlik mekanizmasını etkinleştir veya devre dışı bırak
+    pub fn set_mechanism(&self, mech: SecurityMechanism, enable: bool) -> Result<(), SecurityError> {
+        let handle = sys_resource_acquire(RESOURCE_SECURITY, 0)?;
+        let cmd = match (mech, enable) {
+            (SecurityMechanism::SecureBoot, true) => b"enable_secureboot" as &[u8],
+            (SecurityMechanism::SecureBoot, false) => b"disable_secureboot" as &[u8],
+            (SecurityMechanism::SecureMonitor, true) => b"enable_smon" as &[u8],
+            (SecurityMechanism::SecureMonitor, false) => b"disable_smon" as &[u8],
+            (SecurityMechanism::NxBit, true) => b"enable_nxbit" as &[u8],
+            (SecurityMechanism::NxBit, false) => b"disable_nxbit" as &[u8],
+            (SecurityMechanism::Tpm, true) => b"enable_tpm" as &[u8],
+            (SecurityMechanism::Tpm, false) => b"disable_tpm" as &[u8],
+            (SecurityMechanism::CryptoAccel, true) => b"enable_crypto" as &[u8],
+            (SecurityMechanism::CryptoAccel, false) => b"disable_crypto" as &[u8],
+        };
+        let result = sys_resource_write(handle, cmd);
+        let _ = sys_resource_release(handle);
+        result.map(|_| ())
+    }
+
+    /// Mekanizmanın etkin olup olmadığını sorgula (örnek)
+    pub fn query_mechanism(&self, mech: SecurityMechanism) -> Result<bool, SecurityError> {
+        let handle = sys_resource_acquire(RESOURCE_SECURITY, 0)?;
+        let cmd = match mech {
+            SecurityMechanism::SecureBoot => b"query_secureboot",
+            SecurityMechanism::SecureMonitor => b"query_smon",
+            SecurityMechanism::NxBit => b"query_nxbit",
+            SecurityMechanism::Tpm => b"query_tpm",
+            SecurityMechanism::CryptoAccel => b"query_crypto",
+        };
+        let _ = sys_resource_write(handle, cmd);
+        let mut status: u8 = 0;
+        let read_result = sys_resource_read(handle, &mut status as *mut u8, 1);
+        let _ = sys_resource_release(handle);
+        match read_result {
+            Ok(1) => Ok(status != 0),
+            _ => Err(SecurityError::InternalError),
+        }
+    }
 }
 
-/// Görev veya iş parçacığı bağlamını değiştirmek için SPARC'a özel mantık.
-/// ktask zamanlayıcısı tarafından çağrılabilir.
-/// `old_regs`: Mevcut (ayrılacak) görev/iş parçacığının kayıtları.
-/// `new_regs`: Yeni (girilecek) görev/iş parçacığının kayıtları.
-/// Güvenlik Notu: Kayıt pencerelerinin yönetimi kritik öneme sahiptir.
-pub fn switch_context(old_regs: &mut SparcRegisters, new_regs: &SparcRegisters) {
-    // println!("security_sparc: Bağlam Değiştiriliyor..."); // Bu kritik yolda çok sık çağrılır, dikkatli loglama
-
-    // TODO: Mevcut SPARC kayıtlarını (özellikle pencereleri) old_regs içine kaydet.
-    // TODO: Yeni SPARC kayıtlarını new_regs'ten donanıma yükle.
-    // Bu genellikle düşük seviye assembly gerektirir.
+// --- Karnal64 Sistem Çağrılarını Kullanma (SPARC ABI, platforma göre özelleştirilebilir) ---
+fn sys_resource_acquire(resource_id: &[u8], mode: u32) -> Result<u64, SecurityError> {
+    let id_ptr = resource_id.as_ptr();
+    let id_len = resource_id.len();
+    let ret: i64;
     unsafe {
-        // Örnek: Kayıt penceresini kaydetme ve geri yükleme ile ilgili assembly çağrıları
-         asm!("save %sp, -96, %sp", options(nostack, nomem)); // Örnek SAVE
-        // ... kayıtları kaydetme ...
-        // ... kayıtları yükleme ...
-         asm!("restore %g0, %g0, %g0", options(nostack, nomem)); // Örnek RESTORE
+        // SPARC syscall conventions: %g1 = syscall no, %o0-%o2 args, returns %o0
+        core::arch::asm!(
+            "mov {0}, %o0",
+            "mov {1}, %o1",
+            "mov {2}, %o2",
+            "mov {3}, %g1",
+            "ta 0x6d",
+            "mov %o0, {4}",
+            in(reg) id_ptr,
+            in(reg) id_len,
+            in(reg) mode,
+            const SYSCALL_RESOURCE_ACQUIRE,
+            lateout(reg) ret,
+            out("o0") _,
+            out("o1") _,
+            out("o2") _,
+            out("g1") _,
+            options(nostack)
+        );
     }
-
-    // println!("security_sparc: Bağlam Değiştirildi.");
+    if ret < 0 {
+        Err(SecurityError::InternalError)
+    } else {
+        Ok(ret as u64)
+    }
 }
 
-/// SPARC mimarisine özel trap (kesme, istisna, sistem çağrısı) işleyicisi.
-/// SPARC trap vektör tablosu tarafından çağrılacak düşük seviyeli giriş noktası.
-/// `trap_frame_ptr`: Trap anındaki mimariye özel kayıtları içeren yapının pointer'ı.
-/// Çekirdeğin genel trap işleme mantığına (örneğin sistem çağrıları için handle_syscall'a) yönlendirme yapar.
-#[no_mangle] // Düşük seviyeli işleyici tarafından çağrılabilmesi için isim düzenlemesi yapılmaz
-pub extern "C" fn sparc_trap_handler(trap_frame_ptr: *mut SparcRegisters) {
-     println!("security_sparc: Trap Yakalandı!"); // Dikkatli loglama
-
-    // TODO: Trap frame pointer'ının geçerli olduğunu doğrula.
-    if trap_frame_ptr.is_null() {
-        // Kritik hata: Geçersiz trap frame! Sistemi durdur?
-        println!("security_sparc: HATA: Geçersiz trap frame pointer!");
-        // TODO: Kurtarılamaz hata işleme mekanizması
-        loop {}
+fn sys_resource_write(handle: u64, buf: &[u8]) -> Result<usize, SecurityError> {
+    let ptr = buf.as_ptr();
+    let len = buf.len();
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "mov {0}, %o0",
+            "mov {1}, %o1",
+            "mov {2}, %o2",
+            "mov {3}, %g1",
+            "ta 0x6d",
+            "mov %o0, {4}",
+            in(reg) handle,
+            in(reg) ptr,
+            in(reg) len,
+            const SYSCALL_RESOURCE_WRITE,
+            lateout(reg) ret,
+            out("o0") _,
+            out("o1") _,
+            out("o2") _,
+            out("g1") _,
+            options(nostack)
+        );
     }
-
-    let trap_frame = unsafe { &mut *trap_frame_ptr };
-
-    // TODO: Trap tipini trap frame'den veya ilgili donanım kaydından belirle.
-     let trap_type = get_sparc_trap_type(trap_frame);
-
-    match trap_type { // Varsayımsal trap_type değişkeni
-        SPARC_TRAP_TYPE_SYSCALL => {
-            // Sistem çağrısı trapi
-            println!("security_sparc: Sistem Çağrısı Trapi!");
-
-            // TODO: Sistem çağrısı numarasını ve argümanlarını trap frame'den veya kayıtlardan al.
-            // SPARC'ta sistem çağrısı argümanları genellikle belirli kayıtlarda bulunur (o0, o1, vb.).
-             Let syscall_number = trap_frame.g1; // Örnek: g1'de syscall no olduğunu varsayalım
-             Let arg1 = trap_frame.o0;
-            // ... diğer argümanlar ...
-
-            // Karnal64'ün genel sistem çağrısı işleyicisini çağır.
-            // Bu fonksiyon, syscall numarasını ve ham argümanları alır.
-            // handle_syscall, karnal64.rs içinde tanımlanan fonksiyon.
-            let result = karnal64::handle_syscall(
-                syscall_number,
-                arg1,
-                arg2, // Varsayımsal diğer argümanlar
-                arg3,
-                arg4,
-                arg5,
-            );
-
-            // TODO: Sistem çağrısı sonucunu (result) trap frame'deki uygun kayıt(lar)a yaz.
-            // Kullanıcı alanına dönecek değer genellikle o0 kaydına konur.
-            // Hata durumunda (negatif i64) bu da uygun şekilde işaretlenir/işlenir.
-            // trap_frame.o0 = result as u64; // Başarı değeri
-            // Eğer hata ise, bir flag kaydı veya başka bir mekanizma kullanılabilir.
-        }
-        // TODO: Diğer trap tipleri için işleyiciler:
-        // - Page Fault (Bellek hatası): kmemory modülünün fault işleyicisini çağırabilir.
-        // - Illegal Instruction (Geçersiz komut): Süreci sonlandırabilir veya sinyal gönderebilir.
-        // - Alignment Error (Hizalama hatası):
-        // - Hardware Interrupt (Donanım kesmesi): Aygıt sürücülerinin veya çekirdek kesme işleyicisini çağırabilir.
-        _ => {
-            // Bilinmeyen veya işlenmeyen trap tipi
-            println!("security_sparc: İşlenmeyen Trap Tipi: {}", trap_type);
-            // TODO: Hata raporlama ve belki görev sonlandırma
-            loop {} // Geçici olarak sistemi durdur
-        }
+    if ret < 0 {
+        Err(SecurityError::InternalError)
+    } else {
+        Ok(ret as usize)
     }
-
-    // Trap işleyiciden çıkış. Donanım, trap frame'deki duruma göre kullanıcı alanına dönecektir.
-    // Kayıt pencerelerinin doğru yönetimi burada kritiktir.
 }
 
-// --- Yardımcı Fonksiyonlar ve Dahili Implementasyonlar (Yer Tutucular) ---
-
-/// SPARC MMU'yu başlangıç için yapılandırır.
-fn setup_mmu() -> Result<(), KError> {
-    println!("security_sparc: MMU yapılandırılıyor...");
-    // TODO: SPARC MMU'ya özel kayıtları ayarla (örneğin, Page Table Base Register'ı).
-    // TODO: Başlangıç sayfa tablolarını oluştur (çekirdek kodu/verisi, boot stack'i vb. için).
-    // Bu adım, kmemory modülünün fiziksel bellek ayırıcısından sayfa çerçeveleri
-    // tahsis etmeyi gerektirebilir.
-     let kernel_page_table = kmemory::create_kernel_page_table()?; // Varsayımsal Karnal64 çağrısı
-
-    println!("security_sparc: MMU yapılandırması tamamlandı.");
-    Ok(())
+fn sys_resource_read(handle: u64, buf: *mut u8, len: usize) -> Result<usize, SecurityError> {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "mov {0}, %o0",
+            "mov {1}, %o1",
+            "mov {2}, %o2",
+            "mov {3}, %g1",
+            "ta 0x6d",
+            "mov %o0, {4}",
+            in(reg) handle,
+            in(reg) buf,
+            in(reg) len,
+            const SYSCALL_RESOURCE_READ,
+            lateout(reg) ret,
+            out("o0") _,
+            out("o1") _,
+            out("o2") _,
+            out("g1") _,
+            options(nostack)
+        );
+    }
+    if ret < 0 {
+        Err(SecurityError::InternalError)
+    } else {
+        Ok(ret as usize)
+    }
 }
 
-/// SPARC Trap Vektör Tablosunu ayarlar.
-fn setup_trap_table() -> Result<(), KError> {
-    println!("security_sparc: Trap Tablosu ayarlanıyor...");
-    // TODO: sparc_trap_handler fonksiyonunun adresini al.
-    // TODO: Bu adresi SPARC'ın Trap Table Base Register (TTBR) kaydına yaz.
-    // Tüm trap'lar artık sparc_trap_handler'a yönlendirilecektir.
-    let handler_address = sparc_trap_handler as *const ();
-     write_sparc_ttbr(handler_address as u64); // Varsayımsal donanım yazma fonksiyonu
+fn sys_resource_release(handle: u64) -> Result<(), SecurityError> {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "mov {0}, %o0",
+            "mov {1}, %g1",
+            "ta 0x6d",
+            "mov %o0, {2}",
+            in(reg) handle,
+            const SYSCALL_RESOURCE_RELEASE,
+            lateout(reg) ret,
+            out("o0") _,
+            out("g1") _,
+            options(nostack)
+        );
+    }
+    if ret < 0 {
+        Err(SecurityError::InternalError)
+    } else {
+        Ok(())
+    }
+}
 
-    println!("security_sparc: Trap Tablosu ayarlandı.");
-    Ok(())
+// --- Kullanım örnekleri ---
+pub fn enable_security_mechanism(mech: SecurityMechanism) -> Result<(), SecurityError> {
+    let mgr = SparcSecurityManager;
+    mgr.set_mechanism(mech, true)
+}
+
+pub fn disable_security_mechanism(mech: SecurityMechanism) -> Result<(), SecurityError> {
+    let mgr = SparcSecurityManager;
+    mgr.set_mechanism(mech, false)
+}
+
+pub fn is_security_mechanism_enabled(mech: SecurityMechanism) -> Result<bool, SecurityError> {
+    let mgr = SparcSecurityManager;
+    mgr.query_mechanism(mech)
 }
