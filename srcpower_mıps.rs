@@ -1,95 +1,142 @@
-#![no_std] // Kernel alanında çalışır, standart kütüphane yok.
-
-// Geliştirme sırasında kullanılmayan kod veya argümanlar için izinler
+#![no_std]
 #![allow(dead_code)]
 #![allow(unused_variables)]
 
-// Karnal64 API'sından gerekli tipleri/traitleri içe aktaralım
-// `power_mips.rs`, projenizin src/ dizininde ve `karnal64.rs` de aynı
-// src/ dizinindeyse, Karnal64'e erişmek için `super::` kullanabiliriz.
-// Proje yapınız farklıysa bu yol (`super::`) değişebilir.
-use super::KError; // Karnal64 hata tipi
-
-// TODO: İhtiyaca göre KHandle, ResourceProvider trait'i veya diğer Karnal64
-// tipleri buraya eklenebilir. Örneğin, donanım register'larına erişim için.
- use super::{KHandle, ResourceProvider, kresource};
-
-/// MIPS mimarisine özgü güç yönetimi modülü başlatma fonksiyonu.
-/// Çekirdek başlatma sırasında Karnal64'ün ana init fonksiyonu tarafından
-/// bir noktada çağrılmalıdır.
-pub fn init() -> Result<(), KError> {
-    // TODO: MIPS'e özgü güç yönetimi donanımını başlatın.
-    // Örneğin, özel güç yönetim birimlerinin (PMU) register'larını yapılandırın.
-    // Gerekirse, bu donanımı temsil eden ResourceProvider'ları Karnal64'e kaydedin
-    // veya Karnal64 üzerinden ilgili donanım handle'larını edinin.
-
-    // Örnek: Güç kontrol register'larına erişim için bir ResourceProvider
-    // edinme (varsayımsal resource_acquire çağrısı - tam implementasyonu Karnal64'te olmalı).
-     let power_reg_handle = kresource::resource_acquire( // kresource:: resource_acquire olmalı eğer pub ise
-         "karnal://device/mips/power_regs".as_bytes().as_ptr(), // Kaynak ismi
-         "karnal://device/mips/power_regs".len(),
-         kresource::MODE_READ | kresource::MODE_WRITE // İzin modları
-     )?;
-    // TODO: Elde edilen handle'ı veya ilgili yönetim yapısını modül içinde saklayın.
-
-    // Başarılı başlatmayı simüle edelim.
-    // Çekirdek içi print! fonksiyonunuz varsa kullanabilirsiniz:
-     println!("MIPS Güç Yönetimi Modülü Başlatıldı.");
-
-    Ok(()) // Başarı durumunda Ok(()) döndür
+// --- Güç Durumları ---
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum PowerState {
+    Sleep,
+    Hibernate,
+    PowerOff,
+    Performance,
+    Powersave,
 }
 
-/// Mevcut görevi (thread'i) belirtilen süre kadar uyku moduna sokar.
-/// Bu fonksiyon, Karnal64'ün görev yönetimi (scheduler) alt sistemini kullanır.
-///
-/// # Argümanlar
-/// * `duration_ms`: Mevcut thread'in uykuda kalacağı süre milisaniye cinsinden.
-///
-/// # Dönüş Değeri
-/// Başarı durumunda Ok(()), hata durumunda `KError` döner.
-///
-/// # Not
-/// Bu fonksiyonun çalışabilmesi için, Karnal64'ün dahili `ktask` modülünün
-/// (veya scheduler'ın) diğer çekirdek bileşenleri tarafından çağrılabilen
-/// bir `task_sleep` (veya benzeri) fonksiyonunu dışa aktarması (`pub` yapılması)
-/// gerekmektedir. Aşağıdaki çağrı varsayımsaldır ve `ktask` modülüne doğrudan
-/// erişim olduğunu varsayar.
-pub fn sleep(duration_ms: u64) -> Result<(), KError> {
-    if duration_ms == 0 {
-        // 0ms uyumak genellikle CPU'yu diğer görevlere bırakmak (yield) anlamına gelir.
-        // TODO: Karnal64'ün görev zamanlayıcısının yield fonksiyonunu çağırın.
-         return super::ktask::yield_now(); // Varsayımsal yield fonksiyonu çağrısı
+// --- Hata Türü ---
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[repr(i64)]
+pub enum PowerError {
+    NotSupported = -1,
+    InternalError = -2,
+    InvalidState = -3,
+}
 
-         println!("MIPS Power: Görev CPU'yu bıraktı (0ms uyku)."); // Simülasyon
-        Ok(()) // Yield başarısı simülasyonu
-    } else {
-        // TODO: Karnal64'ün görev zamanlayıcısının uyku fonksiyonunu çağırın.
-        // Bu çağrı doğrudan `ktask` modülüne yapılacaktır.
-        // Örneğin:
-         super::ktask::task_sleep(duration_ms)?;
+// --- Karnal64 Sistem Çağrı Numaraları (çekirdek ile uyumlu olmalı) ---
+pub const SYSCALL_RESOURCE_ACQUIRE: u64 = 5;
+pub const SYSCALL_RESOURCE_RELEASE: u64 = 8;
+pub const SYSCALL_RESOURCE_WRITE: u64 = 7;
 
-         println!("MIPS Power: Görev {} ms uykuya geçiyor.", duration_ms); // Simülasyon
+// --- Kaynak Adı ---
+const RESOURCE_POWER: &[u8] = b"karnal://power";
 
-        // Başarı durumunda görev zamanlayıcı bu görev/thread'i uyandıracak.
-        // Hata durumunda çekirdek hatası dönecek.
+// --- MIPS Güç Yöneticisi ---
+pub struct MipsPowerManager;
 
-        // Şimdilik başarılı dönüşü simüle edelim.
-        Ok(()) // Başarı simülasyonu
+impl MipsPowerManager {
+    pub fn set_power_state(&self, state: PowerState) -> Result<(), PowerError> {
+        let handle = sys_resource_acquire(RESOURCE_POWER, 0)?;
+        let cmd = match state {
+            PowerState::Sleep => b"sleep" as &[u8],
+            PowerState::Hibernate => b"hibernate" as &[u8],
+            PowerState::PowerOff => b"poweroff" as &[u8],
+            PowerState::Performance => b"performance" as &[u8],
+            PowerState::Powersave => b"powersave" as &[u8],
+        };
+        let result = sys_resource_write(handle, cmd);
+        let _ = sys_resource_release(handle);
+        result.map(|_| ())
     }
 }
 
-// TODO: MIPS'e özgü diğer güç yönetimi fonksiyonları eklenebilir.
-// Örneğin:
-//
-// /// CPU frekansını belirtilen değere ayarlar (varsayımsal).
-// /// # Argümanlar
-// /// * `freq_khz`: Ayarlanacak frekans kHz cinsinden.
- fn set_cpu_frequency(freq_khz: u32) -> Result<(), KError> {
-//     // Donanım register'ları veya ilgili ResourceProvider üzerinden işlem yapacak.
-//     // Bu, init fonksiyonunda edinilen handle veya saklanan referans üzerinden olabilir.
-//     // Örneğin:
-      let power_provider = get_power_register_provider()?; // Saklanan referansı al
-      power_provider.control(POWER_CONTROL_SET_FREQ, freq_khz as u64)?; // Varsayımsal kontrol komutu
-      Ok(())
-     unimplemented!() // Henüz implemente edilmedi
- }
+// --- Karnal64 Sistem Çağrılarını Kullanma (unsafe, platform bağımlı) ---
+fn sys_resource_acquire(resource_id: &[u8], mode: u32) -> Result<u64, PowerError> {
+    let id_ptr = resource_id.as_ptr() as usize;
+    let id_len = resource_id.len();
+    let ret: isize;
+    unsafe {
+        // MIPS: $a0, $a1, $a2 = args; $v0 = syscall no; syscall; return in $v0
+        core::arch::asm!(
+            "move $a0, {0}",
+            "move $a1, {1}",
+            "move $a2, {2}",
+            "li $v0, {3}",
+            "syscall",
+            "move {4}, $v0",
+            in(reg) id_ptr,
+            in(reg) id_len,
+            in(reg) mode,
+            const SYSCALL_RESOURCE_ACQUIRE,
+            lateout(reg) ret,
+            out("a0") _,
+            out("a1") _,
+            out("a2") _,
+            out("v0") _,
+            options(nostack)
+        );
+    }
+    if ret < 0 {
+        Err(PowerError::InternalError)
+    } else {
+        Ok(ret as u64)
+    }
+}
+
+fn sys_resource_write(handle: u64, buf: &[u8]) -> Result<usize, PowerError> {
+    let ptr = buf.as_ptr() as usize;
+    let len = buf.len();
+    let ret: isize;
+    unsafe {
+        core::arch::asm!(
+            "move $a0, {0}",
+            "move $a1, {1}",
+            "move $a2, {2}",
+            "li $v0, {3}",
+            "syscall",
+            "move {4}, $v0",
+            in(reg) handle,
+            in(reg) ptr,
+            in(reg) len,
+            const SYSCALL_RESOURCE_WRITE,
+            lateout(reg) ret,
+            out("a0") _,
+            out("a1") _,
+            out("a2") _,
+            out("v0") _,
+            options(nostack)
+        );
+    }
+    if ret < 0 {
+        Err(PowerError::InternalError)
+    } else {
+        Ok(ret as usize)
+    }
+}
+
+fn sys_resource_release(handle: u64) -> Result<(), PowerError> {
+    let ret: isize;
+    unsafe {
+        core::arch::asm!(
+            "move $a0, {0}",
+            "li $v0, {1}",
+            "syscall",
+            "move {2}, $v0",
+            in(reg) handle,
+            const SYSCALL_RESOURCE_RELEASE,
+            lateout(reg) ret,
+            out("a0") _,
+            out("v0") _,
+            options(nostack)
+        );
+    }
+    if ret < 0 {
+        Err(PowerError::InternalError)
+    } else {
+        Ok(())
+    }
+}
+
+// --- Kullanım örneği ---
+pub fn set_mips_power(state: PowerState) -> Result<(), PowerError> {
+    let mgr = MipsPowerManager;
+    mgr.set_power_state(state)
+}
