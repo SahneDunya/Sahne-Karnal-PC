@@ -1,119 +1,192 @@
-#![no_std] // Bu modül de çekirdek alanında çalışacak
+#![no_std]
+#![allow(dead_code)]
+#![allow(unused_variables)]
 
-// Karnal64 API'sından gerekli tipleri içe aktaralım
-// Kök dosyanız 'karnal64.rs' içinde karnal64 modülü tanımlandığını varsayarak içe aktarıyoruz.
-// Eğer karnal64.rs doğrudan src/lib.rs veya src/main.rs ise 'crate::KError' şeklinde içe aktarılabilir.
-// Proje yapınıza göre burası ayarlanmalıdır. Şimdilik varsayımsal bir içe aktarma yolu kullanıyorum.
-use crate::karnal64::{KError, KHandle, kmemory}; // kmemory sadece referans amaçlı eklendi, lpddr kmemory'yi kullanmaz, kmemory lpddr'yi kullanır
+// --- Karnal64 Sistem Çağrı Numaraları ---
+pub const SYSCALL_LPDDR_ALLOC: u64 = 30;
+pub const SYSCALL_LPDDR_FREE: u64 = 31;
+pub const SYSCALL_LPDDR_PROTECT: u64 = 32;
+pub const SYSCALL_LPDDR_INFO: u64 = 33;
 
-// Bellek adreslerini temsil etmek için temel tipler
-// Gerçek çekirdekte bu tipler genellikle donanıma özgü olabilir veya daha gelişmiş sarmalayıcılar içerebilir.
-pub type PhysAddr = u64;
-pub type VirtAddr = u64;
-pub type PhysFrame = PhysAddr; // Basitlik için çerçeve adresini fiziksel adres olarak alalım
-
-// Bellek çerçevesi boyutu (örn: 4KB)
-const PAGE_SIZE: usize = 4096; // Varsayımsal sayfa/çerçeve boyutu
-
-// LPDDR Bellek Denetleyicisi Durumunu Temsil Eden Yapı
-// Gerçekte bu, donanım kayıtlarının temel adreslerini veya daha karmaşık durumu tutar.
-struct LpddrController {
-    base_phys_addr: PhysAddr,
-    total_size: usize,
-    // TODO: Fiziksel çerçeve haritası veya ayırma bilgileri için alanlar eklenecek
-    // Bu, hangi fiziksel bellek sayfalarının tahsis edildiğini takip etmek için gereklidir.
-    // Bitmap, free list veya buddy allocator gibi yapılar burada yönetilir.
-    frame_allocator: spin::Mutex<BitmapFrameAllocator>
+// --- Hata Türü ---
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[repr(i64)]
+pub enum LpddrMemoryError {
+    NotSupported = -1,
+    InternalError = -2,
+    InvalidOperation = -3,
+    OutOfMemory = -4,
+    InvalidParameter = -5,
 }
 
-// Tekil LPDDR Denetleyici Örneği
-// Çekirdek genellikle LPDDR gibi donanımlara tekil olarak erişir.
-// `static` kullanarak çekirdek boyunca erişilebilir bir örnek tanımlayalım.
-// Kilit (Mutex) kullanarak güvenli erişim sağlamak önemlidir, özellikle çok işlemcili sistemlerde.
-// Yer tutucu: Gerçek implementasyonda başlatma (`init`) sırasında doldurulmalıdır.
-static mut LPDDR_CONTROLLER: Option<LpddrController> = None;
-// TODO: Güvenli statik başlatma ve erişim için Mutex veya Spinlock eklenecek.
- static LPDDR_CONTROLLER: OnceCell<spin::Mutex<LpddrController>> = OnceCell::new();
-
-// LPDDR Modülünün Başlatılması
-// Bu fonksiyon, çekirdek başlangıcında `kmemory::init_manager` tarafından çağrılabilir.
-// Donanım LPDDR denetleyicisini yapılandırır ve dahili fiziksel bellek ayırıcısını başlatır.
-pub fn init(base_phys_addr: PhysAddr, size: usize) -> Result<(), KError> {
-    // TODO: Gerçek donanım LPDDR denetleyicisi kayıtlarını yapılandırma
-    // TODO: Geçerlilik kontrolü: base_phys_addr ve size geçerli mi?
-
-    // Fiziksel çerçeve ayırıcısını başlat
-     BitmapFrameAllocator::new(base_phys_addr, size, PAGE_SIZE).map_err(|_| KError::InternalError)?;
-
-    // Denetleyici örneğini oluştur ve statik değişkene ata
-    let controller = LpddrController {
-        base_phys_addr,
-        total_size: size,
-        // TODO: Başlatılan frame_allocator buraya eklenecek
-    };
-
-    unsafe {
-        // TODO: Statik değişkene atama işlemini kilitle koru
-        LPDDR_CONTROLLER = Some(controller);
-    }
-
-    // TODO: Başlatmanın başarılı olduğunu doğrula
-
-    println!("LPDDR Bellek Modülü Başlatıldı: Adres = {:x}, Boyut = {} KB", base_phys_addr, size / 1024); // Çekirdek içi print! gerektirir
-
-    Ok(()) // Başarı
-}
-
-// Fiziksel Bellek Çerçevesi (Page) Tahsis Et
-// Çekirdeğin bellek yöneticisi (kmemory) tarafından kullanılır.
-// Tek bir boş fiziksel bellek çerçevesinin fiziksel adresini döndürür.
-pub fn allocate_frame() -> Result<PhysFrame, KError> {
-    // TODO: LPDDR_CONTROLLER örneğine güvenli bir şekilde eriş
-    // TODO: Dahili fiziksel çerçeve ayırıcısından bir çerçeve tahsis et.
-    // Ayırıcı, boş bir çerçeve bulup onu "tahsis edildi" olarak işaretlemelidir.
-
-    unsafe {
-        // Yer tutucu: Sadece başlatılmış mı diye kontrol et
-        let controller = LPDDR_CONTROLLER.as_ref().ok_or(KError::InternalError)?;
-        // TODO: Gerçek tahsis mantığı (örneğin bitmap'ten bir bit bulma)
-
-        // Başarılı tahsis durumunda çerçevenin fiziksel adresini döndür
-         Ok(controller.frame_allocator.allocate_frame()?)
-        println!("LPDDR: Fiziksel çerçeve tahsis edildi (Yer Tutucu)");
-        Ok(controller.base_phys_addr + PAGE_SIZE as u64) // Örnek: Base adres + 1. sayfa adresi döndür
+// --- LPDDR Bellek Koruma Bayrakları ---
+bitflags::bitflags! {
+    pub struct LpddrMemoryProtection: u32 {
+        const READ    = 0b0001;
+        const WRITE   = 0b0010;
+        const EXECUTE = 0b0100;
+        const NONE    = 0b0000;
     }
 }
 
-// Fiziksel Bellek Çerçevesini Serbest Bırak
-// Çekirdeğin bellek yöneticisi (kmemory) tarafından kullanılır.
-// Tahsis edilmiş bir fiziksel çerçeveyi tekrar kullanıma açar.
-pub fn free_frame(frame: PhysFrame) -> Result<(), KError> {
-    // TODO: LPDDR_CONTROLLER örneğine güvenli bir şekilde eriş
-    // TODO: Verilen fiziksel çerçevenin geçerli bir LPDDR çerçevesi olduğunu doğrula (sınırlar içinde mi?).
-    // TODO: Dahili fiziksel çerçeve ayırıcısında çerçeveyi "serbest" olarak işaretle.
+// --- LPDDR Bellek Bilgisi ---
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct LpddrMemoryInfo {
+    pub base: usize,
+    pub total: usize,
+    pub free: usize,
+    pub used: usize,
+    pub largest_free_block: usize,
+}
 
-    unsafe {
-        // Yer tutucu: Sadece başlatılmış mı diye kontrol et
-        let controller = LPDDR_CONTROLLER.as_ref().ok_or(KError::InternalError)?;
-         // TODO: Gerçek serbest bırakma mantığı (örneğin bitmap'te ilgili bit'i sıfırlama)
+// --- LPDDR Bellek Yönetim Arayüzü ---
+pub struct KarnalLpddrMemory;
 
-        // Başarılı serbest bırakma
-         controller.frame_allocator.free_frame(frame)?;
-        println!("LPDDR: Fiziksel çerçeve serbest bırakıldı (Yer Tutucu): {:x}", frame);
-        Ok(())
+impl KarnalLpddrMemory {
+    /// LPDDR belleği ayır
+    pub fn alloc(size: usize, prot: LpddrMemoryProtection) -> Result<*mut u8, LpddrMemoryError> {
+        let mut addr: usize = 0;
+        let ret = unsafe {
+            sys_lpddr_alloc(size, prot.bits(), &mut addr as *mut usize)
+        };
+        match ret {
+            0 => Ok(addr as *mut u8),
+            -4 => Err(LpddrMemoryError::OutOfMemory),
+            -5 => Err(LpddrMemoryError::InvalidParameter),
+            _ => Err(LpddrMemoryError::InternalError),
+        }
+    }
+
+    /// LPDDR belleği serbest bırak
+    pub fn free(ptr: *mut u8, size: usize) -> Result<(), LpddrMemoryError> {
+        let ret = unsafe { sys_lpddr_free(ptr as usize, size) };
+        match ret {
+            0 => Ok(()),
+            -5 => Err(LpddrMemoryError::InvalidParameter),
+            _ => Err(LpddrMemoryError::InternalError),
+        }
+    }
+
+    /// LPDDR bellek koruması değiştir
+    pub fn protect(ptr: *mut u8, size: usize, prot: LpddrMemoryProtection) -> Result<(), LpddrMemoryError> {
+        let ret = unsafe { sys_lpddr_protect(ptr as usize, size, prot.bits()) };
+        match ret {
+            0 => Ok(()),
+            -5 => Err(LpddrMemoryError::InvalidParameter),
+            _ => Err(LpddrMemoryError::InternalError),
+        }
+    }
+
+    /// LPDDR bellek durumu hakkında bilgi al
+    pub fn info() -> Result<LpddrMemoryInfo, LpddrMemoryError> {
+        let mut info = LpddrMemoryInfo {
+            base: 0,
+            total: 0,
+            free: 0,
+            used: 0,
+            largest_free_block: 0,
+        };
+        let ret = unsafe { sys_lpddr_info(&mut info as *mut LpddrMemoryInfo) };
+        match ret {
+            0 => Ok(info),
+            _ => Err(LpddrMemoryError::InternalError),
+        }
     }
 }
 
-// Toplam LPDDR Bellek Boyutunu Getir
-pub fn get_total_size() -> Result<usize, KError> {
-     unsafe {
-        // Yer tutucu: Sadece başlatılmış mı diye kontrol et
-        let controller = LPDDR_CONTROLLER.as_ref().ok_or(KError::InternalError)?;
-        Ok(controller.total_size)
-     }
+// --- Karnal64 Sistem Çağrısı Uyumlu Assembly (Kendi çekirdeğinize göre uyarlayınız) ---
+
+/// LPDDR Bellek ayırma sistem çağrısı
+unsafe fn sys_lpddr_alloc(size: usize, prot: u32, out_addr: *mut usize) -> i64 {
+    let mut ret: i64;
+    core::arch::asm!(
+        // x0: size, x1: prot, x2: out_addr, x8: syscall no, svc #0, x0: return
+        "mov x0, {0}",
+        "mov x1, {1}",
+        "mov x2, {2}",
+        "mov x8, {3}",
+        "svc #0",
+        "mov {4}, x0",
+        in(reg) size,
+        in(reg) prot,
+        in(reg) out_addr,
+        const SYSCALL_LPDDR_ALLOC,
+        lateout(reg) ret,
+        out("x0") _, out("x1") _, out("x2") _, out("x8") _,
+        options(nostack)
+    );
+    ret
 }
 
-// TODO: Bellek bölgesi (MemoryRegion) tanımlama, bellek haritası oluşturma gibi daha gelişmiş
-// bellek yönetimi alt fonksiyonları buraya eklenebilir.
- map_physical_to_virtual(page_table: &mut PageTable, phys_addr: PhysAddr, virt_addr: VirtAddr, flags: PageFlags) -> Result<(), KError>;
- get_physical_address(page_table: &PageTable, virt_addr: VirtAddr) -> Result<PhysAddr, KError>;
+/// LPDDR Bellek serbest bırakma sistem çağrısı
+unsafe fn sys_lpddr_free(ptr: usize, size: usize) -> i64 {
+    let mut ret: i64;
+    core::arch::asm!(
+        "mov x0, {0}",
+        "mov x1, {1}",
+        "mov x8, {2}",
+        "svc #0",
+        "mov {3}, x0",
+        in(reg) ptr,
+        in(reg) size,
+        const SYSCALL_LPDDR_FREE,
+        lateout(reg) ret,
+        out("x0") _, out("x1") _, out("x8") _,
+        options(nostack)
+    );
+    ret
+}
+
+/// LPDDR bellek koruma sistem çağrısı
+unsafe fn sys_lpddr_protect(ptr: usize, size: usize, prot: u32) -> i64 {
+    let mut ret: i64;
+    core::arch::asm!(
+        "mov x0, {0}",
+        "mov x1, {1}",
+        "mov x2, {2}",
+        "mov x8, {3}",
+        "svc #0",
+        "mov {4}, x0",
+        in(reg) ptr,
+        in(reg) size,
+        in(reg) prot,
+        const SYSCALL_LPDDR_PROTECT,
+        lateout(reg) ret,
+        out("x0") _, out("x1") _, out("x2") _, out("x8") _,
+        options(nostack)
+    );
+    ret
+}
+
+/// LPDDR bellek durumu sorgulama sistem çağrısı
+unsafe fn sys_lpddr_info(info_ptr: *mut LpddrMemoryInfo) -> i64 {
+    let mut ret: i64;
+    core::arch::asm!(
+        "mov x0, {0}",
+        "mov x8, {1}",
+        "svc #0",
+        "mov {2}, x0",
+        in(reg) info_ptr,
+        const SYSCALL_LPDDR_INFO,
+        lateout(reg) ret,
+        out("x0") _, out("x8") _,
+        options(nostack)
+    );
+    ret
+}
+
+// --- Kullanım Örnekleri ---
+pub fn example_usage() {
+    // LPDDR bellekten 4096 bayt ayır
+    if let Ok(ptr) = KarnalLpddrMemory::alloc(4096, LpddrMemoryProtection::READ | LpddrMemoryProtection::WRITE) {
+        // Koruma sadece okuma olarak değiştir
+        let _ = KarnalLpddrMemory::protect(ptr, 4096, LpddrMemoryProtection::READ);
+
+        // LPDDR bellek durumu al
+        let _ = KarnalLpddrMemory::info();
+
+        // Belleği serbest bırak
+        let _ = KarnalLpddrMemory::free(ptr, 4096);
+    }
+}
