@@ -1,243 +1,192 @@
-#![no_std] // Kernel alanında çalışacağı için standart kütüphaneye ihtiyaç yok.
+#![no_std]
+#![allow(dead_code)]
+#![allow(unused_variables)]
 
-use karnal64::{KError, KHandle}; // Varsayım: Karnal64 temel tiplerine erişim var.
-// Varsayım: kmemory modülü gerekli trait'leri ve register fonksiyonunu dışarıya açıyor.
-use karnal64::kmemory::{MemoryAllocator, MemoryAllocatorId, register_allocator};
-use spin::Mutex; // Basit bir spinlock ile eşzamanlılık kontrolü. Kernel geliştirmede yaygın.
+// --- Karnal64 Sistem Çağrı Numaraları ---
+pub const SYSCALL_HBM_ALLOC: u64 = 50;
+pub const SYSCALL_HBM_FREE: u64 = 51;
+pub const SYSCALL_HBM_PROTECT: u64 = 52;
+pub const SYSCALL_HBM_INFO: u64 = 53;
 
-// --- HBM Bellek Bölgesi Tanımları (Varsayımsal) ---
-// Gerçek bir sistemde bu değerler donanım veya bootloader tarafından sağlanır.
-const HBM_BASE_ADDRESS: usize = 0x8000_0000; // Örnek: HBM'in başladığı sanal adres
-const HBM_SIZE: usize = 64 * 1024 * 1024; // Örnek: 64 MB HBM boyutu
-const MIN_ALLOC_SIZE: usize = 64; // Minimum tahsis birimi (alignment veya blok boyutu)
-
-// --- Bellek Bloku Durumu ---
-#[derive(Debug, Copy, Clone, PartialEq)]
-enum BlockStatus {
-    Free,
-    Used,
+// --- Hata Türü ---
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[repr(i64)]
+pub enum HbmMemoryError {
+    NotSupported = -1,
+    InternalError = -2,
+    InvalidOperation = -3,
+    OutOfMemory = -4,
+    InvalidParameter = -5,
 }
 
-// --- Bellek Bloku Yapısı ---
-// Basit blok ayırıcı için her blok başında bulunacak meta veri.
-#[repr(C)] // C uyumluluğu için düzeni belirleyelim
-struct MemoryBlock {
-    status: BlockStatus,
-    size: usize, // Bu blokun toplam boyutu (meta veri dahil)
-    // Bağlı liste için sonraki/önceki pointer'ları da eklenebilir
-     next: *mut MemoryBlock,
-     prev: *mut MemoryBlock,
-}
-
-// MemoryBlock yapısının boyutu
-const META_SIZE: usize = core::mem::size_of::<MemoryBlock>();
-
-// --- HBM Bellek Yöneticisi ---
-pub struct HbmMemoryManager {
-    // HBM bellek bölgesinin başlangıcı ve sonu (çekirdek sanal adresleri)
-    start_addr: usize,
-    end_addr: usize,
-    // Ayırıcı mantığı için kilit (eşzamanlı erişimi korumak için)
-    lock: Mutex<()>, // Basit bir kilit, daha karmaşık bir yapı gerekebilir
-}
-
-impl HbmMemoryManager {
-    /// Yeni bir HBM Memory Manager örneği oluşturur.
-    /// `hbm_start`: HBM bellek bölgesinin çekirdek sanal başlangıç adresi.
-    /// `hbm_size`: HBM bellek bölgesinin boyutu.
-    pub fn new(hbm_start: usize, hbm_size: usize) -> Result<Self, KError> {
-        if hbm_size == 0 || hbm_size < META_SIZE + MIN_ALLOC_SIZE {
-            // Çok küçük veya geçersiz boyut
-            return Err(KError::InvalidArgument);
-        }
-
-        let end_addr = hbm_start.checked_add(hbm_size).ok_or(KError::InvalidArgument)?;
-
-        // HBM bölgesinin başına ilk serbest bloku yaz.
-        let initial_block_ptr = hbm_start as *mut MemoryBlock;
-        unsafe {
-            // Bu 'unsafe' blok, çekirdeğin bu adres aralığına erişebildiğini varsayar.
-            // Gerçek bir kernelde bu adresin sanal bellek haritasında doğru ayarlandığından
-            // emin olunmalıdır.
-            core::ptr::write_volatile(initial_block_ptr, MemoryBlock {
-                status: BlockStatus::Free,
-                size: hbm_size, // Başlangıçta tüm alan serbest
-                 next: core::ptr::null_mut(),
-                 prev: core::ptr::null_mut(),
-            });
-        }
-
-        Ok(Self {
-            start_addr: hbm_start,
-            end_addr: end_addr,
-            lock: Mutex::new(()),
-        })
+// --- HBM Bellek Koruma Bayrakları ---
+bitflags::bitflags! {
+    pub struct HbmMemoryProtection: u32 {
+        const READ    = 0b0001;
+        const WRITE   = 0b0010;
+        const EXECUTE = 0b0100;
+        const NONE    = 0b0000;
     }
+}
 
-    /// Belirtilen boyutta HBM belleği tahsis etmeye çalışır.
-    /// Kullanıcı alanı sanal adresini döndürür.
-    fn allocate_hbm(&self, size: usize, flags: u32) -> Result<*mut u8, KError> {
-        if size == 0 {
-            return Ok(core::ptr::null_mut()); // Sıfır boyut tahsis etmek geçerli olabilir
-        }
+// --- HBM Bellek Bilgisi ---
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct HbmMemoryInfo {
+    pub base: usize,
+    pub total: usize,
+    pub free: usize,
+    pub used: usize,
+    pub largest_free_block: usize,
+}
 
-        // Tahsis edilecek boyutu, meta veri boyutu ve minimum tahsis birimiyle hizala.
-        let needed_size = size
-            .checked_add(META_SIZE).ok_or(KError::OutOfMemory)? // Meta veri için yer
-            .checked_add(MIN_ALLOC_SIZE - 1).ok_or(KError::OutOfMemory)? // Hizalama için yer
-            & !(MIN_ALLOC_SIZE - 1); // Hizalama
+// --- HBM Bellek Yönetim Arayüzü ---
+pub struct KarnalHbmMemory;
 
-        if needed_size < META_SIZE + MIN_ALLOC_SIZE {
-             // Hizalamadan sonra bile minimumdan küçükse düzelt
-             needed_size = META_SIZE + MIN_ALLOC_SIZE;
-        }
-
-
-        let _guard = self.lock.lock(); // Kilidi al (eşzamanlı erişimi engelle)
-
-        let mut current_block_ptr = self.start_addr as *mut MemoryBlock;
-
-        // Basit first-fit arama
-        while (current_block_ptr as usize) < self.end_addr {
-            let current_block = unsafe {
-                // Güvenlik: Pointer'ın HBM bölgesinde ve geçerli bir MemoryBlock işaret ettiğini varsayıyoruz.
-                // Gerçek kernelde bu pointer validasyonu çok daha dikkatli yapılmalıdır.
-                core::ptr::read_volatile(current_block_ptr)
-            };
-
-            if current_block.status == BlockStatus::Free && current_block.size >= needed_size {
-                // Yeterince büyük serbest blok bulundu.
-
-                // Bu bloku kullanılmış olarak işaretle.
-                unsafe {
-                    core::ptr::write_volatile(&mut (*current_block_ptr).status, BlockStatus::Used);
-                }
-
-                // Eğer kalan alan yeterince büyükse, serbest bloku böl.
-                let remaining_size = current_block.size.checked_sub(needed_size).ok_or(KError::InternalError)?;
-                if remaining_size >= META_SIZE + MIN_ALLOC_SIZE {
-                    let new_free_block_ptr = (current_block_ptr as usize + needed_size) as *mut MemoryBlock;
-                    unsafe {
-                        // Yeni serbest bloku oluştur
-                        core::ptr::write_volatile(new_free_block_ptr, MemoryBlock {
-                            status: BlockStatus::Free,
-                            size: remaining_size,
-                            // next/prev güncellemeleri gerekebilir
-                        });
-                         // Orijinal kullanılan blokun boyutunu güncelle
-                         core::ptr::write_volatile(&mut (*current_block_ptr).size, needed_size);
-                    }
-                }
-                 // Not: Eğer remaining_size küçükse, kalan kısım parçalanır ve kullanılamaz hale gelir (internal fragmentation)
-
-                // Tahsis edilen alanın başlangıcı (meta veriden sonra)
-                let allocated_ptr = (current_block_ptr as usize + META_SIZE) as *mut u8;
-
-                // Güvenlik Notu: Buradan dönen 'allocated_ptr' değeri, kullanıcı alanı sanal adresine haritalanmalıdır.
-                // Bu basit örnekte, HBM adreslerinin doğrudan kullanıcı adresleriyle aynı olduğunu varsayıyoruz
-                // veya döndürmeden önce bir sanal bellek çevirisi/haritalaması yapılması gerektiğini işaret ediyoruz.
-                // Gerçekte döndürülen pointer'ın kullanıcının adres alanında geçerli olması sağlanmalıdır.
-
-                return Ok(allocated_ptr);
-            }
-
-            // Sonraki bloka geç.
-            let next_block_addr = (current_block_ptr as usize).checked_add(current_block.size).ok_or(KError::InternalError)?;
-             // Güvenlik: next_block_addr'ın HBM bölgesi içinde kaldığını kontrol et.
-             if next_block_addr >= self.end_addr {
-                 break; // Bölge dışına çıktık
-             }
-            current_block_ptr = next_block_addr as *mut MemoryBlock;
-        }
-
-        // Yeterli büyüklükte serbest blok bulunamadı.
-        Err(KError::OutOfMemory)
-    }
-
-    /// Daha önce tahsis edilmiş HBM belleğini serbest bırakır.
-    /// `ptr`: Serbest bırakılacak kullanıcı alanı sanal adresi.
-    /// `size`: Serbest bırakılacak alanın boyutu. (Ayırıcı bazen size bilgisini pointer'dan da alabilir)
-    fn deallocate_hbm(&self, ptr: *mut u8, size: usize) -> Result<(), KError> {
-        if ptr.is_null() {
-            return Ok(()); // Null pointer serbest bırakmak genellikle sorun değil
-        }
-
-        // Güvenlik Kontrolü: ptr'nin HBM bölgesine ait ve geçerli bir tahsisin başlangıcı (meta veriden sonrası) olup olmadığını doğrula.
-        let ptr_addr = ptr as usize;
-        if ptr_addr < self.start_addr + META_SIZE || ptr_addr >= self.end_addr {
-            return Err(KError::BadAddress); // Bölge dışında veya meta veri alanında
-        }
-
-        // Pointer'dan MemoryBlock meta verisine geri dön.
-        let block_ptr = ptr_addr.checked_sub(META_SIZE).ok_or(KError::BadAddress)? as *mut MemoryBlock;
-
-        // Güvenlik Kontrolü: block_ptr'nin gerçekten bir blok başlangıcı olduğunu ve durumunun 'Used' olduğunu doğrula.
-        // Gerçek ayırıcı implementasyonları, bu doğrulamaları yapmak için blok listesini gezebilir veya işaretçinin geçerliliğini kontrol edebilir.
-        let block = unsafe {
-             // Güvenlik: block_ptr'nin geçerli olduğunu varsayıyoruz.
-            core::ptr::read_volatile(block_ptr)
+impl KarnalHbmMemory {
+    /// HBM belleği ayır
+    pub fn alloc(size: usize, prot: HbmMemoryProtection) -> Result<*mut u8, HbmMemoryError> {
+        let mut addr: usize = 0;
+        let ret = unsafe {
+            sys_hbm_alloc(size, prot.bits(), &mut addr as *mut usize)
         };
-
-        if (block_ptr as usize) < self.start_addr || (block_ptr as usize) >= self.end_addr || block.status != BlockStatus::Used {
-             // Pointer HBM bölgesinde değil, veya 'Used' durumda değil.
-             return Err(KError::InvalidArgument); // Veya KError::BadAddress
+        match ret {
+            0 => Ok(addr as *mut u8),
+            -4 => Err(HbmMemoryError::OutOfMemory),
+            -5 => Err(HbmMemoryError::InvalidParameter),
+            _ => Err(HbmMemoryError::InternalError),
         }
-         // Boyut kontrolü de yapılabilir, ancak basit ayırıcıda pointer'dan boyutu alıyoruz.
-
-        let _guard = self.lock.lock(); // Kilidi al
-
-        // Bloku serbest olarak işaretle.
-        unsafe {
-            core::ptr::write_volatile(&mut (*block_ptr).status, BlockStatus::Free);
-        }
-
-        // İyileştirme: Komşu serbest blokları birleştirme (coalescing) mantığı buraya eklenebilir.
-        // Bu, parçalanmayı azaltır ve daha büyük serbest bloklar oluşturur.
-
-        Ok(())
     }
 
-    // TODO: İhtiyaç olursa shared_mem_create_hbm, map_shared_hbm, unmap_shared_hbm fonksiyonlarını ekle.
-    // HBM için paylaşımlı bellek, farklı görevlerin aynı HBM bölgesini kendi adres alanlarına haritalaması anlamına gelir.
-    // Bu, çekirdeğin sanal bellek yönetimi (MMU kontrolü) ile etkileşime girer.
+    /// HBM belleği serbest bırak
+    pub fn free(ptr: *mut u8, size: usize) -> Result<(), HbmMemoryError> {
+        let ret = unsafe { sys_hbm_free(ptr as usize, size) };
+        match ret {
+            0 => Ok(()),
+            -5 => Err(HbmMemoryError::InvalidParameter),
+            _ => Err(HbmMemoryError::InternalError),
+        }
+    }
+
+    /// HBM bellek koruması değiştir
+    pub fn protect(ptr: *mut u8, size: usize, prot: HbmMemoryProtection) -> Result<(), HbmMemoryError> {
+        let ret = unsafe { sys_hbm_protect(ptr as usize, size, prot.bits()) };
+        match ret {
+            0 => Ok(()),
+            -5 => Err(HbmMemoryError::InvalidParameter),
+            _ => Err(HbmMemoryError::InternalError),
+        }
+    }
+
+    /// HBM bellek durumu hakkında bilgi al
+    pub fn info() -> Result<HbmMemoryInfo, HbmMemoryError> {
+        let mut info = HbmMemoryInfo {
+            base: 0,
+            total: 0,
+            free: 0,
+            used: 0,
+            largest_free_block: 0,
+        };
+        let ret = unsafe { sys_hbm_info(&mut info as *mut HbmMemoryInfo) };
+        match ret {
+            0 => Ok(info),
+            _ => Err(HbmMemoryError::InternalError),
+        }
+    }
 }
 
+// --- Karnal64 Sistem Çağrısı Uyumlu Assembly (Kendi çekirdeğinize göre uyarlayınız) ---
 
-// --- MemoryAllocator Trait Implementasyonu ---
-// HbmMemoryManager'ın, kmemory modülünün beklediği arayüzü sağladığını belirtiriz.
-impl MemoryAllocator for HbmMemoryManager {
-    /// Kullanıcı belleği tahsis et (HBM'den)
-    fn allocate(&self, size: usize, flags: u32) -> Result<*mut u8, KError> {
-        // HBM ayırıcıyı çağır.
-        // Flags, belki bellek türü, erişim izinleri (okuma/yazma/çalıştırma) gibi bilgileri taşıyabilir.
-        self.allocate_hbm(size, flags)
-    }
-
-    /// Kullanıcı belleğini serbest bırak (HBM'den)
-    fn deallocate(&self, ptr: *mut u8, size: usize) -> Result<(), KError> {
-        // HBM serbest bırakma fonksiyonunu çağır.
-        self.deallocate_hbm(ptr, size)
-    }
-
-    // TODO: shared_mem_create, map_shared, unmap_shared metotlarını da MemoryAllocator trait'ine ekleyip burada implemente et.
-     fn create_shared_memory(&self, size: usize) -> Result<KHandle, KError> { /* ... */ }
-     fn map_shared_memory(&self, handle: &KHandle, offset: usize, size: usize) -> Result<*mut u8, KError> { /* ... */ }
-     fn unmap_shared_memory(&self, ptr: *mut u8, size: usize) -> Result<(), KError> { /* ... */ }
+/// HBM Bellek ayırma sistem çağrısı
+unsafe fn sys_hbm_alloc(size: usize, prot: u32, out_addr: *mut usize) -> i64 {
+    let mut ret: i64;
+    core::arch::asm!(
+        // x0: size, x1: prot, x2: out_addr, x8: syscall no, svc #0, x0: return
+        "mov x0, {0}",
+        "mov x1, {1}",
+        "mov x2, {2}",
+        "mov x8, {3}",
+        "svc #0",
+        "mov {4}, x0",
+        in(reg) size,
+        in(reg) prot,
+        in(reg) out_addr,
+        const SYSCALL_HBM_ALLOC,
+        lateout(reg) ret,
+        out("x0") _, out("x1") _, out("x2") _, out("x8") _,
+        options(nostack)
+    );
+    ret
 }
 
+/// HBM Bellek serbest bırakma sistem çağrısı
+unsafe fn sys_hbm_free(ptr: usize, size: usize) -> i64 {
+    let mut ret: i64;
+    core::arch::asm!(
+        "mov x0, {0}",
+        "mov x1, {1}",
+        "mov x8, {2}",
+        "svc #0",
+        "mov {3}, x0",
+        in(reg) ptr,
+        in(reg) size,
+        const SYSCALL_HBM_FREE,
+        lateout(reg) ret,
+        out("x0") _, out("x1") _, out("x8") _,
+        options(nostack)
+    );
+    ret
+}
 
-// --- Modül Başlatma Fonksiyonu ---
-// Bu fonksiyon, çekirdek boot sürecinde veya HBM modülü yüklendiğinde çağrılacaktır.
-pub fn init() -> Result<(), KError> {
-    // HBM Memory Manager örneğini oluştur.
-    let hbm_manager = HbmMemoryManager::new(HBM_BASE_ADDRESS, HBM_SIZE)?;
+/// HBM bellek koruma sistem çağrısı
+unsafe fn sys_hbm_protect(ptr: usize, size: usize, prot: u32) -> i64 {
+    let mut ret: i64;
+    core::arch::asm!(
+        "mov x0, {0}",
+        "mov x1, {1}",
+        "mov x2, {2}",
+        "mov x8, {3}",
+        "svc #0",
+        "mov {4}, x0",
+        in(reg) ptr,
+        in(reg) size,
+        in(reg) prot,
+        const SYSCALL_HBM_PROTECT,
+        lateout(reg) ret,
+        out("x0") _, out("x1") _, out("x2") _, out("x8") _,
+        options(nostack)
+    );
+    ret
+}
 
-    // kmemory modülüne bu ayırıcıyı kaydet.
-    // Varsayım: kmemory modülünde böyle bir fonksiyon var.
-    // Varsayım: MemoryAllocatorId, farklı ayırıcıları tanımlamak için kullanılır (örneğin bir enum).
-    let allocator_id = MemoryAllocatorId::Hbm; // Varsayımsal ID
-    register_allocator(allocator_id, Box::new(hbm_manager))?; // Box::new trait object oluşturur
+/// HBM bellek durumu sorgulama sistem çağrısı
+unsafe fn sys_hbm_info(info_ptr: *mut HbmMemoryInfo) -> i64 {
+    let mut ret: i64;
+    core::arch::asm!(
+        "mov x0, {0}",
+        "mov x8, {1}",
+        "svc #0",
+        "mov {2}, x0",
+        in(reg) info_ptr,
+        const SYSCALL_HBM_INFO,
+        lateout(reg) ret,
+        out("x0") _, out("x8") _,
+        options(nostack)
+    );
+    ret
+}
 
-    println!("Karnal64: HBM Bellek Yöneticisi Başlatıldı ve Kaydedildi."); // Çekirdek içi print!
-    Ok(())
+// --- Kullanım Örnekleri ---
+pub fn example_usage() {
+    // HBM bellekten 32768 bayt ayır
+    if let Ok(ptr) = KarnalHbmMemory::alloc(32768, HbmMemoryProtection::READ | HbmMemoryProtection::WRITE) {
+        // Koruma sadece okuma olarak değiştir
+        let _ = KarnalHbmMemory::protect(ptr, 32768, HbmMemoryProtection::READ);
+
+        // HBM bellek durumu al
+        let _ = KarnalHbmMemory::info();
+
+        // Belleği serbest bırak
+        let _ = KarnalHbmMemory::free(ptr, 32768);
+    }
 }
